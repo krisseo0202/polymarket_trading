@@ -50,6 +50,9 @@ data/
 *.db
 *.sqlite
 
+# Bot runtime state
+bot_state.json
+
 # OS
 .DS_Store
 Thumbs.db

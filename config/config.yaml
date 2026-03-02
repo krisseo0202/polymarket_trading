@@ -1,0 +1,45 @@
+api:
+  host: "https://clob.polymarket.com"
+  chain_id: 137
+
+trading:
+  paper_trading: true   # flip to false for live trading
+  interval: 300         # 5-minute cycles (seconds)
+
+btc_updown_bot:
+  market_keywords: ["Bitcoin", "Up or Down"]  # title must contain all of these (case-insensitive)
+  state_file: "bot_state.json"
+  min_volume: 0  # 0 — don't filter by volume so brand-new markets are found immediately
+
+strategies:
+  btc_updown:
+    # Directional bias seeded from config; overridden at runtime via set_bias().
+    # LONG = buy YES (BTC up), SHORT = buy NO (BTC down), NONE = flat.
+    default_bias: "LONG"
+
+    # Momentum confirmation: require this much upward return over the lookback window.
+    confirmation_pct: 0.02              # 2% move required
+    confirmation_window_seconds: 5      # compare mid_now vs mid 5s ago (range 3–8 s)
+
+    # Exit thresholds
+    profit_target_pct: 0.20   # take profit at +20% (range 10–30%)
+    stop_loss_pct: 0.12        # stop loss at -12%
+    max_hold_seconds: 240      # force-exit after 4 minutes regardless of PnL
+
+    # Sizing
+    position_size_usdc: 20.0   # spend ~$20 USDC per trade
+    min_confidence: 0.7
+
+risk:
+  max_position_size: 200.0        # max shares per position
+  max_position_pct: 0.05          # 5% of balance per position
+  max_total_exposure: 0.15        # 15% of balance across all positions
+  max_daily_loss: 0.05            # 5% of balance daily loss cap
+  max_exposure_per_market: 0.10   # 10% of balance on this market
+  stop_loss_pct: 0.12
+  circuit_breaker_enabled: true
+  circuit_breaker_threshold: 0.20
+
+logging:
+  level: "INFO"
+  file: "logs/btc_updown_bot.log"

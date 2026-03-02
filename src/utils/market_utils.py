@@ -1,55 +1,87 @@
 """Market utility functions for trading"""
 
-from typing import Optional
+from typing import List, Optional, Dict
 import requests
 import json
 from ..api.client import PolymarketClient
 from ..api.types import OrderBook
 
-def get_active_events_with_token_ids(min_volume: float = 100000000) -> list:
-    """Fetch active events with their token IDs"""
+def _contains_all(text: str, keywords: List[str]) -> bool:
+    t = (text or "").lower()
+    return all(k.lower() in t for k in keywords)
+
+def get_active_events_with_token_ids(
+    min_volume: float = 100000,                 # more realistic default
+    event_keywords: Optional[List[str]] = None, # e.g. ["btc"]
+    market_keywords: Optional[List[str]] = None # e.g. ["up", "down"] or ["up", "down", "5", "minute"]
+) -> list:
+    """
+    Fetch active events with their token IDs, optionally filtering by keywords.
+    - event_keywords are matched against event['title']
+    - market_keywords are matched against market['question'] (and event title as fallback)
+    """
     url = "https://gamma-api.polymarket.com/events"
     all_events = []
-    params = {
-        "active": "true",
-        "closed": "false",
-        "limit": 100,
-        "offset": 0
-    }
-    response = requests.get(url, params=params)
+
+    params = {"active": "true", "closed": "false", "limit": 100, "offset": 0}
+    # NOTE: gamma supports pagination; if you need full coverage, loop over offset.
+
+    response = requests.get(url, params=params, timeout=20)
+    response.raise_for_status()
     events = response.json()
     if not events:
         return []
-    
+
+    event_keywords = event_keywords or []
+    market_keywords = market_keywords or []
+
     for event in events:
-        total_volume = 0
+        title = event.get("title", "")
+        if event_keywords and not _contains_all(title, event_keywords):
+            continue
+
+        total_volume = 0.0
         markets_with_tokens = []
-        
+
         for market in event.get("markets", []):
             volume = float(market.get("volume", 0) or 0)
             total_volume += volume
-            
-            # Parse clobTokenIds from JSON string
-            clob_token_ids = json.loads(market.get("clobTokenIds", "[]"))
-            
+
+            question = market.get("question", "")
+            # Filter at market level (most important)
+            if market_keywords:
+                # check question first, then fallback to combined text
+                combined = f"{title} {question}"
+                if not _contains_all(combined, market_keywords):
+                    continue
+
+            # Parse clobTokenIds safely (it’s often a JSON string)
+            raw = market.get("clobTokenIds", "[]")
+            try:
+                clob_token_ids = json.loads(raw) if isinstance(raw, str) else (raw or [])
+            except Exception:
+                clob_token_ids = []
+
             markets_with_tokens.append({
-                "market_id": market["id"],
-                "question": market["question"],
+                "market_id": market.get("id"),
+                "question": question,
                 "yes_token_id": clob_token_ids[0] if len(clob_token_ids) > 0 else None,
                 "no_token_id": clob_token_ids[1] if len(clob_token_ids) > 1 else None,
                 "neg_risk": market.get("negRisk", False),
-                "tick_size": market.get("orderPriceMinTickSize", 0.01)
+                "tick_size": market.get("orderPriceMinTickSize", 0.01),
+                "volume": volume,
             })
-        
-        if total_volume >= min_volume:
+
+        # Only keep events that have at least one matching market + pass volume
+        if markets_with_tokens and total_volume >= min_volume:
             all_events.append({
-                "event_id": event["id"],
-                "title": event["title"],
+                "event_id": event.get("id"),
+                "title": title,
                 "total_volume": total_volume,
                 "markets": markets_with_tokens
             })
-    return all_events if all_events else []
-    
+
+    return all_events
 
 def round_to_tick(price: float, tick: float) -> float:
     """
