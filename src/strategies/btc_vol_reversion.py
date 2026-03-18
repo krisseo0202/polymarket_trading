@@ -1,17 +1,19 @@
 """
-Stateful directional momentum strategy for BTC Up/Down 5-minute binary markets.
+Stateful volatility mean-reversion strategy for BTC Up/Down 5-minute binary markets.
 
-Bias behaviour: LONG → buy YES, SHORT → buy NO, NONE → stay flat.
-An external caller sets the view via set_bias(); config key `default_bias`
-seeds an initial value so the bot works without a live caller.
+In highly volatile BTC markets, prediction market prices overreact to short-term spikes.
+When BTC drops 1% in 30s, traders panic-sell YES tokens (pushing price to 30-35¢), but
+a single spike has ~50% chance of reversing within the same 5-min window. This creates
+a mean-reversion edge: fade the overreaction.
 
-Momentum confirmation (deterministic, no indicators):
-  return_pct = (mid_now - mid_prev) / mid_prev  >=  confirmation_pct
-where mid_prev is the closest recorded price ≥ confirmation_window_seconds ago.
-Mid-price history is accumulated internally — bot need not populate price_history.
+Volatility signal (deterministic, no indicators):
+  z = (current_yes_price - rolling_mean) / rolling_std  over 90s window
+  Entry when |z| >= zscore_threshold (default 1.8)
+    z < -1.8  → YES is cheap (bearish overreaction) → BUY YES
+    z > +1.8  → YES is expensive (bullish overreaction) → BUY NO
 
 Position lifecycle:
-  Entry  → bias set + no open position + momentum confirmed.
+  Entry  → z-score signal confirmed + no open position.
   Exit   → take-profit | stop-loss | max-hold time (checked before entry).
 
 Market-rollover safety: set_tokens() resets state when 5-min tokens change.
@@ -19,6 +21,7 @@ Market-rollover safety: set_tokens() resets state when 5-min tokens change.
 
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
+import math
 import time
 
 from .base import Signal, Strategy
@@ -26,25 +29,19 @@ from ..api.types import OrderBook, Position
 from ..utils.market_utils import get_mid_price, round_to_tick
 
 
-class Bias(Enum):
-    LONG  = "LONG"   # BTC expected up   → trade YES token
-    SHORT = "SHORT"  # BTC expected down → trade NO  token
-    NONE  = "NONE"   # no view           → stay flat
-
-
-class BTCUpDownStrategy(Strategy):
+class BTCVolatilityReversionStrategy(Strategy):
 
     def __init__(self, config: Dict[str, Any]):
-        super().__init__(name="btc_updown", config=config)
+        super().__init__(name="btc_vol_reversion", config=config)
 
-        self.confirmation_pct: float        = config.get("confirmation_pct", 0.02)
-        self.confirmation_window_seconds: int = int(config.get("confirmation_window_seconds", 60))
-        self.profit_target_pct: float       = config.get("profit_target_pct", 0.04)
-        self.stop_loss_pct: float           = config.get("stop_loss_pct", 0.12)
-        self.max_hold_seconds: int          = int(config.get("max_hold_seconds", 240))
-        self.position_size_usdc: float      = config.get("position_size_usdc", 20.0)
-
-        self.current_bias: Bias = Bias[config.get("default_bias", "NONE").upper()]
+        self.window_seconds: int        = int(config.get("window_seconds", 90))
+        self.min_samples: int           = int(config.get("min_samples", 20))
+        self.zscore_threshold: float    = config.get("zscore_threshold", 1.8)
+        self.min_vol_threshold: float   = config.get("min_vol_threshold", 0.005)
+        self.profit_target_pct: float   = config.get("profit_target_pct", 0.03)
+        self.stop_loss_pct: float       = config.get("stop_loss_pct", 0.07)
+        self.max_hold_seconds: int      = int(config.get("max_hold_seconds", 90))
+        self.position_size_usdc: float  = config.get("position_size_usdc", 20.0)
 
         # Token context — refreshed each cycle by set_tokens()
         self._market_id: str = ""
@@ -64,7 +61,7 @@ class BTCUpDownStrategy(Strategy):
 
         # Mid-price history: token_id → [(monotonic_ts, mid), ...]
         self._price_history: Dict[str, List[Tuple[float, float]]] = {}
-        self._history_max_age: float = max(self.confirmation_window_seconds * 3, 300.0)
+        self._history_max_age: float = max(self.window_seconds * 3, 300.0)
 
     # ------------------------------------------------------------------
     # Public setters
@@ -80,17 +77,10 @@ class BTCUpDownStrategy(Strategy):
         self._no_token_id  = no_token_id
         self._outcome_map  = {yes_token_id: "YES", no_token_id: "NO"}
 
-    def set_bias(self, bias: Bias) -> None:
-        """
-        Set directional view from an external source (user, model, rule).
-        LONG / SHORT selects which token to enter; NONE keeps the bot flat.
-        """
-        self.current_bias = bias
-
     def record_price(self, token_id: str, mid: float, ts: Optional[float] = None) -> None:
         """Feed a mid-price observation into the internal history buffer.
-        Called by the ticker every 5 s so the 5-second lookback has data
-        between analyze() calls (which run every 5 minutes).
+        Called by the ticker every 1s so the rolling window has dense samples
+        for accurate z-score computation.
         """
         now = ts if ts is not None else time.monotonic()
         buf = self._price_history.setdefault(token_id, [])
@@ -108,7 +98,7 @@ class BTCUpDownStrategy(Strategy):
           1. Append current mid-prices to internal history buffer.
           2. Auto-recover lost position state from live positions.
           3. Check exit conditions → emit SELL if triggered.
-          4. Check entry conditions → emit BUY if bias + momentum align.
+          4. Check entry conditions → emit BUY if z-score signals mean-reversion.
         """
         if not self._yes_token_id or not self._no_token_id:
             return []
@@ -151,7 +141,7 @@ class BTCUpDownStrategy(Strategy):
             return [exit_sig]
 
         # 4. Entry check
-        if self.current_bias != Bias.NONE and self.active_token_id is None:
+        if self.active_token_id is None:
             entry_sig = self._check_entry(order_books, by_token, now_ts)
             if entry_sig:
                 return [entry_sig]
@@ -173,39 +163,36 @@ class BTCUpDownStrategy(Strategy):
     ) -> Optional[Signal]:
         """
         Entry conditions:
-          - Bias selects YES (LONG) or NO (SHORT) token.
-          - No existing position for that token.
-          - Momentum measured on YES token return for both directions:
-              LONG:  YES_return_pct >= +confirmation_pct  → buy YES
-              SHORT: YES_return_pct <= -confirmation_pct  → buy NO
-            where YES_return_pct = (yes_mid_now - yes_mid_prev) / yes_mid_prev
-            and yes_mid_prev is from at least confirmation_window_seconds ago.
+          - Z-score on YES token detects mean-reversion signal.
+          - No existing position.
+          - Z-score triggers when |z| >= threshold:
+              z < -threshold  → YES is cheap (bearish overreaction) → buy YES
+              z > +threshold  → YES is expensive (bullish overreaction) → buy NO
         On confirmation, state is set optimistically so exit logic
         fires on the very next cycle.
         """
-        # Determine target token for position/book lookup
-        token_id = self._yes_token_id if self.current_bias == Bias.LONG \
-                   else self._no_token_id
+        # Compute z-score on YES token
+        yes_zscore = self._compute_zscore(self._yes_token_id, now_ts)
+        if yes_zscore is None:
+            return None  # insufficient history, warmup, or flat market
+
+        # Check entry threshold
+        if abs(yes_zscore) < self.zscore_threshold:
+            return None  # z-score not extreme enough
+
+        # Determine target token based on z-score sign
+        if yes_zscore < -self.zscore_threshold:
+            # YES is cheap → bullish reversal expected → buy YES
+            token_id = self._yes_token_id
+            direction = "bullish_reversion"
+        else:
+            # YES is expensive → bearish reversal expected → buy NO
+            token_id = self._no_token_id
+            direction = "bearish_reversion"
 
         pos = by_token.get(token_id)
         if pos and pos.size > 0:
             return None   # already holding — no pyramiding
-
-        # Always measure momentum on YES token
-        yes_book = order_books.get(self._yes_token_id)
-        yes_mid_now = get_mid_price(yes_book) if yes_book else None
-        yes_mid_prev = self._lookback_mid(self._yes_token_id, now_ts, self.confirmation_window_seconds)
-        if yes_mid_now is None or yes_mid_prev is None or yes_mid_prev <= 0:
-            return None   # insufficient history or no book
-
-        return_pct = (yes_mid_now - yes_mid_prev) / yes_mid_prev
-
-        if self.current_bias == Bias.LONG:
-            if return_pct < self.confirmation_pct:
-                return None   # YES not rising fast enough
-        elif self.current_bias == Bias.SHORT:
-            if return_pct > -self.confirmation_pct:
-                return None   # YES not falling fast enough
 
         book = order_books.get(token_id)
         if book is None:
@@ -219,7 +206,8 @@ class BTCUpDownStrategy(Strategy):
         if best_ask <= 0:
             return None
         size       = round(self.position_size_usdc / best_ask, 2)
-        confidence = min(0.5 + (abs(return_pct) / self.confirmation_pct) * 0.5, 1.0)
+        # Confidence scales with z-score magnitude: baseline 0.5, up to 1.0
+        confidence = min(0.5 + (abs(yes_zscore) / self.zscore_threshold) * 0.5, 1.0)
 
         # Optimistically record position state
         self.active_token_id  = token_id
@@ -227,7 +215,6 @@ class BTCUpDownStrategy(Strategy):
         self.entry_timestamp  = now_ts
         self.entry_size       = size
 
-        direction = "rising" if self.current_bias == Bias.LONG else "falling"
         return Signal(
             market_id=self._market_id,
             outcome=self._outcome_map.get(token_id, ""),
@@ -236,27 +223,44 @@ class BTCUpDownStrategy(Strategy):
             price=round_to_tick(best_ask, tick),
             size=size,
             reason=(
-                f"momentum confirmed: YES {direction} return={return_pct:.2%} "
-                f"threshold={self.confirmation_pct:.2%} "
-                f"over {self.confirmation_window_seconds}s | "
-                f"bias={self.current_bias.value}"
+                f"vol_reversion fading: {direction} zscore={yes_zscore:.2f} "
+                f"threshold={self.zscore_threshold:.2f} "
+                f"over {self.window_seconds}s"
             ),
         )
 
-    def _lookback_mid(
-        self, token_id: str, now_ts: float, lookback_seconds: int
-    ) -> Optional[float]:
+    def _compute_zscore(self, token_id: str, now_ts: float) -> Optional[float]:
         """
-        Return the most-recent mid recorded at least `lookback_seconds` ago.
-        History is chronological; we walk forward and keep the last entry
-        that falls before the target timestamp.
+        Compute z-score of current price within rolling window.
+
+        Returns z-score = (current_price - mean) / std over the window,
+        or None if:
+          - Insufficient history (< min_samples)
+          - Price volatility too low (std < min_vol_threshold)
+          - No current price in order book
         """
-        target_ts = now_ts - lookback_seconds
-        result: Optional[float] = None
-        for ts, mid in self._price_history.get(token_id, []):
-            if ts <= target_ts:
-                result = mid
-            else:
-                break
-        return result
+        history = self._price_history.get(token_id, [])
+
+        # Extract prices within window
+        window_start = now_ts - self.window_seconds
+        prices_in_window = [mid for ts, mid in history if ts >= window_start]
+
+        # Warmup guard
+        if len(prices_in_window) < self.min_samples:
+            return None
+
+        # Compute mean and std
+        mean = sum(prices_in_window) / len(prices_in_window)
+        variance = sum((p - mean) ** 2 for p in prices_in_window) / len(prices_in_window)
+        std = math.sqrt(variance)
+
+        # Guard: skip if market is too flat (no volatility edge)
+        if std < self.min_vol_threshold:
+            return None
+
+        # Z-score of current (latest) price
+        current_price = prices_in_window[-1]
+        zscore = (current_price - mean) / std
+
+        return zscore
 

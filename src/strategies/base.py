@@ -1,8 +1,11 @@
 """Base Strategy class for all trading strategies"""
 
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Any
+
+from ..utils.market_utils import get_mid_price, round_to_tick
 
 
 @dataclass
@@ -20,118 +23,130 @@ class Signal:
 class Strategy(ABC):
     """
     Abstract base class for all trading strategies.
-    
+
     All strategies must inherit from this class and implement
     the analyze() and should_enter() methods.
     """
-    
+
     def __init__(self, name: str, config: Dict[str, Any]):
-        """
-        Initialize strategy
-        
-        Args:
-            name: Strategy name
-            config: Strategy-specific configuration dictionary
-        """
         self.name = name
         self.config = config
         self.enabled = config.get("enabled", True)
         self.min_confidence = config.get("min_confidence", 0.5)
         self.max_position_size = config.get("max_position_size", 1000.0)
-    
+
     @abstractmethod
     def analyze(self, market_data: Dict[str, Any]) -> List[Signal]:
-        """
-        Analyze market data and return trading signals
-        
-        Args:
-            market_data: Dictionary containing market information,
-                        order book, price history, etc.
-                        
-        Returns:
-            List of Signal objects
-        """
         pass
-    
+
     @abstractmethod
     def should_enter(self, signal: Signal) -> bool:
-        """
-        Determine if we should enter a position based on a signal
-        
-        Args:
-            signal: Trading signal to evaluate
-            
-        Returns:
-            True if we should enter the position
-        """
         pass
-    
+
     def should_exit(self, position: Dict[str, Any], market_data: Dict[str, Any]) -> bool:
-        """
-        Determine if we should exit a position (optional override)
-        
-        Args:
-            position: Current position information
-            market_data: Current market data
-            
-        Returns:
-            True if we should exit the position
-        """
         return False
-    
+
     def calculate_position_size(
         self,
         signal: Signal,
         balance: float,
         current_positions: List[Dict[str, Any]]
     ) -> float:
-        """
-        Calculate position size for a signal
-        
-        Args:
-            signal: Trading signal
-            balance: Current account balance
-            current_positions: List of current positions
-            
-        Returns:
-            Position size to use
-        """
-        # Default: Use signal size, but cap at max_position_size and available balance
         size = min(signal.size, self.max_position_size)
-        
-        # Check available balance
-        max_by_balance = balance * self.config.get("max_position_pct", 0.1)  # 10% default
+        max_by_balance = balance * self.config.get("max_position_pct", 0.1)
         size = min(size, max_by_balance)
-        
         return max(0.0, size)
-    
+
     def validate_signal(self, signal: Signal) -> bool:
-        """
-        Validate a signal before execution
-        
-        Args:
-            signal: Signal to validate
-            
-        Returns:
-            True if signal is valid
-        """
         if not self.enabled:
             return False
-        
         if signal.confidence < self.min_confidence:
             return False
-        
         if signal.price < 0.0 or signal.price > 1.0:
             return False
-        
         if signal.size <= 0.0:
             return False
-        
         if signal.action not in ["BUY", "SELL"]:
             return False
-        
         if signal.outcome not in ["YES", "NO"]:
             return False
-        
         return True
 
+    # ------------------------------------------------------------------
+    # Shared position lifecycle helpers
+    # ------------------------------------------------------------------
+
+    def check_exit(
+        self,
+        order_books: Dict[str, Any],
+        by_token: Dict[str, Any],
+        now_ts: float,
+    ) -> Optional[Signal]:
+        """
+        Common exit logic: take-profit, stop-loss, time-limit.
+
+        Requires the subclass to set on self:
+            active_token_id, entry_price, entry_timestamp, entry_size,
+            profit_target_pct, stop_loss_pct, max_hold_seconds,
+            _market_id, _outcome_map
+        """
+        if self.active_token_id is None or self.entry_price is None:
+            return None
+
+        pos = by_token.get(self.active_token_id)
+        held_size = float(pos.size) if pos and pos.size > 0 else self.entry_size
+        if not held_size:
+            self._reset_position_state()
+            return None
+
+        book = order_books.get(self.active_token_id)
+        if book is None:
+            return None
+        mid = get_mid_price(book)
+        if mid is None:
+            return None
+
+        profit_pct = (mid - self.entry_price) / self.entry_price
+        time_held  = now_ts - self.entry_timestamp if self.entry_timestamp else 0.0
+
+        reason: Optional[str] = None
+        if profit_pct >= self.profit_target_pct:
+            reason = f"take_profit profit={profit_pct:.2%} >= target={self.profit_target_pct:.2%}"
+        elif -profit_pct >= self.stop_loss_pct:
+            reason = f"stop_loss loss={-profit_pct:.2%} >= limit={self.stop_loss_pct:.2%}"
+        elif time_held >= self.max_hold_seconds:
+            reason = f"time_limit held={time_held:.0f}s >= max={self.max_hold_seconds}s"
+
+        if reason is None:
+            return None
+
+        tick     = book.tick_size or 0.001
+        best_bid = book.bids[0].price if book.bids else mid
+        return Signal(
+            market_id=self._market_id,
+            outcome=self._outcome_map.get(self.active_token_id, ""),
+            action="SELL",
+            confidence=1.0,
+            price=round_to_tick(best_bid, tick),
+            size=held_size,
+            reason=reason,
+        )
+
+    def _reset_position_state(self) -> None:
+        """Reset open position tracking fields to None."""
+        self.active_token_id = None
+        self.entry_price     = None
+        self.entry_timestamp = None
+        self.entry_size      = None
+
+    def get_position_info(self) -> Optional[Dict[str, Any]]:
+        """Return current open position info for display, or None if flat."""
+        if self.active_token_id is None or self.entry_price is None:
+            return None
+        return {
+            "outcome": self._outcome_map.get(self.active_token_id, ""),
+            "entry_price": self.entry_price,
+            "entry_size": self.entry_size or 0.0,
+            "entry_timestamp": self.entry_timestamp or time.monotonic(),
+            "max_hold_seconds": self.max_hold_seconds,
+        }

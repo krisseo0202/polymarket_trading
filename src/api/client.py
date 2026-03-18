@@ -112,20 +112,21 @@ class PolymarketClient:
     
     def get_order_book(self, token_id: str) -> OrderBook:
         """
-        Get order book for a token
-        
+        Get order book for a token.
+        Paper trading still reads REAL market data — only order placement is mocked.
+
         Args:
             token_id: Token ID to get order book for
-            
+
         Returns:
             OrderBook object
         """
         if self.paper_trading:
-            return self._get_mock_order_book(token_id)
-        
+            return self._fetch_real_order_book(token_id)
+
         try:
             book = self.client.get_order_book(token_id)
-            
+
             bids = [
                 OrderBookEntry(price=float(bid.price), size=float(bid.size))
                 for bid in book.bids
@@ -148,6 +149,46 @@ class PolymarketClient:
             )
         except Exception as e:
             raise Exception(f"Error fetching order book: {e}")
+
+    def _fetch_real_order_book(self, token_id: str) -> OrderBook:
+        """Fetch real order book from CLOB REST API (no auth required)."""
+        last_exc = None
+        for _ in range(2):
+            try:
+                response = requests.get(
+                    f"{self.host}/book",
+                    params={"token_id": token_id},
+                    timeout=10,
+                )
+                response.raise_for_status()
+                data = response.json()
+
+                bids = [
+                    OrderBookEntry(
+                        price=float(entry.get("price") or entry.get("p")),
+                        size=float(entry.get("size") or entry.get("s")),
+                    )
+                    for entry in data.get("bids", [])
+                ]
+                asks = [
+                    OrderBookEntry(
+                        price=float(entry.get("price") or entry.get("p")),
+                        size=float(entry.get("size") or entry.get("s")),
+                    )
+                    for entry in data.get("asks", [])
+                ]
+                return OrderBook(
+                    market_id="",
+                    token_id=token_id,
+                    bids=bids,
+                    asks=asks,
+                    min_order_size=int(data.get("min_order_size", 0)),
+                    tick_size=float(data.get("tick_size", 0.01)),
+                    timestamp=datetime.now(),
+                )
+            except Exception as e:
+                last_exc = e
+        raise Exception(f"Error fetching real order book: {last_exc}")
     
     def get_midpoint(self, token_id):
         """Get current midpoint price or best effort"""

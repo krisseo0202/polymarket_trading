@@ -9,7 +9,9 @@ Configuration: config/config.yaml
     for live trading.
 """
 
+import argparse
 import json
+import logging
 import math
 import os
 import requests
@@ -31,7 +33,10 @@ from src.engine.execution import ExecutionTracker
 from src.engine.inventory import InventoryState
 from src.engine.risk_manager import RiskLimits, RiskManager
 from src.engine.state_store import BotState, StateStore
+from src.strategies.base import Signal
 from src.strategies.btc_updown import BTCUpDownStrategy
+from src.strategies.btc_vol_reversion import BTCVolatilityReversionStrategy
+from src.strategies.coin_toss import CoinTossStrategy
 from src.utils.config import load_config
 from src.utils.logger import setup_logger
 from src.utils.market_utils import cancel_if_exists, get_mid_price
@@ -44,6 +49,10 @@ _client: Optional[PolymarketClient] = None
 _state: Optional[BotState] = None
 _state_store: Optional[StateStore] = None
 _paper_trading: bool = True
+
+# Session PnL counters — reset each run, not persisted
+_session_wins: int = 0
+_session_losses: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -59,7 +68,7 @@ def sleep_until_next_cycle(interval_s: int) -> None:
         time.sleep(delay)
 
 
-def _fetch_book_top(yes_token_id: str, no_token_id: str) -> tuple:
+def _fetch_book_top(yes_token_id: str, no_token_id: str, logger=None) -> tuple:
     """Fetch best bid/ask for YES and NO tokens via /book. Returns (yes_bid, yes_ask, no_bid, no_ask)."""
     def _top(token_id: str):
         try:
@@ -74,8 +83,12 @@ def _fetch_book_top(yes_token_id: str, no_token_id: str) -> tuple:
             asks = data.get("asks") or []
             bid = float(bids[0]["p"]) if bids else None
             ask = float(asks[0]["p"]) if asks else None
+            if bid is None and ask is None and logger:
+                logger.debug(f"Empty book for token {token_id[:12]}...")
             return bid, ask
-        except Exception:
+        except Exception as e:
+            if logger:
+                logger.debug(f"Book fetch failed for {token_id[:12]}...: {e}")
             return None, None
 
     yes_bid, yes_ask = _top(yes_token_id)
@@ -90,20 +103,15 @@ def ticker_until_next_cycle(
     interval_s: int,
     strategy=None,
     intra_cycle_analyze_fn=None,
+    logger=None,
 ) -> None:
     """
-    Print a live one-line price ticker every second while waiting for the
-    next cycle boundary.
+    Record prices in the background while waiting for the next cycle.
 
-    Price fetches run in a background thread every 5 s so network latency
-    never affects the 1-second countdown cadence.  If `strategy` is provided,
-    each fetch also calls strategy.record_price() to populate sub-cycle history.
-
-    If `intra_cycle_analyze_fn` is provided, it is called every 30 s inside
-    the fetch thread so signals can fire mid-cycle once price history exists.
-
-    Example output (overwrites same line):
-      YES b=0.5100 a=0.5200 | NO b=0.4790 a=0.4880 | Next cycle in 04:27
+    Prints a single static status line after the first price fetch,
+    then sleeps quietly until the next wall-clock boundary.
+    Background thread continues recording prices and running
+    intra-cycle analysis every 30 s.
     """
     yes_bid: List[Optional[float]] = [None]
     yes_ask: List[Optional[float]] = [None]
@@ -114,7 +122,9 @@ def ticker_until_next_cycle(
     def _fetch_loop():
         last_analyzed = time.monotonic()
         while not stop_evt.is_set():
-            y_bid, y_ask, n_bid, n_ask = _fetch_book_top(yes_token_id, no_token_id)
+            y_bid, y_ask, n_bid, n_ask = _fetch_book_top(
+                yes_token_id, no_token_id, logger=logger,
+            )
 
             if y_bid is not None: yes_bid[0] = y_bid
             if y_ask is not None: yes_ask[0] = y_ask
@@ -131,34 +141,66 @@ def ticker_until_next_cycle(
                 intra_cycle_analyze_fn()
                 last_analyzed = now_m
 
-            stop_evt.wait(1.0)  # 1-second cadence (was 5.0)
+            stop_evt.wait(1.0)
 
     fetcher = threading.Thread(target=_fetch_loop, daemon=True)
     fetcher.start()
 
     def _fmt(v): return f"{v:.4f}" if v is not None else " --- "
 
+    def _pos_str() -> str:
+        pos = strategy.get_position_info() if strategy and hasattr(strategy, "get_position_info") else None
+        if pos is None:
+            return "FLAT"
+        outcome     = pos["outcome"]
+        entry_price = pos["entry_price"]
+        entry_size  = pos["entry_size"]
+
+        # Current mid for the held side
+        if outcome == "YES":
+            cb, ca = yes_bid[0], yes_ask[0]
+        else:
+            cb, ca = no_bid[0], no_ask[0]
+        if cb is not None and ca is not None:
+            cur_mid = (cb + ca) / 2
+        elif cb is not None:
+            cur_mid = cb
+        elif ca is not None:
+            cur_mid = ca
+        else:
+            cur_mid = entry_price
+
+        unrealized = (cur_mid - entry_price) * entry_size
+        pnl_pct    = (cur_mid - entry_price) / entry_price * 100 if entry_price else 0.0
+        return (
+            f"POS: {outcome} {entry_size:.1f}sh @{entry_price:.4f} "
+            f"uPnL={unrealized:+.2f} ({pnl_pct:+.1f}%)"
+        )
+
+    # Wait for first price fetch, then print one status line
+    time.sleep(2)
+    now = time.time()
+    next_run = math.ceil(now / interval_s) * interval_s
+    remaining = max(0, next_run - now)
+    mins, secs = divmod(int(remaining), 60)
+    if logger:
+        logger.info(
+            f"  YES b={_fmt(yes_bid[0])} a={_fmt(yes_ask[0])}"
+            f" | NO b={_fmt(no_bid[0])} a={_fmt(no_ask[0])}"
+            f" | {_pos_str()}"
+            f" | Next cycle in {mins:02d}:{secs:02d}"
+        )
+
+    # Sleep in 1-second increments (responsive to shutdown signals)
     try:
-        while True:
+        while not _shutdown_requested:
             now = time.time()
             next_run = math.ceil(now / interval_s) * interval_s
-            remaining = next_run - now
-            if remaining <= 0:
+            if next_run - now <= 0:
                 break
-
-            mins, secs = divmod(int(remaining), 60)
-
-            print(
-                f"\r  YES b={_fmt(yes_bid[0])} a={_fmt(yes_ask[0])}"
-                f" | NO b={_fmt(no_bid[0])} a={_fmt(no_ask[0])}"
-                f" | Next cycle in {mins:02d}:{secs:02d}  ",
-                end="",
-                flush=True,
-            )
             time.sleep(1.0)
     finally:
         stop_evt.set()
-        print()  # newline so the next log line isn't clobbered
 
 
 def _execute_signals(
@@ -205,11 +247,26 @@ def _execute_signals(
                 size=sig.size,
             )
             state.active_order_ids[token_id] = order.order_id
-            logger.info(
-                f"Order placed | {sig.action} {sig.outcome} "
-                f"size={sig.size:.2f} price={sig.price:.4f} "
-                f"order_id={order.order_id} | {sig.reason}"
-            )
+            if sig.action == "BUY":
+                cost = sig.price * sig.size
+                logger.info(
+                    f"BUY  {sig.outcome:3s}  {sig.size:.2f}sh @ {sig.price:.4f}"
+                    f"  (cost ${cost:.2f})  [{sig.reason}]"
+                )
+            else:
+                entry_price = getattr(strategy, "_pending_exit_entry_price", None)
+                if entry_price and entry_price > 0 and sig.size:
+                    realized = (sig.price - entry_price) * sig.size
+                    pct      = (sig.price - entry_price) / entry_price * 100
+                    logger.info(
+                        f"SELL {sig.outcome:3s}  {sig.size:.2f}sh @ {sig.price:.4f}"
+                        f"  PnL: {realized:+.2f} ({pct:+.1f}%)  [{sig.reason}]"
+                    )
+                else:
+                    logger.info(
+                        f"SELL {sig.outcome:3s}  {sig.size:.2f}sh @ {sig.price:.4f}"
+                        f"  [{sig.reason}]"
+                    )
         except Exception as e:
             logger.error(f"Order placement failed: {e}")
 
@@ -227,8 +284,19 @@ def _make_intra_cycle_fn(
     logger,
 ):
     """Return a zero-arg callable for intra-cycle analyze+execute passes."""
+    captured_slot = int(math.floor(time.time() / 300) * 300)
+    slot_expiry_ts = captured_slot + 300
+
     def _fn():
         try:
+            now_wall = time.time()
+            if int(math.floor(now_wall / 300) * 300) != captured_slot:
+                logger.debug("Intra-cycle skipped: market slot rolled over")
+                return
+
+            time_remaining = slot_expiry_ts - now_wall
+            min_entry_window = getattr(strategy, 'max_hold_seconds', 240)
+
             yes_book  = client.get_order_book(yes_tid)
             no_book   = client.get_order_book(no_tid)
             positions = client.get_positions()
@@ -241,6 +309,16 @@ def _make_intra_cycle_fn(
                 "price_history": {},
             }
             signals = strategy.analyze(market_data)
+
+            if time_remaining < min_entry_window:
+                buy_count = sum(1 for s in signals if s.action == "BUY")
+                signals = [s for s in signals if s.action == "SELL"]
+                if buy_count:
+                    logger.info(
+                        f"Intra-cycle: BUY suppressed ({time_remaining:.0f}s < "
+                        f"{min_entry_window}s window) — exits only"
+                    )
+
             if signals:
                 logger.info(f"Intra-cycle: {len(signals)} signal(s)")
                 _execute_signals(
@@ -393,9 +471,12 @@ def graceful_shutdown(
             logger.info(f"Cancelling resting order {order_id} for token {token_id[:12]}...")
             cancel_if_exists(client, order_id, dry_run=paper_trading)
     state_store.save(state)
+    trades = _session_wins + _session_losses
+    win_rate = _session_wins / trades if trades > 0 else 0.0
     logger.info(
         f"Shutdown complete | cycles={state.cycle_count} "
-        f"| daily_pnl={state.daily_realized_pnl:.4f}"
+        f"| daily_pnl={state.daily_realized_pnl:+.4f} "
+        f"| session trades={trades} wins={_session_wins} ({win_rate:.0%} win rate)"
     )
     sys.exit(0)
 
@@ -411,6 +492,28 @@ def _handle_signal(signum, frame):
 
 def main() -> None:
     global _shutdown_requested, _client, _state, _state_store, _paper_trading
+    global _session_wins, _session_losses
+
+    parser = argparse.ArgumentParser(description="Polymarket trading bot")
+    parser.add_argument(
+        "--strategy",
+        choices=["btc_updown", "btc_vol_reversion", "coin_toss"],
+        default="btc_updown",
+        help="Strategy to run (default: btc_updown)",
+    )
+    parser.add_argument(
+        "--paper",
+        action="store_true",
+        default=None,
+        help="Force paper trading mode",
+    )
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        default=None,
+        help="Force live trading mode",
+    )
+    args = parser.parse_args()
 
     # -----------------------------------------------------------------------
     # Load configuration
@@ -428,9 +531,13 @@ def main() -> None:
     min_volume: int = int(bot_cfg.get("min_volume", 1_000_000))
     interval: int = int(raw_yaml.get("trading", {}).get("interval", 300))
     paper_trading: bool = cfg.paper_trading
+    if args.live:
+        paper_trading = False
+    elif args.paper:
+        paper_trading = True
     _paper_trading = paper_trading
 
-    strategy_cfg: dict = cfg.strategies.get("btc_updown", {})
+    strategy_cfg: dict = cfg.strategies.get(args.strategy, {})
 
     # -----------------------------------------------------------------------
     # Logger
@@ -440,7 +547,7 @@ def main() -> None:
         os.makedirs(os.path.dirname(log_file), exist_ok=True)
     logger = setup_logger(level=cfg.log_level, log_file=log_file)
     logger.info(
-        f"Starting BTC Up/Down bot | paper_trading={paper_trading} | interval={interval}s"
+        f"Starting bot | strategy={args.strategy} | paper_trading={paper_trading} | interval={interval}s"
     )
 
     # -----------------------------------------------------------------------
@@ -472,7 +579,12 @@ def main() -> None:
         positions_sync_interval_s=interval,
     )
 
-    strategy = BTCUpDownStrategy(config=strategy_cfg)
+    if args.strategy == "coin_toss":
+        strategy = CoinTossStrategy(config=strategy_cfg)
+    elif args.strategy == "btc_vol_reversion":
+        strategy = BTCVolatilityReversionStrategy(config=strategy_cfg)
+    else:
+        strategy = BTCUpDownStrategy(config=strategy_cfg)
 
     # -----------------------------------------------------------------------
     # State + inventories
@@ -505,6 +617,7 @@ def main() -> None:
     # -----------------------------------------------------------------------
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGTSTP, _handle_signal)
 
     # -----------------------------------------------------------------------
     # Main loop
@@ -557,6 +670,7 @@ def main() -> None:
                 ticker_until_next_cycle(
                     client, yes_token_id, no_token_id, interval,
                     strategy=strategy, intra_cycle_analyze_fn=None,
+                    logger=logger,
                 )
                 continue
 
@@ -579,6 +693,10 @@ def main() -> None:
                     state.daily_realized_pnl += realized
                     if realized != 0.0:
                         risk_manager.record_trade(realized)
+                        if realized > 0:
+                            _session_wins += 1
+                        else:
+                            _session_losses += 1
 
             for token_id, inv in inventories.items():
                 state.inventories[token_id] = {
@@ -592,6 +710,45 @@ def main() -> None:
             yes_book  = client.get_order_book(yes_token_id)
             no_book   = client.get_order_book(no_token_id)
             positions = client.get_positions()
+
+            # ------------------------------------------------------------------
+            # Orphaned position cleanup: both YES and NO open simultaneously
+            # (can happen after a crash/restart with a prior manual trade).
+            # Emit SELL for both sides before handing off to the strategy.
+            # ------------------------------------------------------------------
+            by_token_live = {p.token_id: p for p in positions}
+            yes_live = by_token_live.get(yes_token_id)
+            no_live  = by_token_live.get(no_token_id)
+            if yes_live and yes_live.size > 0 and no_live and no_live.size > 0:
+                logger.warning(
+                    f"Orphaned positions detected — YES: {yes_live.size:.2f}, "
+                    f"NO: {no_live.size:.2f}. Emitting cleanup SELLs."
+                )
+                orphan_sigs = []
+                for tok_id, outcome, live_pos, book in [
+                    (yes_token_id, "YES", yes_live, yes_book),
+                    (no_token_id,  "NO",  no_live,  no_book),
+                ]:
+                    mid = get_mid_price(book) if book else None
+                    best_bid = book.bids[0].price if book and book.bids else mid
+                    if best_bid:
+                        orphan_sigs.append(Signal(
+                            market_id=current_market_id,
+                            outcome=outcome,
+                            action="SELL",
+                            confidence=1.0,
+                            price=best_bid,
+                            size=float(live_pos.size),
+                            reason="orphan_cleanup",
+                        ))
+                if orphan_sigs:
+                    _execute_signals(
+                        orphan_sigs, client, strategy, risk_manager, state,
+                        current_market_id, yes_token_id, no_token_id,
+                        balance, positions, paper_trading, logger,
+                    )
+                    state_store.save(state)
+                    positions = client.get_positions()  # refresh after cleanup
 
             market_data = {
                 "markets": [],
@@ -613,6 +770,19 @@ def main() -> None:
                 current_market_id, yes_token_id, no_token_id, paper_trading, logger,
             )
             signals = strategy.analyze(market_data)
+
+            # Guard: suppress BUY entries if insufficient time remains in market window
+            _slot_expiry = (int(math.floor(time.time() / 300) * 300) + 300)
+            _time_remaining = _slot_expiry - time.time()
+            _min_entry = getattr(strategy, 'max_hold_seconds', 240)
+            if _time_remaining < _min_entry:
+                _original = len(signals)
+                signals = [s for s in signals if s.action == "SELL"]
+                if len(signals) < _original:
+                    logger.info(
+                        f"Entry suppressed at cycle start: {_time_remaining:.0f}s < "
+                        f"{_min_entry}s required window"
+                    )
 
             _execute_signals(
                 signals, client, strategy, risk_manager, state,
@@ -648,6 +818,7 @@ def main() -> None:
                 client, yes_token_id, no_token_id, interval,
                 strategy=strategy,
                 intra_cycle_analyze_fn=intra_cycle_analyze_fn,
+                logger=logger,
             )
         else:
             sleep_until_next_cycle(interval)

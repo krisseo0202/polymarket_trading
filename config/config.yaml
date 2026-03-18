@@ -12,6 +12,14 @@ btc_updown_bot:
   min_volume: 0  # 0 — don't filter by volume so brand-new markets are found immediately
 
 strategies:
+  coin_toss:
+    enabled: false             # baseline test only; flip to true to benchmark pipeline
+    position_size_usdc: 5.0    # small size for pipeline testing
+    max_hold_seconds: 240      # force-exit before 5-min market expires
+    profit_target_pct: 0.10   # 10% take-profit
+    stop_loss_pct: 0.05        # 5% stop-loss
+    min_confidence: 0.5        # coin flip always has confidence=0.5
+
   btc_updown:
     # Directional bias seeded from config; overridden at runtime via set_bias().
     # LONG = buy YES (BTC up), SHORT = buy NO (BTC down), NONE = flat.
@@ -29,6 +37,23 @@ strategies:
     # Sizing
     position_size_usdc: 20.0   # spend ~$20 USDC per trade
     min_confidence: 0.7
+
+  btc_vol_reversion:
+    enabled: true
+    # Z-score mean-reversion: fade overreactions by monitoring price volatility
+    window_seconds: 90           # rolling window for mean/std computation
+    min_samples: 20              # warmup guard: need at least 20 price samples
+    zscore_threshold: 1.8        # trigger signal when |z| >= this value
+    min_vol_threshold: 0.005     # skip if price std < half-cent (market too flat)
+
+    # Exit thresholds — quick snapback is the expected behavior
+    profit_target_pct: 0.03      # take profit at +3% (tight, mean-reversion is small)
+    stop_loss_pct: 0.07          # stop loss at -7% (2:1+ R/R with >60% win rate)
+    max_hold_seconds: 90         # force-exit after 90s (window = hold max)
+
+    # Sizing
+    position_size_usdc: 20.0
+    min_confidence: 0.55
 
 risk:
   max_position_size: 200.0        # max shares per position
