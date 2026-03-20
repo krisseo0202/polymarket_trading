@@ -27,9 +27,27 @@ class CoinTossStrategy(Strategy):
         self.max_hold_seconds: int     = int(config.get("max_hold_seconds", 240))
         self.position_size_usdc: float = config.get("position_size_usdc", 5.0)
 
+        # Token context — set by set_tokens() before analyze() is called
+        self._yes_token_id: str = ""
+        self._no_token_id: str = ""
+
+    # ------------------------------------------------------------------
+    # Public setters (same interface as BTCUpDownStrategy)
+    # ------------------------------------------------------------------
+
     def record_price(self, token_id: str, mid: float, ts: float = None) -> None:
         """No-op — coin toss needs no price history."""
         pass
+
+    def set_tokens(self, market_id: str, yes_token_id: str, no_token_id: str) -> None:
+        """Register current market tokens. Resets position state on rollover."""
+        if (yes_token_id != self._yes_token_id or no_token_id != self._no_token_id) \
+                and self._yes_token_id:
+            self._reset_position_state()
+        self._market_id    = market_id
+        self._yes_token_id = yes_token_id
+        self._no_token_id  = no_token_id
+        self._outcome_map  = {yes_token_id: "YES", no_token_id: "NO"}
 
     # ------------------------------------------------------------------
     # Strategy interface
@@ -50,7 +68,16 @@ class CoinTossStrategy(Strategy):
         by_token: Dict[str, Position]     = {p.token_id: p for p in positions}
         now_ts = time.monotonic()
 
-        self._auto_recover_position(by_token, now_ts)
+        # 1. Auto-recover state after restart
+        if self.active_token_id is None:
+            for tid in (self._yes_token_id, self._no_token_id):
+                pos = by_token.get(tid)
+                if pos and pos.size > 0:
+                    self.active_token_id = tid
+                    self.entry_price     = pos.average_price
+                    self.entry_timestamp = now_ts
+                    self.entry_size      = pos.size
+                    break
 
         # 2. Exit check — always before entry
         exit_sig = self.check_exit(order_books, by_token, now_ts)
@@ -62,7 +89,7 @@ class CoinTossStrategy(Strategy):
 
         # 3. Entry — only when flat
         if self.active_token_id is None:
-            entry_sig = self._coin_flip_entry(order_books, by_token, now_ts)
+            entry_sig = self._coin_flip_entry(order_books, now_ts)
             if entry_sig:
                 return [entry_sig]
 
@@ -78,12 +105,8 @@ class CoinTossStrategy(Strategy):
     def _coin_flip_entry(
         self,
         order_books: Dict[str, OrderBook],
-        by_token: Dict[str, Position],
         now_ts: float,
     ) -> Optional[Signal]:
-        if not self.is_flat(by_token):
-            return None
-
         # Flip coin: heads → YES, tails → NO
         outcome  = "YES" if random.random() < 0.5 else "NO"
         token_id = self._yes_token_id if outcome == "YES" else self._no_token_id
@@ -91,18 +114,20 @@ class CoinTossStrategy(Strategy):
         book = order_books.get(token_id)
         if book is None:
             return None
-        best_ask = book.asks[0].price if book.asks else get_mid_price(book)
-        if not best_ask or best_ask <= 0:
-            return None
-        if best_ask > self.max_entry_price or best_ask < self.min_entry_price:
+
+        # Use mid-price for realistic paper-trading fills.
+        # The CLOB book for short-lived markets can have extreme spreads
+        # ($0.01 / $0.99) — best_ask would be a terrible entry price.
+        mid = get_mid_price(book)
+        if not mid or mid <= 0:
             return None
 
         tick = book.tick_size or 0.001
-        size = round(self.position_size_usdc / best_ask, 2)
+        size = round(self.position_size_usdc / mid, 2)
 
         # Optimistically record position state
         self.active_token_id = token_id
-        self.entry_price     = best_ask
+        self.entry_price     = mid
         self.entry_timestamp = now_ts
         self.entry_size      = size
 
@@ -111,8 +136,8 @@ class CoinTossStrategy(Strategy):
             outcome=outcome,
             action="BUY",
             confidence=0.5,
-            price=round_to_tick(best_ask, tick),
+            price=round_to_tick(mid, tick),
             size=size,
-            reason=f"coin_toss: bought {outcome}",
+            reason=f"coin_toss: bought {outcome} @ mid={mid:.4f}",
         )
 

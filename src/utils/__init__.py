@@ -8,6 +8,10 @@ from .market_utils import (
     get_mid_price,
     cancel_if_exists,
 )
+from .volatility import estimate_realized_vol
+from .btc_feed import BtcPriceFeed, BookSnapshot
+from .kelly import kelly_fraction
+from .edge_detector import EdgeDecision, detect_edge
 
 __all__ = [
     "load_config",
@@ -18,5 +22,11 @@ __all__ = [
     "get_tick_size_fallback",
     "get_mid_price",
     "cancel_if_exists",
+    "estimate_realized_vol",
+    "BtcPriceFeed",
+    "BookSnapshot",
+    "kelly_fraction",
+    "EdgeDecision",
+    "detect_edge",
 ]
 

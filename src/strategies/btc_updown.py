@@ -46,11 +46,27 @@ class BTCUpDownStrategy(Strategy):
 
         self.current_bias: Bias = Bias[config.get("default_bias", "NONE").upper()]
 
-        self._history_max_age = max(self.confirmation_window_seconds * 3, 300.0)
+        # Token context — refreshed each cycle by set_tokens()
+        self._yes_token_id: str = ""
+        self._no_token_id: str = ""
+
+        # Mid-price history: token_id → [(monotonic_ts, mid), ...]
+        self._price_history: Dict[str, List[Tuple[float, float]]] = {}
+        self._history_max_age: float = max(self.confirmation_window_seconds * 3, 300.0)
 
     # ------------------------------------------------------------------
     # Public setters
     # ------------------------------------------------------------------
+
+    def set_tokens(self, market_id: str, yes_token_id: str, no_token_id: str) -> None:
+        """Register current market tokens. Resets position state on rollover."""
+        if (yes_token_id != self._yes_token_id or no_token_id != self._no_token_id) \
+                and self._yes_token_id:
+            self._reset_position_state()
+        self._market_id   = market_id
+        self._yes_token_id = yes_token_id
+        self._no_token_id  = no_token_id
+        self._outcome_map  = {yes_token_id: "YES", no_token_id: "NO"}
 
     def set_bias(self, bias: Bias) -> None:
         """
@@ -58,6 +74,17 @@ class BTCUpDownStrategy(Strategy):
         LONG / SHORT selects which token to enter; NONE keeps the bot flat.
         """
         self.current_bias = bias
+
+    def record_price(self, token_id: str, mid: float, ts: Optional[float] = None) -> None:
+        """Feed a mid-price observation into the internal history buffer.
+        Called by the ticker every 5 s so the 5-second lookback has data
+        between analyze() calls (which run every 5 minutes).
+        """
+        now = ts if ts is not None else time.monotonic()
+        buf = self._price_history.setdefault(token_id, [])
+        buf.append((now, mid))
+        cutoff = now - self._history_max_age
+        self._price_history[token_id] = [(t, p) for t, p in buf if t >= cutoff]
 
     # ------------------------------------------------------------------
     # Strategy interface
@@ -92,7 +119,16 @@ class BTCUpDownStrategy(Strategy):
             cutoff = now_ts - self._history_max_age
             self._price_history[tid] = [(ts, p) for ts, p in buf if ts >= cutoff]
 
-        self._auto_recover_position(by_token, now_ts)
+        # 2. Auto-recover state after restart (positions are source of truth)
+        if self.active_token_id is None:
+            for tid in (self._yes_token_id, self._no_token_id):
+                pos = by_token.get(tid)
+                if pos and pos.size > 0:
+                    self.active_token_id  = tid
+                    self.entry_price      = pos.average_price
+                    self.entry_timestamp  = now_ts   # conservative: treat as just entered
+                    self.entry_size       = pos.size
+                    break
 
         # 3. Exit check — always before entry
         exit_sig = self.check_exit(order_books, by_token, now_ts)
@@ -139,7 +175,8 @@ class BTCUpDownStrategy(Strategy):
         token_id = self._yes_token_id if self.current_bias == Bias.LONG \
                    else self._no_token_id
 
-        if not self.is_flat(by_token):
+        pos = by_token.get(token_id)
+        if pos and pos.size > 0:
             return None   # already holding — no pyramiding
 
         # Always measure momentum on YES token
@@ -166,17 +203,12 @@ class BTCUpDownStrategy(Strategy):
             return None
 
         tick     = book.tick_size or 0.001
-        best_ask = book.asks[0].price if book.asks else mid_now
-        if best_ask <= 0:
-            return None
-        if best_ask > self.max_entry_price or best_ask < self.min_entry_price:
-            return None
-        size       = round(self.position_size_usdc / best_ask, 2)
+        size       = round(self.position_size_usdc / mid_now, 2)
         confidence = min(0.5 + (abs(return_pct) / self.confirmation_pct) * 0.5, 1.0)
 
         # Optimistically record position state
         self.active_token_id  = token_id
-        self.entry_price      = best_ask
+        self.entry_price      = mid_now
         self.entry_timestamp  = now_ts
         self.entry_size       = size
 
@@ -186,7 +218,7 @@ class BTCUpDownStrategy(Strategy):
             outcome=self._outcome_map.get(token_id, ""),
             action="BUY",
             confidence=confidence,
-            price=round_to_tick(best_ask, tick),
+            price=round_to_tick(mid_now, tick),
             size=size,
             reason=(
                 f"momentum confirmed: YES {direction} return={return_pct:.2%} "
