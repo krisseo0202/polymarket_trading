@@ -28,20 +28,8 @@ class CoinTossStrategy(Strategy):
         self.position_size_usdc: float = config.get("position_size_usdc", 5.0)
 
         # Token context — set by set_tokens() before analyze() is called
-        self._market_id: str = ""
         self._yes_token_id: str = ""
         self._no_token_id: str = ""
-        self._outcome_map: Dict[str, str] = {}
-
-        # Open position state
-        self.active_token_id: Optional[str]  = None
-        self.entry_price: Optional[float]    = None
-        self.entry_timestamp: Optional[float] = None  # time.monotonic()
-        self.entry_size: Optional[float]     = None
-
-        # Saved just before reset so _execute_signals can compute realized PnL
-        self._pending_exit_entry_price: Optional[float] = None
-        self._pending_exit_entry_size: Optional[float]  = None
 
     # ------------------------------------------------------------------
     # Public setters (same interface as BTCUpDownStrategy)
@@ -126,16 +114,20 @@ class CoinTossStrategy(Strategy):
         book = order_books.get(token_id)
         if book is None:
             return None
-        best_ask = book.asks[0].price if book.asks else get_mid_price(book)
-        if not best_ask or best_ask <= 0:
+
+        # Use mid-price for realistic paper-trading fills.
+        # The CLOB book for short-lived markets can have extreme spreads
+        # ($0.01 / $0.99) — best_ask would be a terrible entry price.
+        mid = get_mid_price(book)
+        if not mid or mid <= 0:
             return None
 
         tick = book.tick_size or 0.001
-        size = round(self.position_size_usdc / best_ask, 2)
+        size = round(self.position_size_usdc / mid, 2)
 
         # Optimistically record position state
         self.active_token_id = token_id
-        self.entry_price     = best_ask
+        self.entry_price     = mid
         self.entry_timestamp = now_ts
         self.entry_size      = size
 
@@ -144,8 +136,8 @@ class CoinTossStrategy(Strategy):
             outcome=outcome,
             action="BUY",
             confidence=0.5,
-            price=round_to_tick(best_ask, tick),
+            price=round_to_tick(mid, tick),
             size=size,
-            reason=f"coin_toss: bought {outcome}",
+            reason=f"coin_toss: bought {outcome} @ mid={mid:.4f}",
         )
 

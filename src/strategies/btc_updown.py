@@ -47,20 +47,8 @@ class BTCUpDownStrategy(Strategy):
         self.current_bias: Bias = Bias[config.get("default_bias", "NONE").upper()]
 
         # Token context — refreshed each cycle by set_tokens()
-        self._market_id: str = ""
         self._yes_token_id: str = ""
         self._no_token_id: str = ""
-        self._outcome_map: Dict[str, str] = {}
-
-        # Open position state
-        self.active_token_id: Optional[str]   = None
-        self.entry_price: Optional[float]      = None
-        self.entry_timestamp: Optional[float]  = None  # time.monotonic()
-        self.entry_size: Optional[float]       = None
-
-        # Saved just before reset so _execute_signals can compute realized PnL
-        self._pending_exit_entry_price: Optional[float] = None
-        self._pending_exit_entry_size: Optional[float]  = None
 
         # Mid-price history: token_id → [(monotonic_ts, mid), ...]
         self._price_history: Dict[str, List[Tuple[float, float]]] = {}
@@ -215,15 +203,12 @@ class BTCUpDownStrategy(Strategy):
             return None
 
         tick     = book.tick_size or 0.001
-        best_ask = book.asks[0].price if book.asks else mid_now
-        if best_ask <= 0:
-            return None
-        size       = round(self.position_size_usdc / best_ask, 2)
+        size       = round(self.position_size_usdc / mid_now, 2)
         confidence = min(0.5 + (abs(return_pct) / self.confirmation_pct) * 0.5, 1.0)
 
         # Optimistically record position state
         self.active_token_id  = token_id
-        self.entry_price      = best_ask
+        self.entry_price      = mid_now
         self.entry_timestamp  = now_ts
         self.entry_size       = size
 
@@ -233,7 +218,7 @@ class BTCUpDownStrategy(Strategy):
             outcome=self._outcome_map.get(token_id, ""),
             action="BUY",
             confidence=confidence,
-            price=round_to_tick(best_ask, tick),
+            price=round_to_tick(mid_now, tick),
             size=size,
             reason=(
                 f"momentum confirmed: YES {direction} return={return_pct:.2%} "

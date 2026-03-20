@@ -126,3 +126,10 @@ Optional:
 - Binary markets always have `YES` and `NO` outcome tokens; `market.outcome_tokens` maps `"YES"/"NO"` → `token_id`.
 - `PolymarketClient` defaults `paper_trading=True`; `TradingEngine` defaults `paper_trading=False` (intentional asymmetry—client must be configured first).
 - `ExecutionTracker.reconcile()` is the preferred method over `reconcile_open_orders()` (which is a thin wrapper); pass `inventories` dict to get position state synced automatically.
+
+## Active Technologies
+- Python 3.10+ + `numpy` (MC simulation), `websockets` (BTC feed), `requests` (Polymarket API), `pytest` + `unittest.mock` (tests) (001-btc-prob-cycle-engine)
+- None (in-memory; no DB required) (001-btc-prob-cycle-engine)
+
+## Recent Changes
+- 001-btc-prob-cycle-engine: Added Python 3.10+ + `numpy` (MC simulation), `websockets` (BTC feed), `requests` (Polymarket API), `pytest` + `unittest.mock` (tests)
