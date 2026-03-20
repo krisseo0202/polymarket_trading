@@ -151,7 +151,12 @@ class PolymarketClient:
             raise Exception(f"Error fetching order book: {e}")
 
     def _fetch_real_order_book(self, token_id: str) -> OrderBook:
-        """Fetch real order book from CLOB REST API (no auth required)."""
+        """Fetch real order book from CLOB REST API (no auth required).
+
+        Also fetches the CLOB ``/midpoint`` endpoint and stores it as
+        ``last_price`` so that ``get_mid_price()`` returns a realistic
+        price even when the book spread is extremely wide.
+        """
         last_exc = None
         for _ in range(2):
             try:
@@ -177,6 +182,10 @@ class PolymarketClient:
                     )
                     for entry in data.get("asks", [])
                 ]
+
+                # Fetch CLOB midpoint for realistic pricing
+                midpoint = self._fetch_clob_midpoint(token_id)
+
                 return OrderBook(
                     market_id="",
                     token_id=token_id,
@@ -184,11 +193,25 @@ class PolymarketClient:
                     asks=asks,
                     min_order_size=int(data.get("min_order_size", 0)),
                     tick_size=float(data.get("tick_size", 0.01)),
+                    last_price=midpoint,
                     timestamp=datetime.now(),
                 )
             except Exception as e:
                 last_exc = e
         raise Exception(f"Error fetching real order book: {last_exc}")
+
+    def _fetch_clob_midpoint(self, token_id: str) -> Optional[float]:
+        """Fetch the CLOB midpoint price for a token (no auth required)."""
+        try:
+            resp = requests.get(
+                f"{self.host}/midpoint",
+                params={"token_id": token_id},
+                timeout=5,
+            )
+            resp.raise_for_status()
+            return float(resp.json().get("mid", 0)) or None
+        except Exception:
+            return None
     
     def get_midpoint(self, token_id):
         """Get current midpoint price or best effort"""
@@ -271,6 +294,7 @@ class PolymarketClient:
     def get_positions(self) -> List[Position]:
         """Get current positions"""
         if self.paper_trading:
+            self._settle_paper_orders()
             return list(self._paper_positions.values())
         
         try:
@@ -323,6 +347,7 @@ class PolymarketClient:
             List of open order dictionaries
         """
         if self.paper_trading:
+            self._settle_paper_orders()
             return [
                 {
                     'id': order.order_id,
@@ -444,7 +469,12 @@ class PolymarketClient:
         price: float,
         size: float
     ) -> Order:
-        """Simulate order placement for paper trading"""
+        """Simulate order placement for paper trading.
+
+        Orders start as PENDING and are settled (filled) on the next call to
+        ``get_positions()`` or ``get_open_orders()``, giving the reconciliation
+        loop a window to observe the pending state.
+        """
         order = Order(
             order_id=f"paper_{len(self._paper_orders)}",
             market_id=market_id,
@@ -453,32 +483,39 @@ class PolymarketClient:
             side=side,
             price=price,
             size=size,
-            status="FILLED",  # Auto-fill in paper trading
+            status="PENDING",
             timestamp=datetime.now()
         )
         self._paper_orders.append(order)
-        
-        # Update paper positions
-        position_key = f"{market_id}_{outcome}"
+        return order
+
+    def _settle_paper_orders(self) -> None:
+        """Simulate fill for pending paper orders (instant for simplicity)."""
+        for order in self._paper_orders:
+            if order.status == "PENDING":
+                order.status = "FILLED"
+                self._update_paper_position(order)
+
+    def _update_paper_position(self, order: Order) -> None:
+        """Apply a filled paper order to the paper positions ledger."""
+        position_key = order.token_id
         if position_key in self._paper_positions:
             pos = self._paper_positions[position_key]
-            if side == "BUY":
-                total_cost = pos.average_price * pos.size + price * size
-                pos.size += size
-                pos.average_price = total_cost / pos.size
+            if order.side == "BUY":
+                total_cost = pos.average_price * pos.size + order.price * order.size
+                pos.size += order.size
+                pos.average_price = total_cost / pos.size if pos.size > 0 else 0.0
             else:
-                pos.size -= size
+                pos.size -= order.size
                 if pos.size <= 0:
                     del self._paper_positions[position_key]
         else:
-            if side == "BUY":
+            if order.side == "BUY":
                 self._paper_positions[position_key] = Position(
-                    market_id=market_id,
-                    token_id=token_id,
-                    outcome=outcome,
-                    size=size,
-                    average_price=price
+                    market_id=order.market_id,
+                    token_id=order.token_id,
+                    outcome=order.outcome,
+                    size=order.size,
+                    average_price=order.price
                 )
-        
-        return order
 
