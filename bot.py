@@ -69,8 +69,13 @@ def sleep_until_next_cycle(interval_s: int) -> None:
 
 
 def _fetch_book_top(yes_token_id: str, no_token_id: str, logger=None) -> tuple:
-    """Fetch best bid/ask for YES and NO tokens via /book. Returns (yes_bid, yes_ask, no_bid, no_ask)."""
+    """Fetch best bid/ask for YES and NO tokens via /book.
+
+    Returns (yes_bid, yes_ask, no_bid, no_ask).
+    Also fetches CLOB midpoint as a fallback when the book spread is wide.
+    """
     def _top(token_id: str):
+        bid, ask, mid = None, None, None
         try:
             r = requests.get(
                 "https://clob.polymarket.com/book",
@@ -81,15 +86,32 @@ def _fetch_book_top(yes_token_id: str, no_token_id: str, logger=None) -> tuple:
             data = r.json()
             bids = data.get("bids") or []
             asks = data.get("asks") or []
-            bid = float(bids[0]["p"]) if bids else None
-            ask = float(asks[0]["p"]) if asks else None
-            if bid is None and ask is None and logger:
-                logger.debug(f"Empty book for token {token_id[:12]}...")
-            return bid, ask
+            bid = float(bids[0].get("price") or bids[0].get("p")) if bids else None
+            ask = float(asks[0].get("price") or asks[0].get("p")) if asks else None
         except Exception as e:
             if logger:
                 logger.debug(f"Book fetch failed for {token_id[:12]}...: {e}")
-            return None, None
+
+        # Fetch CLOB midpoint — more reliable than (bid+ask)/2 for wide spreads
+        try:
+            r = requests.get(
+                "https://clob.polymarket.com/midpoint",
+                params={"token_id": token_id},
+                timeout=5,
+            )
+            r.raise_for_status()
+            mid = float(r.json().get("mid", 0)) or None
+        except Exception:
+            pass
+
+        # Use midpoint as bid/ask when book is too wide or empty
+        if mid is not None:
+            if bid is None or (ask is not None and (ask - bid) > 0.50):
+                bid = mid
+            if ask is None or (bid is not None and (ask - bid) > 0.50):
+                ask = mid
+
+        return bid, ask
 
     yes_bid, yes_ask = _top(yes_token_id)
     no_bid,  no_ask  = _top(no_token_id)
@@ -177,27 +199,33 @@ def ticker_until_next_cycle(
             f"uPnL={unrealized:+.2f} ({pnl_pct:+.1f}%)"
         )
 
-    # Wait for first price fetch, then print one status line
+    # Wait for first price fetch, then log status every 30 seconds until next cycle
     time.sleep(2)
-    now = time.time()
-    next_run = math.ceil(now / interval_s) * interval_s
-    remaining = max(0, next_run - now)
-    mins, secs = divmod(int(remaining), 60)
-    if logger:
-        logger.info(
-            f"  YES b={_fmt(yes_bid[0])} a={_fmt(yes_ask[0])}"
-            f" | NO b={_fmt(no_bid[0])} a={_fmt(no_ask[0])}"
-            f" | {_pos_str()}"
-            f" | Next cycle in {mins:02d}:{secs:02d}"
-        )
+    last_logged = 0.0
 
-    # Sleep in 1-second increments (responsive to shutdown signals)
+    def _log_status():
+        now = time.time()
+        next_run = math.ceil(now / interval_s) * interval_s
+        remaining = max(0, next_run - now)
+        mins, secs = divmod(int(remaining), 60)
+        if logger:
+            logger.info(
+                f"  YES b={_fmt(yes_bid[0])} a={_fmt(yes_ask[0])}"
+                f" | NO b={_fmt(no_bid[0])} a={_fmt(no_ask[0])}"
+                f" | {_pos_str()}"
+                f" | Next cycle in {mins:02d}:{secs:02d}"
+            )
+
+    # Sleep in 1-second increments, refreshing status every 30 s
     try:
         while not _shutdown_requested:
             now = time.time()
             next_run = math.ceil(now / interval_s) * interval_s
             if next_run - now <= 0:
                 break
+            if now - last_logged >= 30.0:
+                _log_status()
+                last_logged = now
             time.sleep(1.0)
     finally:
         stop_evt.set()
@@ -247,6 +275,14 @@ def _execute_signals(
                 size=sig.size,
             )
             state.active_order_ids[token_id] = order.order_id
+            state.strategy_last_signal = (
+                f"{sig.action} {sig.outcome} @ {sig.price:.4f} | {sig.reason[:60]}"
+            )
+            state.strategy_last_signal_ts = time.time()
+            if sig.action == "BUY":
+                state.strategy_status = "POSITION_OPEN"
+            elif sig.action == "SELL":
+                state.strategy_status = "EXITED"
             if sig.action == "BUY":
                 cost = sig.price * sig.size
                 logger.info(
@@ -269,6 +305,44 @@ def _execute_signals(
                     )
         except Exception as e:
             logger.error(f"Order placement failed: {e}")
+
+
+def _snapshot_strategy_state(strategy, state: "BotState") -> None:
+    """Write strategy internal state into BotState fields for dashboard visibility."""
+    state.strategy_name = getattr(strategy, "name", "")
+    active_tid = getattr(strategy, "active_token_id", None)
+    state.strategy_status = "POSITION_OPEN" if active_tid else "WATCHING"
+
+    # Bias (btc_updown)
+    bias_obj = getattr(strategy, "current_bias", None)
+    state.strategy_bias = bias_obj.value if bias_obj is not None else ""
+
+    # Momentum % (btc_updown)
+    yes_tid = getattr(strategy, "_yes_token_id", None)
+    lookback_fn = getattr(strategy, "_lookback_mid", None)
+    price_history = getattr(strategy, "_price_history", {})
+    if yes_tid and lookback_fn and yes_tid in price_history:
+        now_mono = time.monotonic()
+        window = getattr(strategy, "confirmation_window_seconds", 60)
+        hist = price_history.get(yes_tid, [])
+        mid_now = hist[-1][1] if hist else None
+        mid_prev = lookback_fn(yes_tid, now_mono, window)
+        if mid_now and mid_prev and mid_prev > 0:
+            state.strategy_momentum_pct = (mid_now - mid_prev) / mid_prev
+        else:
+            state.strategy_momentum_pct = None
+    else:
+        state.strategy_momentum_pct = None
+
+    # Z-score (btc_vol_reversion)
+    compute_z = getattr(strategy, "_compute_zscore", None)
+    if compute_z and yes_tid:
+        try:
+            state.strategy_zscore = compute_z(yes_tid, time.monotonic())
+        except Exception:
+            state.strategy_zscore = None
+    else:
+        state.strategy_zscore = None
 
 
 def _make_intra_cycle_fn(
@@ -326,6 +400,7 @@ def _make_intra_cycle_fn(
                     market_id, yes_tid, no_tid, balance, positions,
                     paper_trading, logger,
                 )
+                _snapshot_strategy_state(strategy, state)
                 state_store.save(state)
         except Exception as e:
             logger.error(f"Intra-cycle analyze error: {e}", exc_info=True)
@@ -648,6 +723,13 @@ def main() -> None:
                 # Old token order IDs are now stale — clear them
                 for old_tid in (yes_token_id, no_token_id):
                     state.active_order_ids.pop(old_tid, None)
+                # Clear execution tracker state for old tokens
+                for old_tid in (yes_token_id, no_token_id):
+                    execution_tracker.active_orders = {
+                        oid: o for oid, o in execution_tracker.active_orders.items()
+                        if o.token_id != old_tid
+                    }
+                    execution_tracker._last_positions_by_token.pop(old_tid, None)
 
             current_market_id = new_market_id
             yes_token_id = market_info["yes_token_id"]
@@ -703,6 +785,19 @@ def main() -> None:
                     "position": inv.position,
                     "avg_cost": inv.avg_cost,
                 }
+
+            # ------------------------------------------------------------------
+            # Sync strategy position state with inventory truth
+            # ------------------------------------------------------------------
+            _synced = False
+            for tid in (yes_token_id, no_token_id):
+                inv = inventories.get(tid)
+                if inv and inv.position > 0:
+                    strategy.sync_position_from_inventory(tid, inv.position, inv.avg_cost)
+                    _synced = True
+                    break
+            if not _synced:
+                strategy.sync_position_from_inventory(None, 0.0, 0.0)
 
             # ------------------------------------------------------------------
             # Fetch order books and positions
@@ -792,6 +887,7 @@ def main() -> None:
 
             # ------------------------------------------------------------------
             state.cycle_count += 1
+            _snapshot_strategy_state(strategy, state)
             state_store.save(state)
 
             elapsed = time.monotonic() - cycle_start
