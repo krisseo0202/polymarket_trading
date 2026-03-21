@@ -271,6 +271,7 @@ class PolymarketClient:
     def get_positions(self) -> List[Position]:
         """Get current positions"""
         if self.paper_trading:
+            self._settle_paper_orders()
             return list(self._paper_positions.values())
         
         try:
@@ -323,6 +324,9 @@ class PolymarketClient:
             List of open order dictionaries
         """
         if self.paper_trading:
+            # Do NOT settle here — let reconciliation see PENDING orders first.
+            # Orders are settled in get_positions() so the tracker can detect
+            # the PENDING→gone transition and infer fills.
             return [
                 {
                     'id': order.order_id,
@@ -444,7 +448,12 @@ class PolymarketClient:
         price: float,
         size: float
     ) -> Order:
-        """Simulate order placement for paper trading"""
+        """Simulate order placement for paper trading.
+
+        Orders start as PENDING and are settled (filled) on the next call to
+        ``get_positions()`` or ``get_open_orders()``, giving the reconciliation
+        loop a window to observe the pending state.
+        """
         order = Order(
             order_id=f"paper_{len(self._paper_orders)}",
             market_id=market_id,
@@ -453,32 +462,41 @@ class PolymarketClient:
             side=side,
             price=price,
             size=size,
-            status="FILLED",  # Auto-fill in paper trading
+            status="PENDING",
             timestamp=datetime.now()
         )
         self._paper_orders.append(order)
-        
-        # Update paper positions
-        position_key = f"{market_id}_{outcome}"
+        return order
+
+    def _settle_paper_orders(self) -> None:
+        """Simulate fill for pending paper orders, then discard settled ones."""
+        for order in self._paper_orders:
+            if order.status == "PENDING":
+                order.status = "FILLED"
+                self._update_paper_position(order)
+        # Drop filled orders — only PENDING ones are needed by reconciliation
+        self._paper_orders = [o for o in self._paper_orders if o.status != "FILLED"]
+
+    def _update_paper_position(self, order: Order) -> None:
+        """Apply a filled paper order to the paper positions ledger."""
+        position_key = order.token_id
         if position_key in self._paper_positions:
             pos = self._paper_positions[position_key]
-            if side == "BUY":
-                total_cost = pos.average_price * pos.size + price * size
-                pos.size += size
-                pos.average_price = total_cost / pos.size
+            if order.side == "BUY":
+                total_cost = pos.average_price * pos.size + order.price * order.size
+                pos.size += order.size
+                pos.average_price = total_cost / pos.size if pos.size > 0 else 0.0
             else:
-                pos.size -= size
+                pos.size -= order.size
                 if pos.size <= 0:
                     del self._paper_positions[position_key]
         else:
-            if side == "BUY":
+            if order.side == "BUY":
                 self._paper_positions[position_key] = Position(
-                    market_id=market_id,
-                    token_id=token_id,
-                    outcome=outcome,
-                    size=size,
-                    average_price=price
+                    market_id=order.market_id,
+                    token_id=order.token_id,
+                    outcome=order.outcome,
+                    size=order.size,
+                    average_price=order.price
                 )
-        
-        return order
 

@@ -1,5 +1,6 @@
 """Historical data loading for backtesting"""
 
+import os
 from typing import List, Dict, Optional
 from datetime import datetime, timedelta
 import pandas as pd
@@ -8,6 +9,13 @@ from ..api.types import MarketData, OrderBook, OrderBookEntry
 
 
 EVENT_URL = "https://gamma-api.polymarket.com/events"
+
+# Default path relative to project root
+_DEFAULT_HISTORY_CSV = os.path.join(
+    os.path.dirname(__file__), "..", "..", "data", "btc_updown_5m.csv"
+)
+
+
 class DataLoader:
     """
     Load historical market data for backtesting
@@ -69,6 +77,30 @@ class DataLoader:
     
    
     
+    def load_btc_updown_history(
+        self, csv_path: Optional[str] = None
+    ) -> pd.DataFrame:
+        """Load collected BTC Up/Down 5-min history from CSV.
+
+        Args:
+            csv_path: Path to CSV file. Defaults to data/btc_updown_5m.csv
+
+        Returns:
+            DataFrame with columns: slot_ts, slot_utc, question, up_token,
+            down_token, outcome, volume, up_price_start, up_price_end,
+            down_price_start, down_price_end, strike_price
+        """
+        path = csv_path or _DEFAULT_HISTORY_CSV
+        df = pd.read_csv(path, parse_dates=["slot_utc"])
+        # Coerce numeric columns
+        for col in [
+            "volume", "up_price_start", "up_price_end",
+            "down_price_start", "down_price_end", "strike_price",
+        ]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        return df
+
     def load_order_book_snapshots(
         self,
         token_id: str,

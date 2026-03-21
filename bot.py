@@ -59,6 +59,45 @@ _session_losses: int = 0
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _apply_fill_to_state(
+    inv: "InventoryState",
+    side: str,
+    price: float,
+    size: float,
+    state: "BotState",
+    risk_manager: "RiskManager",
+) -> float:
+    """Apply a fill to inventory + state PnL. Returns realized PnL."""
+    realized = inv.apply_fill(side, price, size)
+    state.daily_realized_pnl += realized
+    if realized != 0.0:
+        risk_manager.record_trade(realized)
+    return realized
+
+
+def _sync_inventories_to_state(
+    state: "BotState", inventories: Dict[str, "InventoryState"]
+) -> None:
+    """Serialize all inventory states into the bot state dict."""
+    for token_id, inv in inventories.items():
+        state.inventories[token_id] = {
+            "position": inv.position,
+            "avg_cost": inv.avg_cost,
+        }
+
+
+def _sync_strategy_from_inventories(
+    strategy, inventories: Dict[str, "InventoryState"], token_ids: tuple
+) -> None:
+    """Sync strategy position state from authoritative inventory."""
+    for tid in token_ids:
+        inv = inventories.get(tid)
+        if inv and inv.position > 0:
+            strategy.sync_position_from_inventory(tid, inv.position, inv.avg_cost)
+            return
+    strategy.sync_position_from_inventory(None, 0.0, 0.0)
+
+
 def sleep_until_next_cycle(interval_s: int) -> None:
     """Sleep until the next wall-clock-aligned cycle boundary (no drift)."""
     now = time.time()
@@ -216,12 +255,15 @@ def ticker_until_next_cycle(
                 f" | Next cycle in {mins:02d}:{secs:02d}"
             )
 
+    # Compute the target boundary ONCE — break when we reach it.
+    _now = time.time()
+    target_boundary = math.ceil(_now / interval_s) * interval_s
+
     # Sleep in 1-second increments, refreshing status every 30 s
     try:
         while not _shutdown_requested:
             now = time.time()
-            next_run = math.ceil(now / interval_s) * interval_s
-            if next_run - now <= 0:
+            if now >= target_boundary:
                 break
             if now - last_logged >= 30.0:
                 _log_status()
@@ -244,6 +286,7 @@ def _execute_signals(
     positions: list,
     paper_trading: bool,
     logger,
+    inventories: Dict[str, "InventoryState"] = None,
 ) -> None:
     """Risk-gate BUY signals and place orders for all passing signals."""
     for sig in signals:
@@ -283,6 +326,15 @@ def _execute_signals(
                 state.strategy_status = "POSITION_OPEN"
             elif sig.action == "SELL":
                 state.strategy_status = "EXITED"
+
+            # Paper trading: apply fill directly to inventory (skip reconciliation dance)
+            if paper_trading and inventories is not None:
+                inv = inventories.get(token_id)
+                if inv is None:
+                    inv = InventoryState(token_id=token_id)
+                    inventories[token_id] = inv
+                _apply_fill_to_state(inv, sig.action, sig.price, sig.size, state, risk_manager)
+                _sync_inventories_to_state(state, inventories)
             if sig.action == "BUY":
                 cost = sig.price * sig.size
                 logger.info(
@@ -356,6 +408,8 @@ def _make_intra_cycle_fn(
     no_tid: str,
     paper_trading: bool,
     logger,
+    execution_tracker=None,
+    inventories=None,
 ):
     """Return a zero-arg callable for intra-cycle analyze+execute passes."""
     captured_slot = int(math.floor(time.time() / 300) * 300)
@@ -370,6 +424,22 @@ def _make_intra_cycle_fn(
 
             time_remaining = slot_expiry_ts - now_wall
             min_entry_window = getattr(strategy, 'max_hold_seconds', 240)
+
+            # Reconcile orders + positions → update inventories
+            if execution_tracker and inventories is not None:
+                closed_orders = execution_tracker.reconcile(
+                    client, [yes_tid, no_tid], inventories
+                )
+                for order in closed_orders:
+                    tid = order.token_id
+                    if state.active_order_ids.get(tid) == order.order_id:
+                        state.active_order_ids[tid] = None
+                for fill in execution_tracker.inferred_fills:
+                    inv = inventories.get(fill.token_id)
+                    if inv:
+                        _apply_fill_to_state(inv, fill.side, fill.price, fill.size, state, risk_manager)
+                _sync_inventories_to_state(state, inventories)
+                _sync_strategy_from_inventories(strategy, inventories, (yes_tid, no_tid))
 
             yes_book  = client.get_order_book(yes_tid)
             no_book   = client.get_order_book(no_tid)
@@ -392,13 +462,14 @@ def _make_intra_cycle_fn(
                         f"Intra-cycle: BUY suppressed ({time_remaining:.0f}s < "
                         f"{min_entry_window}s window) — exits only"
                     )
+                    strategy._reset_position_state()
 
             if signals:
                 logger.info(f"Intra-cycle: {len(signals)} signal(s)")
                 _execute_signals(
                     signals, client, strategy, risk_manager, state,
                     market_id, yes_tid, no_tid, balance, positions,
-                    paper_trading, logger,
+                    paper_trading, logger, inventories=inventories,
                 )
                 _snapshot_strategy_state(strategy, state)
                 state_store.save(state)
@@ -650,8 +721,8 @@ def main() -> None:
     risk_manager = RiskManager(limits=risk_limits)
 
     execution_tracker = ExecutionTracker(
-        orders_sync_interval_s=interval * 0.5,
-        positions_sync_interval_s=interval,
+        orders_sync_interval_s=5.0,       # reconcile orders every 5s (intra-cycle needs fast detection)
+        positions_sync_interval_s=10.0,   # reconcile positions every 10s
     )
 
     if args.strategy == "coin_toss":
@@ -702,6 +773,7 @@ def main() -> None:
             graceful_shutdown(state, state_store, client, paper_trading, logger)
 
         cycle_start = time.monotonic()
+        logger.info(f"=== Main loop iteration (cycle {state.cycle_count + 1}) ===")
 
         try:
             # ------------------------------------------------------------------
@@ -771,33 +843,18 @@ def main() -> None:
             for fill in execution_tracker.inferred_fills:
                 inv = inventories.get(fill.token_id)
                 if inv:
-                    realized = inv.apply_fill(fill.side, fill.price, fill.size)
-                    state.daily_realized_pnl += realized
-                    if realized != 0.0:
-                        risk_manager.record_trade(realized)
-                        if realized > 0:
-                            _session_wins += 1
-                        else:
-                            _session_losses += 1
+                    realized = _apply_fill_to_state(inv, fill.side, fill.price, fill.size, state, risk_manager)
+                    if realized > 0:
+                        _session_wins += 1
+                    elif realized < 0:
+                        _session_losses += 1
 
-            for token_id, inv in inventories.items():
-                state.inventories[token_id] = {
-                    "position": inv.position,
-                    "avg_cost": inv.avg_cost,
-                }
+            _sync_inventories_to_state(state, inventories)
 
             # ------------------------------------------------------------------
             # Sync strategy position state with inventory truth
             # ------------------------------------------------------------------
-            _synced = False
-            for tid in (yes_token_id, no_token_id):
-                inv = inventories.get(tid)
-                if inv and inv.position > 0:
-                    strategy.sync_position_from_inventory(tid, inv.position, inv.avg_cost)
-                    _synced = True
-                    break
-            if not _synced:
-                strategy.sync_position_from_inventory(None, 0.0, 0.0)
+            _sync_strategy_from_inventories(strategy, inventories, (yes_token_id, no_token_id))
 
             # ------------------------------------------------------------------
             # Fetch order books and positions
@@ -841,6 +898,7 @@ def main() -> None:
                         orphan_sigs, client, strategy, risk_manager, state,
                         current_market_id, yes_token_id, no_token_id,
                         balance, positions, paper_trading, logger,
+                        inventories=inventories,
                     )
                     state_store.save(state)
                     positions = client.get_positions()  # refresh after cleanup
@@ -863,6 +921,7 @@ def main() -> None:
             intra_cycle_analyze_fn = _make_intra_cycle_fn(
                 client, strategy, risk_manager, state, state_store,
                 current_market_id, yes_token_id, no_token_id, paper_trading, logger,
+                execution_tracker=execution_tracker, inventories=inventories,
             )
             signals = strategy.analyze(market_data)
 
@@ -878,11 +937,14 @@ def main() -> None:
                         f"Entry suppressed at cycle start: {_time_remaining:.0f}s < "
                         f"{_min_entry}s required window"
                     )
+                    # Undo optimistic position state set by the strategy
+                    strategy._reset_position_state()
 
             _execute_signals(
                 signals, client, strategy, risk_manager, state,
                 current_market_id, yes_token_id, no_token_id,
                 balance, positions, paper_trading, logger,
+                inventories=inventories,
             )
 
             # ------------------------------------------------------------------

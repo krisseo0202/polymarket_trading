@@ -28,20 +28,8 @@ class CoinTossStrategy(Strategy):
         self.position_size_usdc: float = config.get("position_size_usdc", 5.0)
 
         # Token context — set by set_tokens() before analyze() is called
-        self._market_id: str = ""
         self._yes_token_id: str = ""
         self._no_token_id: str = ""
-        self._outcome_map: Dict[str, str] = {}
-
-        # Open position state
-        self.active_token_id: Optional[str]  = None
-        self.entry_price: Optional[float]    = None
-        self.entry_timestamp: Optional[float] = None  # time.monotonic()
-        self.entry_size: Optional[float]     = None
-
-        # Saved just before reset so _execute_signals can compute realized PnL
-        self._pending_exit_entry_price: Optional[float] = None
-        self._pending_exit_entry_size: Optional[float]  = None
 
     # ------------------------------------------------------------------
     # Public setters (same interface as BTCUpDownStrategy)

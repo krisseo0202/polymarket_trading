@@ -47,20 +47,8 @@ class BTCUpDownStrategy(Strategy):
         self.current_bias: Bias = Bias[config.get("default_bias", "NONE").upper()]
 
         # Token context — refreshed each cycle by set_tokens()
-        self._market_id: str = ""
         self._yes_token_id: str = ""
         self._no_token_id: str = ""
-        self._outcome_map: Dict[str, str] = {}
-
-        # Open position state
-        self.active_token_id: Optional[str]   = None
-        self.entry_price: Optional[float]      = None
-        self.entry_timestamp: Optional[float]  = None  # time.monotonic()
-        self.entry_size: Optional[float]       = None
-
-        # Saved just before reset so _execute_signals can compute realized PnL
-        self._pending_exit_entry_price: Optional[float] = None
-        self._pending_exit_entry_size: Optional[float]  = None
 
         # Mid-price history: token_id → [(monotonic_ts, mid), ...]
         self._price_history: Dict[str, List[Tuple[float, float]]] = {}

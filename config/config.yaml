@@ -13,9 +13,9 @@ btc_updown_bot:
 
 strategies:
   coin_toss:
-    enabled: false             # baseline test only; flip to true to benchmark pipeline
+    enabled: true              # baseline test; flip to false to disable
     position_size_usdc: 5.0    # small size for pipeline testing
-    max_hold_seconds: 240      # force-exit before 5-min market expires
+    max_hold_seconds: 60       # short hold for testing — exit quickly
     profit_target_pct: 0.10   # 10% take-profit
     stop_loss_pct: 0.05        # 5% stop-loss
     min_confidence: 0.5        # coin flip always has confidence=0.5

@@ -35,6 +35,20 @@ class Strategy(ABC):
         self.min_confidence = config.get("min_confidence", 0.5)
         self.max_position_size = config.get("max_position_size", 1000.0)
 
+        # Position state — authoritative after sync_position_from_inventory()
+        self.active_token_id: Optional[str] = None
+        self.entry_price: Optional[float] = None
+        self.entry_timestamp: Optional[float] = None
+        self.entry_size: Optional[float] = None
+
+        # Token context — subclasses populate via set_tokens()
+        self._market_id: str = ""
+        self._outcome_map: Dict[str, str] = {}
+
+        # Pending exit info for PnL computation
+        self._pending_exit_entry_price: Optional[float] = None
+        self._pending_exit_entry_size: Optional[float] = None
+
     @abstractmethod
     def analyze(self, market_data: Dict[str, Any]) -> List[Signal]:
         pass
@@ -138,6 +152,26 @@ class Strategy(ABC):
         self.entry_price     = None
         self.entry_timestamp = None
         self.entry_size      = None
+
+    def sync_position_from_inventory(
+        self,
+        token_id: Optional[str],
+        position: float,
+        avg_cost: float,
+    ) -> None:
+        """Synchronize strategy position state with authoritative inventory.
+
+        Called after ExecutionTracker.reconcile() to ensure the strategy's
+        internal bookkeeping matches on-chain reality.
+        """
+        if position > 0 and token_id:
+            if self.active_token_id != token_id:
+                self.active_token_id = token_id
+                self.entry_price = avg_cost
+                self.entry_size = position
+                self.entry_timestamp = time.monotonic()
+        elif self.active_token_id == token_id or token_id is None:
+            self._reset_position_state()
 
     def get_position_info(self) -> Optional[Dict[str, Any]]:
         """Return current open position info for display, or None if flat."""
