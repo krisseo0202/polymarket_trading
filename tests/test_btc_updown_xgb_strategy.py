@@ -26,9 +26,8 @@ class _FakeFeed:
 
 
 class _FakeModelService:
-    def __init__(self, prob_yes=None, prob_no=None, feature_status="ready"):
+    def __init__(self, prob_yes=None, feature_status="ready"):
         self.prob_yes = prob_yes
-        self.prob_no = prob_no
         self.feature_status = feature_status
         self.thresholds = {}
         self.model_version = "test_model"
@@ -36,7 +35,6 @@ class _FakeModelService:
     def predict(self, snapshot):
         return PredictionResult(
             prob_yes=self.prob_yes,
-            prob_no=self.prob_no,
             model_version=self.model_version,
             feature_status=self.feature_status,
         )
@@ -62,11 +60,11 @@ def _market_data(yes_book, no_book, positions=None, seconds_to_expiry=120):
     }
 
 
-def _strategy(prob_yes=None, prob_no=None, healthy=True, feature_status="ready"):
+def _strategy(prob_yes=None, healthy=True, feature_status="ready"):
     strategy = BTCUpDownXGBStrategy(
         config={},
         btc_feed=_FakeFeed(healthy=healthy),
-        model_service=_FakeModelService(prob_yes=prob_yes, prob_no=prob_no, feature_status=feature_status),
+        model_service=_FakeModelService(prob_yes=prob_yes, feature_status=feature_status),
         logger=logging.getLogger("test"),
     )
     strategy.set_tokens("mkt", "yes", "no")
@@ -74,7 +72,7 @@ def _strategy(prob_yes=None, prob_no=None, healthy=True, feature_status="ready")
 
 
 def test_buy_yes_signal():
-    strategy = _strategy(prob_yes=0.62, prob_no=0.38)
+    strategy = _strategy(prob_yes=0.62)
     signals = strategy.analyze(_market_data(_book("yes", 0.53, 0.55), _book("no", 0.60, 0.62)))
 
     assert len(signals) == 1
@@ -83,7 +81,7 @@ def test_buy_yes_signal():
 
 
 def test_buy_no_signal():
-    strategy = _strategy(prob_yes=0.40, prob_no=0.60)
+    strategy = _strategy(prob_yes=0.40)
     signals = strategy.analyze(_market_data(_book("yes", 0.58, 0.60), _book("no", 0.51, 0.53)))
 
     assert len(signals) == 1
@@ -92,14 +90,14 @@ def test_buy_no_signal():
 
 
 def test_no_trade_on_weak_edge():
-    strategy = _strategy(prob_yes=0.55, prob_no=0.45)
+    strategy = _strategy(prob_yes=0.55)
     signals = strategy.analyze(_market_data(_book("yes", 0.53, 0.54), _book("no", 0.45, 0.46)))
 
     assert signals == []
 
 
 def test_no_trade_on_wide_spread():
-    strategy = _strategy(prob_yes=0.70, prob_no=0.30)
+    strategy = _strategy(prob_yes=0.70)
     signals = strategy.analyze(_market_data(_book("yes", 0.40, 0.70), _book("no", 0.30, 0.60)))
 
     assert signals == []
@@ -107,7 +105,7 @@ def test_no_trade_on_wide_spread():
 
 
 def test_fail_closed_on_stale_feed():
-    strategy = _strategy(prob_yes=0.70, prob_no=0.30, healthy=False)
+    strategy = _strategy(prob_yes=0.70, healthy=False)
     signals = strategy.analyze(_market_data(_book("yes", 0.50, 0.52), _book("no", 0.48, 0.50)))
 
     assert signals == []
@@ -115,7 +113,7 @@ def test_fail_closed_on_stale_feed():
 
 
 def test_exit_on_model_flip():
-    strategy = _strategy(prob_yes=0.40, prob_no=0.60)
+    strategy = _strategy(prob_yes=0.40)
     strategy.active_token_id = "yes"
     strategy.entry_price = 0.55
     strategy.entry_timestamp = time.monotonic() - 10
@@ -131,7 +129,7 @@ def test_exit_on_model_flip():
 
 
 def test_paper_trading_smoke_executes_signal():
-    strategy = _strategy(prob_yes=0.62, prob_no=0.38)
+    strategy = _strategy(prob_yes=0.62)
     signal = strategy.analyze(_market_data(_book("yes", 0.53, 0.55), _book("no", 0.60, 0.62)))[0]
 
     client = PolymarketClient(paper_trading=True)

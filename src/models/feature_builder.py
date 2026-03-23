@@ -72,7 +72,7 @@ def build_live_features(snapshot: Mapping[str, object]) -> FeatureBuildResult:
     features["strike_price"] = strike_price
     features["seconds_to_expiry"] = seconds_to_expiry
     features["moneyness"] = (btc_mid - strike_price) / strike_price
-    features["distance_to_strike_bps"] = (btc_mid - strike_price) / strike_price * 10_000.0
+    features["distance_to_strike_bps"] = features["moneyness"] * 10_000.0
 
     features["btc_ret_15s"] = _safe_return(btc_prices, now_ts, 15)
     features["btc_ret_30s"] = _safe_return(btc_prices, now_ts, 30)
@@ -228,11 +228,10 @@ def _prices_to_ohlc(
 
 def coerce_training_frame(df: pd.DataFrame) -> pd.DataFrame:
     """Coerce an input frame into the fixed feature schema."""
-    out = pd.DataFrame(index=df.index)
-    for name in FEATURE_COLUMNS:
-        if name in df.columns:
-            out[name] = pd.to_numeric(df[name], errors="coerce").fillna(DEFAULT_FEATURE_VALUES[name])
-        else:
-            out[name] = DEFAULT_FEATURE_VALUES[name]
-    return out
+    present = [c for c in FEATURE_COLUMNS if c in df.columns]
+    out = df.reindex(columns=FEATURE_COLUMNS)
+    if present:
+        out[present] = out[present].apply(pd.to_numeric, errors="coerce")
+    defaults = pd.Series(DEFAULT_FEATURE_VALUES)
+    return out.fillna(defaults)
 

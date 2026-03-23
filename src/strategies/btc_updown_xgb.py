@@ -46,29 +46,11 @@ class BTCUpDownXGBStrategy(Strategy):
         self.min_seconds_to_expiry: float = float(config.get("min_seconds_to_expiry", thresholds.get("min_seconds_to_expiry", 20.0)))
         self.max_seconds_to_expiry: float = float(config.get("max_seconds_to_expiry", thresholds.get("max_seconds_to_expiry", 240.0)))
 
-        self._price_history: Dict[str, List[Tuple[float, float]]] = {}
-        self._history_max_age: float = 300.0
-
         self.last_prob_yes: Optional[float] = None
         self.last_edge_yes: Optional[float] = None
         self.last_edge_no: Optional[float] = None
         self.last_feature_status: str = ""
         self.last_model_version: str = self.model_service.model_version
-
-    def set_tokens(self, market_id: str, yes_token_id: str, no_token_id: str) -> None:
-        if (yes_token_id != self._yes_token_id or no_token_id != self._no_token_id) and self._yes_token_id:
-            self._reset_position_state()
-        self._market_id = market_id
-        self._yes_token_id = yes_token_id
-        self._no_token_id = no_token_id
-        self._outcome_map = {yes_token_id: "YES", no_token_id: "NO"}
-
-    def record_price(self, token_id: str, mid: float, ts: Optional[float] = None) -> None:
-        now = ts if ts is not None else time.monotonic()
-        buf = self._price_history.setdefault(token_id, [])
-        buf.append((now, mid))
-        cutoff = now - self._history_max_age
-        self._price_history[token_id] = [(t, p) for t, p in buf if t >= cutoff]
 
     def analyze(self, market_data: Dict[str, Any]) -> List[Signal]:
         if not self._yes_token_id or not self._no_token_id:

@@ -43,38 +43,7 @@ class BTCVolatilityReversionStrategy(Strategy):
         self.max_hold_seconds: int      = int(config.get("max_hold_seconds", 90))
         self.position_size_usdc: float  = config.get("position_size_usdc", 20.0)
 
-        # Token context — refreshed each cycle by set_tokens()
-        self._yes_token_id: str = ""
-        self._no_token_id: str = ""
-
-        # Mid-price history: token_id → [(monotonic_ts, mid), ...]
-        self._price_history: Dict[str, List[Tuple[float, float]]] = {}
-        self._history_max_age: float = max(self.window_seconds * 3, 300.0)
-
-    # ------------------------------------------------------------------
-    # Public setters
-    # ------------------------------------------------------------------
-
-    def set_tokens(self, market_id: str, yes_token_id: str, no_token_id: str) -> None:
-        """Register current market tokens. Resets position state on rollover."""
-        if (yes_token_id != self._yes_token_id or no_token_id != self._no_token_id) \
-                and self._yes_token_id:
-            self._reset_position_state()
-        self._market_id   = market_id
-        self._yes_token_id = yes_token_id
-        self._no_token_id  = no_token_id
-        self._outcome_map  = {yes_token_id: "YES", no_token_id: "NO"}
-
-    def record_price(self, token_id: str, mid: float, ts: Optional[float] = None) -> None:
-        """Feed a mid-price observation into the internal history buffer.
-        Called by the ticker every 1s so the rolling window has dense samples
-        for accurate z-score computation.
-        """
-        now = ts if ts is not None else time.monotonic()
-        buf = self._price_history.setdefault(token_id, [])
-        buf.append((now, mid))
-        cutoff = now - self._history_max_age
-        self._price_history[token_id] = [(t, p) for t, p in buf if t >= cutoff]
+        self._history_max_age = max(self.window_seconds * 3, 300.0)
 
     # ------------------------------------------------------------------
     # Strategy interface
