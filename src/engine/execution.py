@@ -1,6 +1,7 @@
 """Execution tracking for market making"""
 
 from typing import Dict, Iterable, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import time
 
@@ -151,13 +152,16 @@ class ExecutionTracker:
 
         open_orders_by_token: Dict[str, Dict[str, Order]] = {}
         if self._should_sync(self._last_orders_sync_monotonic, self._orders_sync_interval_s):
-            for token_id in token_list:
-                try:
-                    open_orders_raw = client.get_open_orders(token_id)
-                except Exception as e:
-                    logger.warning(f"poll open orders failed: {e}")
-                    open_orders_raw = []
-                open_orders_by_token[token_id] = self._parse_open_orders(open_orders_raw, token_id)
+            with ThreadPoolExecutor(max_workers=len(token_list)) as pool:
+                futures = {pool.submit(client.get_open_orders, tid): tid for tid in token_list}
+                for future in as_completed(futures):
+                    tid = futures[future]
+                    try:
+                        open_orders_raw = future.result()
+                    except Exception as e:
+                        logger.warning(f"poll open orders failed: {e}")
+                        open_orders_raw = []
+                    open_orders_by_token[tid] = self._parse_open_orders(open_orders_raw, tid)
 
             next_active: Dict[str, Order] = {
                 order_id: order

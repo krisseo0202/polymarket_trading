@@ -1,0 +1,84 @@
+{
+  "model_name": "btc_updown_xgb",
+  "model_version": "btc_updown_xgb_20260323T050815Z",
+  "feature_columns": [
+    "btc_mid",
+    "btc_ret_15s",
+    "btc_ret_30s",
+    "btc_ret_60s",
+    "btc_vol_30s",
+    "btc_vol_60s",
+    "strike_price",
+    "seconds_to_expiry",
+    "moneyness",
+    "distance_to_strike_bps",
+    "yes_bid",
+    "yes_ask",
+    "yes_mid",
+    "yes_spread",
+    "yes_spread_pct",
+    "yes_book_imbalance",
+    "yes_ret_30s",
+    "no_bid",
+    "no_ask",
+    "no_mid",
+    "no_spread",
+    "no_spread_pct",
+    "no_book_imbalance",
+    "no_ret_30s",
+    "active_bull_gap",
+    "active_bear_gap",
+    "latest_gap_distance_pct",
+    "bull_setup",
+    "bear_setup",
+    "buy_cd",
+    "sell_cd",
+    "buy_9",
+    "sell_9",
+    "buy_13",
+    "sell_13"
+  ],
+  "feature_groups": [
+    "btc_core",
+    "btc_vol",
+    "strike_time"
+  ],
+  "thresholds": {
+    "min_edge": 0.03,
+    "min_prob_yes": 0.54,
+    "max_prob_yes_for_no": 0.46,
+    "max_spread_pct": 0.06,
+    "exit_edge": -0.01,
+    "min_seconds_to_expiry": 20.0,
+    "max_seconds_to_expiry": 240.0
+  },
+  "calibration": {
+    "bin_edges": [
+      0.0,
+      0.46888574957847595,
+      1.0
+    ],
+    "bin_values": [
+      0.5344827586206896,
+      0.5344827586206896
+    ]
+  },
+  "metrics": {
+    "train_rows": 229,
+    "valid_rows": 58,
+    "raw_log_loss": 0.6993843368415175,
+    "calibrated_log_loss": 0.6907671705264811,
+    "raw_brier": 0.25311390695319147,
+    "calibrated_brier": 0.24881093935790727,
+    "positive_rate": 0.4808362369337979
+  },
+  "training": {
+    "feature_groups": [
+      "btc_core",
+      "btc_vol",
+      "strike_time"
+    ],
+    "val_fraction": 0.2,
+    "num_round": 200
+  }
+}

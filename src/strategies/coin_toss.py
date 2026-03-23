@@ -27,10 +27,6 @@ class CoinTossStrategy(Strategy):
         self.max_hold_seconds: int     = int(config.get("max_hold_seconds", 240))
         self.position_size_usdc: float = config.get("position_size_usdc", 5.0)
 
-        # Token context — set by set_tokens() before analyze() is called
-        self._yes_token_id: str = ""
-        self._no_token_id: str = ""
-
     # ------------------------------------------------------------------
     # Public setters (same interface as BTCUpDownStrategy)
     # ------------------------------------------------------------------
@@ -89,7 +85,7 @@ class CoinTossStrategy(Strategy):
 
         # 3. Entry — only when flat
         if self.active_token_id is None:
-            entry_sig = self._coin_flip_entry(order_books, now_ts)
+            entry_sig = self._coin_flip_entry(order_books, by_token, now_ts)
             if entry_sig:
                 return [entry_sig]
 
@@ -105,8 +101,12 @@ class CoinTossStrategy(Strategy):
     def _coin_flip_entry(
         self,
         order_books: Dict[str, OrderBook],
+        by_token: Dict[str, Position],
         now_ts: float,
     ) -> Optional[Signal]:
+        if not self.is_flat(by_token):
+            return None
+
         # Flip coin: heads → YES, tails → NO
         outcome  = "YES" if random.random() < 0.5 else "NO"
         token_id = self._yes_token_id if outcome == "YES" else self._no_token_id
@@ -116,6 +116,8 @@ class CoinTossStrategy(Strategy):
             return None
         best_ask = book.asks[0].price if book.asks else get_mid_price(book)
         if not best_ask or best_ask <= 0:
+            return None
+        if best_ask > self.max_entry_price or best_ask < self.min_entry_price:
             return None
 
         tick = book.tick_size or 0.001

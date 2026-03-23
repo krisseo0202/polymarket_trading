@@ -4,7 +4,7 @@ import json
 import os
 from dataclasses import dataclass, field, asdict
 from datetime import date
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 
 @dataclass
@@ -15,6 +15,8 @@ class BotState:
 
     daily_realized_pnl: float = 0.0
     daily_reset_date: str = ""        # "YYYY-MM-DD"; reset when date changes
+    session_wins: int = 0
+    session_losses: int = 0
     cycle_count: int = 0
     inventories: Dict[str, Dict] = field(default_factory=dict)
     # token_id -> {"position": float, "avg_cost": float}
@@ -24,9 +26,26 @@ class BotState:
     strategy_bias: str = ""                     # "LONG" | "SHORT" | "NONE"
     strategy_zscore: Optional[float] = None     # btc_vol_reversion only
     strategy_momentum_pct: Optional[float] = None  # btc_updown only
+    strategy_prob_yes: Optional[float] = None
+    strategy_edge_yes: Optional[float] = None
+    strategy_edge_no: Optional[float] = None
+    strategy_model_version: str = ""
+    strategy_feature_status: str = ""
     strategy_last_signal: str = ""              # e.g. "BUY YES @ 0.6500 | momentum=2.3%"
     strategy_last_signal_ts: float = 0.0
     strategy_status: str = ""                   # "WATCHING" | "POSITION_OPEN" | "EXITED"
+
+    # Chainlink reference price (slot-open "price to beat")
+    chainlink_ref_price: Optional[float] = None
+    chainlink_ref_slot_ts: Optional[int] = None
+    chainlink_healthy: bool = False
+
+    # Per-slot realized PnL — resets on each 5-min market rollover
+    slot_realized_pnl: float = 0.0
+
+    # Trade history — last 20 fills, newest last
+    # Each entry: {"ts": float, "action": str, "outcome": str, "price": float, "size": float}
+    trade_log: List[Dict] = field(default_factory=list)
 
     def __post_init__(self):
         if not self.daily_reset_date:
@@ -64,9 +83,19 @@ class StateStore:
                 strategy_bias=data.get("strategy_bias", ""),
                 strategy_zscore=data.get("strategy_zscore"),
                 strategy_momentum_pct=data.get("strategy_momentum_pct"),
+                strategy_prob_yes=data.get("strategy_prob_yes"),
+                strategy_edge_yes=data.get("strategy_edge_yes"),
+                strategy_edge_no=data.get("strategy_edge_no"),
+                strategy_model_version=data.get("strategy_model_version", ""),
+                strategy_feature_status=data.get("strategy_feature_status", ""),
                 strategy_last_signal=data.get("strategy_last_signal", ""),
                 strategy_last_signal_ts=float(data.get("strategy_last_signal_ts", 0.0)),
                 strategy_status=data.get("strategy_status", ""),
+                chainlink_ref_price=data.get("chainlink_ref_price"),
+                chainlink_ref_slot_ts=data.get("chainlink_ref_slot_ts"),
+                chainlink_healthy=data.get("chainlink_healthy", False),
+                slot_realized_pnl=float(data.get("slot_realized_pnl", 0.0)),
+                trade_log=data.get("trade_log", []),
             )
         except Exception:
             # Corrupt / unreadable — start fresh rather than crashing

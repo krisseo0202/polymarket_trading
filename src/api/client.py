@@ -127,14 +127,16 @@ class PolymarketClient:
         try:
             book = self.client.get_order_book(token_id)
 
-            bids = [
-                OrderBookEntry(price=float(bid.price), size=float(bid.size))
-                for bid in book.bids
-            ]
-            asks = [
-                OrderBookEntry(price=float(ask.price), size=float(ask.size))
-                for ask in book.asks
-            ]
+            bids = sorted(
+                [OrderBookEntry(price=float(bid.price), size=float(bid.size))
+                 for bid in book.bids],
+                key=lambda e: e.price, reverse=True,
+            )
+            asks = sorted(
+                [OrderBookEntry(price=float(ask.price), size=float(ask.size))
+                 for ask in book.asks],
+                key=lambda e: e.price,
+            )
             min_order_size = int(book.min_order_size)
             tick_size = float(book.tick_size)
             return OrderBook(
@@ -151,7 +153,13 @@ class PolymarketClient:
             raise Exception(f"Error fetching order book: {e}")
 
     def _fetch_real_order_book(self, token_id: str) -> OrderBook:
-        """Fetch real order book from CLOB REST API (no auth required)."""
+        """Fetch real order book from CLOB REST API (no auth required).
+
+        Also fetches the CLOB midpoint and applies a spread-based fallback:
+        if the spread > 0.50 or either side is empty, both bid and ask are
+        replaced with the midpoint.  This prevents strategies from using
+        complement-side asks (e.g. 0.99 for a NO token at 1.5¢) as entry prices.
+        """
         last_exc = None
         for _ in range(2):
             try:
@@ -163,27 +171,54 @@ class PolymarketClient:
                 response.raise_for_status()
                 data = response.json()
 
-                bids = [
-                    OrderBookEntry(
+                bids = sorted(
+                    [OrderBookEntry(
                         price=float(entry.get("price") or entry.get("p")),
                         size=float(entry.get("size") or entry.get("s")),
                     )
-                    for entry in data.get("bids", [])
-                ]
-                asks = [
-                    OrderBookEntry(
+                    for entry in data.get("bids", [])],
+                    key=lambda e: e.price, reverse=True,
+                )
+                asks = sorted(
+                    [OrderBookEntry(
                         price=float(entry.get("price") or entry.get("p")),
                         size=float(entry.get("size") or entry.get("s")),
                     )
-                    for entry in data.get("asks", [])
-                ]
+                    for entry in data.get("asks", [])],
+                    key=lambda e: e.price,
+                )
+
+                # Only fetch /midpoint when book is one-sided or spread is wide.
+                best_bid = bids[0].price if bids else None
+                best_ask = asks[0].price if asks else None
+                spread = (best_ask - best_bid) if (best_bid is not None and best_ask is not None) else float("inf")
+
+                if best_bid is None or best_ask is None or spread > 0.50:
+                    mid = None
+                    try:
+                        mr = requests.get(
+                            f"{self.host}/midpoint",
+                            params={"token_id": token_id},
+                            timeout=5,
+                        )
+                        mr.raise_for_status()
+                        mid = float(mr.json().get("mid", 0)) or None
+                    except Exception:
+                        pass
+
+                    if mid is not None:
+                        if best_bid is None or spread > 0.50:
+                            bids = [OrderBookEntry(price=mid, size=0.0)]
+                        if best_ask is None or spread > 0.50:
+                            asks = [OrderBookEntry(price=mid, size=0.0)]
+
                 return OrderBook(
                     market_id="",
                     token_id=token_id,
                     bids=bids,
                     asks=asks,
                     min_order_size=int(data.get("min_order_size", 0)),
-                    tick_size=float(data.get("tick_size", 0.01)),
+                    tick_size=float(data.get("tick_size", 0.001)),
                     timestamp=datetime.now(),
                 )
             except Exception as e:
@@ -227,7 +262,7 @@ class PolymarketClient:
         try:
             order_args = OrderArgs(
                 token_id=token_id,
-                price=price,
+                price=round(price, 3),
                 size=size,
                 side=BUY if side.upper() == "BUY" else SELL,
             )

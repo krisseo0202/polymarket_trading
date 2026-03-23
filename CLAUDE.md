@@ -1,142 +1,249 @@
-# CLAUDE.md
+# CLAUDE.md — Polymarket BTC 5-Min Up/Down Trading Bot
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This repo is a production-grade trading system. Treat it that way.
+Your job (as Claude Code) is to ship correct, testable, observable changes that improve long-run expected value while respecting strict risk controls.
 
-## Workflow Orchestration (How to Work in This Repo)
+This is NOT financial advice. Trading can lose money quickly.
 
-### 1) Plan Mode Default
-- Enter plan mode for ANY non-trivial task (3+ steps or architectural decisions).
-- If something goes sideways, STOP and re-plan immediately — don't keep pushing.
-- Use plan mode for verification steps, not just building.
-- Write detailed specs upfront to reduce ambiguity.
+## Mission
 
-### 2) Subagent Strategy
-- Use subagents liberally to keep the main context window clean.
-- Offload research, exploration, and parallel analysis to subagents.
-- For complex problems, throw more compute at it via subagents.
-- One tack per subagent for focused execution.
+Build an automated bot that trades Polymarket “BTC Up or Down — 5 minutes” markets with:
+- deterministic decision rules,
+- explicit edge thresholds,
+- fractional Kelly sizing,
+- strict risk limits,
+- execution-aware order placement,
+- full observability + reproducible backtests.
 
-### 3) Self-Improvement Loop
-- After ANY correction from the user: update `tasks/lessons.md` with the pattern.
-- Write rules for yourself that prevent the same mistake.
-- Ruthlessly iterate on these lessons until mistake rate drops.
-- Review relevant lessons at session start for the current project/task.
+The bot MUST respect one critical reality:
+- The market resolves using Chainlink BTC/USD stream start vs end price for that 5-minute window.
+  Do not assume an exchange’s spot feed matches settlement perfectly.
 
-### 4) Verification Before Done
-- Never mark a task complete without proving it works.
-- Diff behavior between main and your changes when relevant.
-- Ask yourself: "Would a staff engineer approve this?"
-- Run tests, check logs, and demonstrate correctness.
+## Workflow Orchestration
 
-### 5) Demand Elegance (Balanced)
-- For non-trivial changes: pause and ask "is there a more elegant way?"
-- If a fix feels hacky: "Knowing everything I know now, implement the elegant solution."
-- Skip this for simple, obvious fixes — don't over-engineer.
-- Challenge your own work before presenting it.
+### Plan Mode Default
+Before coding:
+1) Write a plan to `tasks/todo.md` with checkboxes and acceptance tests.
+2) If approach/scope is non-obvious, ask for confirmation BEFORE implementation.
+3) Mark progress as you go; keep diffs small.
 
-### 6) Autonomous Bug Fixing
-- When given a bug report: fix it. Don't ask for hand-holding.
-- Point at logs, errors, failing tests — then resolve them.
-- Zero context switching required from the user.
-- Go fix failing CI tests without being told how.
+### Subagent Strategy
+When useful, delegate:
+- Research (docs, math, model choices)
+- Refactors / cleanup
+- Debugging failing tests
+Then integrate.
 
-## Task Management (How to Execute Work)
-1. **Plan First:** Write plan to `tasks/todo.md` with checkable items.
-2. **Verify Plan:** Check in before starting implementation (when scope/approach is non-obvious).
-3. **Track Progress:** Mark items complete as you go.
-4. **Explain Changes:** High-level summary at each step.
-5. **Document Results:** Add review section to `tasks/todo.md`.
-6. **Capture Lessons:** Update `tasks/lessons.md` after corrections.
+### Self-Improvement Loop
+After every significant task:
+- Add 1–3 bullets to `tasks/lessons.md` about what broke, what surprised you, and what to do next time.
 
-## Commands
+### Verification Before Done
+A change is “done” only if:
+- tests pass,
+- backtest sanity checks pass (if strategy logic changed),
+- logs show required decision breakdown,
+- risk invariants are enforced.
 
-### Running the System
-```bash
-python bot.py              # live/paper trading (reads config/config.yaml)
-python bot.py --paper      # force paper mode
-python dashboard.py        # monitoring TUI (Rich)
-python signal_diagnostic.py  # debug signals offline
-python live_diagnostic.py    # debug live BTC feed
-```
+### Demand Elegance (Balanced)
+Prefer the simplest correct implementation that is hard to misuse.
+Avoid gold-plating or abstract frameworks unless necessary.
 
-### Running Tests
-```bash
-# Run all tests
-pytest tests/
+## Repo Operating Commands
 
-# Run a single test file
-pytest tests/engine/test_trading_engine.py
+### Running
+- `python bot.py --strategy <name> --interval 300`
+- Prefer paper trading by default until explicitly enabled.
 
-# Run a single test
-pytest tests/engine/test_trading_engine.py::test_trading_engine_execute_signal
-
-# Run live tests (requires PRIVATE_KEY, PROXY_FUNDER env vars)
-pytest tests/ --live --yes-token <TOKEN_ID> --no-token <TOKEN_ID>
-# Or via env: POLY_LIVE_TEST=true pytest tests/
-```
+### Testing
+- Run all tests: `pytest`
+- Single test file: `pytest tests/test_<x>.py`
+- Single test: `pytest -k <name>`
+- Live tests require secrets; never run on mainnet funds without explicit user request.
 
 ### Dependencies
-Install manually (no requirements.txt present):
-```bash
-pip install py-clob-client requests pandas numpy pyyaml pytest rich websockets
-```
+- Keep requirements minimal.
+- Prefer pinned versions for trading-critical libs.
+- Record environment changes in README or `tasks/lessons.md`.
 
-## Git Workflow
-- Remote URL must NOT embed tokens: `git remote set-url origin https://github.com/...`
-- Token lives in osxkeychain only — clear stale credentials with:
-  ```bash
-  printf "protocol=https\nhost=github.com\n" | git credential-osxkeychain erase
-  ```
-- PR scope: fine-grained PAT needs "Contents: Read and write" + "Pull requests: Read and write"
+## System model for BTC 5-minute markets
 
-## Architecture
+### Market definition
+Each market is a discrete 5-minute window.
+Outcome:
+- “Up” if end price >= start price
+- “Down” otherwise
+Resolution uses Chainlink BTC/USD stream.
 
-### Core Flow
-`bot.py` is the main entry point. It aligns to wall-clock 5-minute cycles via `CycleScheduler`, fetches BTC price from `BtcFeed` (WebSocket), runs each registered `Strategy.analyze()`, evaluates edge via `EdgeDetector` (Kelly sizing), and calls `PolymarketClient.place_order()`. State is crash-persisted to `bot_state.json` via `BotState`.
+### What we are predicting
+Our model outputs `p_up` = P(Up resolves) for the current 5-minute window at decision time.
 
-### Key Modules
+Market-implied probability is approximated by:
+- Up ask/bid midpoint (execution-aware), OR
+- the best available price we can realistically fill at.
 
-**`bot.py`** — Main loop, cycle alignment, `_execute_signals`, `_snapshot_strategy_state`
+Edge definition:
+- `edge_up = p_up - price_up_fillable`
+- `edge_down = (1 - p_up) - price_down_fillable`
 
-**`dashboard.py`** — Rich TUI: BTC price chart, live order book, market cycle panel, strategy state panels
+We only trade when edge clears threshold AFTER expected costs.
 
-**`src/api/`**
-- `client.py` — `PolymarketClient`: wraps `py-clob-client`'s `ClobClient`. In paper trading mode, `self.client = None` and all methods return mock data. Prices are always in `[0.0, 1.0]` probability space. Positions are fetched from `data-api.polymarket.com` (not the CLOB), using `PROXY_FUNDER` env var.
-- `types.py` — All shared dataclasses: `MarketData`, `OrderBook`, `OrderBookEntry`, `Position`, `Order`, `Fill`, and the `Side` literal type.
+## Baseline model spec
 
-**`src/strategies/`**
-- `base.py` — Abstract `Strategy` class with `Signal` dataclass. Implement `analyze(market_data) -> List[Signal]` and `should_enter(signal) -> bool`. The `market_data` dict always has keys: `markets`, `order_books`, `price_history`, `positions`, `balance`.
-- `btc_updown.py` — Momentum bias strategy: confirmation window, YES/NO entries based on BTC direction.
-- `btc_vol_reversion.py` — Z-score mean reversion on BTC volatility.
+### Minimal Poisson/Kelly baseline (first shippable)
+Goal: produce a calibrated `p_up` with minimal complexity.
 
-**`src/engine/`**
-- `risk_manager.py` — `RiskManager` + `RiskLimits`: validates signals against position/exposure/daily-loss limits and circuit breakers.
-- `inventory.py` — `InventoryState`: average-cost inventory tracking with correct flip/partial-close math. Position `> 0` = long, `< 0` = short.
-- `pnl.py` — `PnLTracker`: realized PnL from fills + mark-to-market unrealized PnL.
-- `execution.py` — `ExecutionTracker`: polls open orders and positions, reconciles disappeared orders as FILLED/PARTIALLY_FILLED/CANCELED by comparing position deltas.
-- `state_store.py` — `BotState`: crash-safe JSON persistence of bot state to `bot_state.json`.
+Model the BTC midprice as a compound Poisson jump process in 5-minute horizon:
+- estimate jump arrival rate λ from recent high-frequency returns,
+- estimate jump size distribution from rolling window,
+- approximate probability that cumulative jump sum over 5 minutes is > 0.
 
-**`src/utils/`**
-- `btc_feed.py` — WebSocket BTC price feed.
-- `edge_detector.py` — `EdgeDecision` + Kelly sizing: evaluates whether a signal has sufficient edge to trade.
-- `cycle_scheduler.py` — Wall-clock-aligned 5-minute cycle trigger.
-- `config.py` — `load_config()`: reads `config/config.yaml`, then overrides with env vars (`PRIVATE_KEY`, `FUNDER_ADDRESS`, `PAPER_TRADING`, `LOG_LEVEL`).
-- `logger.py` — `setup_logger()`.
+Deliverable baseline:
+- A function `predict_p_up(features) -> float` returning [0,1]
+- Calibration step on historical windows (reliability curve / Brier score)
 
-**`src/pipeline.py`** — Dry-run end-to-end pipeline harness for offline testing.
+If Poisson fit is unstable, fall back to a logistic regression on the same feature set.
 
-### Environment Variables
-Required for live trading (store in `.env`, which is gitignored):
-- `PRIVATE_KEY` — wallet private key for signing orders
-- `PROXY_FUNDER` — funder/proxy address (used for positions API lookup)
-- `CHAIN_ID` — defaults to `137` (Polygon)
+### Recommended ML alternative (second milestone)
+A simple, robust classifier/regressor that trains fast and is hard to overfit:
+- Gradient boosted trees (e.g., LightGBM/XGBoost) OR
+- Regularized logistic regression with engineered features
 
-Optional:
-- `PAPER_TRADING=true` — skips real order submission
-- `POLY_LIVE_TEST=true` / `YES_TOKEN_ID` / `NO_TOKEN_ID` — for live test suite
+Target metrics:
+- Brier score improvement vs baseline
+- Calibration (ECE) acceptable before deploying sizing changes
 
-### Important Invariants
-- All prices are in `[0.0, 1.0]` (probability/share price, not USD).
-- Binary markets always have `YES` and `NO` outcome tokens; `market.outcome_tokens` maps `"YES"/"NO"` → `token_id`.
-- `PolymarketClient` defaults `paper_trading=True`; `TradingEngine` defaults `paper_trading=False` (intentional asymmetry—client must be configured first).
-- `ExecutionTracker.reconcile()` is the preferred method over `reconcile_open_orders()` (which is a thin wrapper); pass `inventories` dict to get position state synced automatically.
+## Feature set (minimum viable)
+
+Must-haves:
+- Market features: best bid/ask, spread, depth at top N levels, midpoint, short-term price velocity of market probability
+- External BTC features: 5s/15s/60s returns, realized volatility, orderflow proxy (if available), time-to-expiry seconds
+- Microstructure flags: “near close” (e.g., <60s), spread widening, book thinning
+
+Nice-to-haves:
+- Cross-venue BTC price microstructure to anticipate Chainlink stream moves
+- Latency estimates for order placement/cancel round trips
+- A toxicity proxy (e.g., VPIN-like imbalance on Polymarket flow if you have prints)
+
+## Position sizing
+
+### Kelly for binary contracts (BUY Up)
+If price is `x` (0<x<1) and model probability is `p`:
+- EV per $1 risk is `p - x`
+- Full Kelly fraction is: `f_kelly = (p - x) / (1 - x)`
+
+For BUY Down at price `y`:
+- use `p_down = 1 - p_up`
+- `f_kelly = (p_down - y) / (1 - y)`
+
+### Fractional Kelly (default)
+Because `p_up` is uncertain:
+- `f = k * f_kelly`
+- default `k` in [0.10, 0.25] unless user overrides
+- hard cap per-trade fraction regardless of f_kelly
+
+### Empirical Kelly haircuts (preferred when backtest exists)
+If you have a return distribution from realistic fills:
+- run Monte Carlo resampling (path reordering)
+- size to control 95th percentile drawdown
+- apply uncertainty haircut based on CV of edge estimates
+
+## Risk limits (hard)
+
+These limits MUST be enforced by the RiskManager and verified in tests:
+
+Capital and exposure
+- Max fraction of account at risk per market: e.g. 1–3% (configurable)
+- Max simultaneous open BTC 5-minute positions: 1 (per active window)
+- Max notional open orders: capped (configurable)
+- No doubling-down / martingale
+
+Loss controls
+- Daily loss limit: stop trading after hitting limit
+- Per-trade stop-loss optional, but if used must consider market’s 5-minute resolution cadence
+- Cooldown after N consecutive losses or severe slippage events
+
+Execution safety
+- Never hold both Up and Down in the SAME 5-minute market unless the strategy is explicitly “arb/market-make”
+- Cancel stale orders before placing new ones
+- Never place orders without verifying current market id and time-to-expiry
+
+## Execution rules
+
+Polymarket uses limit orders; “market orders” are marketable limit orders.
+Default behavior:
+- Prefer maker-style entry when time-to-expiry is sufficient
+- Use taker-style entry only when:
+  - edge is large enough to pay spread/fees,
+  - and you require immediate fill
+
+Order placement
+- Compute fillable price from orderbook depth (not just top-of-book)
+- Use GTD for short windows (expire before settlement)
+- If near the end of the window, avoid opening new positions unless edge is extreme and fill is guaranteed
+
+Order management
+- Maintain an OrderTracker; reconcile open orders and positions every cycle
+- Cancel/replace logic must be deterministic and rate-limited
+- Treat partial fills as first-class: update position state immediately
+
+Latency priorities
+- Cancel latency matters: stale resting orders are a primary loss source
+- Log: detection timestamp, submit timestamp, cancel timestamp, fill timestamp, and end-to-end round trip
+
+## State machine
+
+The bot must follow an explicit state machine for safety and testability.
+
+High-level states:
+- INIT → LOAD_STATE → SYNC → SELECT_MARKET → EVALUATE → (PLACE_ORDER → MANAGE_POSITION)* → ROLLOVER → ...
+- ERROR → COOLDOWN → RECOVER
+
+Key invariants:
+- Exactly one active market_id at a time
+- At most one net position per active market_id
+- `price` always in [0,1]
+- Positions must be reconciled from the exchange / API, not guessed from local memory
+
+## Logging and observability (required)
+
+Every cycle MUST log:
+- market_id, slug, start/end timestamps, time_to_expiry
+- orderbook snapshot summary (bid/ask, spread, depth)
+- model output p_up, chosen side, edge after costs, sizing fraction, intended shares
+- execution actions (orders submitted/canceled/filled), latency, slippage estimate
+- risk: current balance, daily pnl, drawdown estimate, reason for skip/trade
+
+Alerts / guardrails (at minimum):
+- daily loss limit hit
+- unusually high cancel failures
+- fill rate collapse
+- price outside [0,1] (should never happen)
+- repeated market-id mismatch / rollover confusion
+
+## Backtest and validation checklist
+
+A strategy change is NOT acceptable without:
+- walk-forward / out-of-sample validation
+- realistic fill modeling (limit vs taker, partial fills, slippage)
+- fee modeling (including any market-specific fees)
+- sensitivity analysis on thresholds / k (fractional Kelly)
+- calibration check for p_up
+
+## Deployment checklist
+
+Before turning on real trading:
+- paper trading for X days with identical configuration
+- verify env vars and secret handling (no secrets in logs)
+- small-capital ramp with strict caps
+- monitoring dashboard is live
+- emergency stop works (kill switch)
+
+## Onboarding
+
+If you are new to this repo:
+1) Read this file fully.
+2) Run unit tests.
+3) Run paper trading on BTC 5-minute markets.
+4) Implement baseline model; validate calibration; only then touch sizing.
+5) Add one improvement at a time; keep diffs small and measurable.

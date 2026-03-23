@@ -15,13 +15,13 @@ Usage:
 """
 
 import argparse
+import email.utils
 import json
 import logging
 import math
 import os
-import re
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -32,6 +32,7 @@ from rich.table import Table
 from rich.text import Text
 
 from src.utils.btc_feed import BtcPriceFeed
+from src.utils.chainlink_feed import ChainlinkFeed
 
 
 # ── Caches ────────────────────────────────────────────────────────────────────
@@ -48,6 +49,23 @@ _MARKET_CACHE_TTL = 60.0  # re-discover every 60s
 _book_cache: Optional[Dict[str, Any]] = None
 _book_cache_ts: float = 0.0
 _BOOK_CACHE_TTL = 3.0  # refresh book every 3s
+_book_fetch_ok_ts: float = 0.0  # last SUCCESSFUL fetch timestamp
+
+# Server-clock offset: updated from HTTP Date: headers on each market fetch.
+# Compensates for WSL clock drift vs. Polymarket server time.
+_clock_offset: float = 0.0
+
+
+def _server_now() -> float:
+    """Return local time adjusted by the last-observed Polymarket server clock offset."""
+    return time.time() + _clock_offset
+
+
+def _current_slot_ts(now: Optional[float] = None) -> int:
+    """Return the active 5-minute slot timestamp."""
+    if now is None:
+        now = _server_now()
+    return int(math.floor(now / 300) * 300)
 
 
 # ── Chart defaults ────────────────────────────────────────────────────────────
@@ -155,9 +173,9 @@ def _render_chart(
 
 def _discover_market() -> Optional[Dict[str, Any]]:
     """Find the current BTC Up/Down 5-min market via gamma API. Cached 60s (or until slot rolls)."""
-    global _market_cache, _market_cache_ts, _market_cache_slot
+    global _market_cache, _market_cache_ts, _market_cache_slot, _clock_offset
 
-    now = time.time()
+    now = _server_now()
     current_slot = int(math.floor(now / 300) * 300)
     slot_changed = (current_slot != _market_cache_slot)
 
@@ -173,6 +191,15 @@ def _discover_market() -> Optional[Dict[str, Any]]:
             timeout=5,
         )
         resp.raise_for_status()
+
+        # Update server-clock offset from HTTP Date: header
+        date_hdr = resp.headers.get("Date")
+        if date_hdr:
+            try:
+                server_ts = email.utils.parsedate_to_datetime(date_hdr).timestamp()
+                _clock_offset = server_ts - time.time()
+            except Exception:
+                pass
         events = resp.json()
         for event in (events if isinstance(events, list) else [events]):
             for m in event.get("markets", []):
@@ -180,12 +207,20 @@ def _discover_market() -> Optional[Dict[str, Any]]:
                 outcomes = json.loads(m.get("outcomes", "[]"))
                 if len(tids) >= 2:
                     volume = float(m.get("volume", 0) or 0)
+                    end_ts = None
+                    raw_end = m.get("endDate") or m.get("endDateIso")
+                    if raw_end:
+                        try:
+                            end_ts = datetime.fromisoformat(raw_end.replace("Z", "+00:00")).timestamp()
+                        except Exception:
+                            pass
                     _market_cache = {
                         "up_token": tids[0],
                         "down_token": tids[1],
                         "outcomes": outcomes,
                         "volume": volume,
                         "title": m.get("question", ""),
+                        "end_ts": end_ts,
                     }
                     _market_cache_ts = now
                     _market_cache_slot = current_slot
@@ -197,7 +232,7 @@ def _discover_market() -> Optional[Dict[str, Any]]:
 
 def _fetch_clob_book(token_id: str) -> Optional[Dict[str, Any]]:
     """Fetch order book from CLOB for a token. Cached 3s."""
-    global _book_cache, _book_cache_ts
+    global _book_cache, _book_cache_ts, _book_fetch_ok_ts
 
     now = time.time()
     if (_book_cache is not None
@@ -215,20 +250,38 @@ def _fetch_clob_book(token_id: str) -> Optional[Dict[str, Any]]:
         data = resp.json()
         data["_token_id"] = token_id
 
-        # Also fetch midpoint for the "Last" display
-        try:
-            mr = requests.get(
-                "https://clob.polymarket.com/midpoint",
-                params={"token_id": token_id},
-                timeout=3,
-            )
-            mr.raise_for_status()
-            data["_midpoint"] = float(mr.json().get("mid", 0))
-        except Exception:
-            data["_midpoint"] = None
+        # Compute midpoint from book data; only fall back to /midpoint if both sides empty
+        raw_bids = data.get("bids") or []
+        raw_asks = data.get("asks") or []
+        new_mid = None
+        if raw_bids and raw_asks:
+            new_mid = (float(raw_bids[0].get("price") or raw_bids[0].get("p"))
+                       + float(raw_asks[0].get("price") or raw_asks[0].get("p"))) / 2
+        elif raw_bids:
+            new_mid = float(raw_bids[0].get("price") or raw_bids[0].get("p"))
+        elif raw_asks:
+            new_mid = float(raw_asks[0].get("price") or raw_asks[0].get("p"))
+        else:
+            # Book completely empty — fetch /midpoint as last resort
+            try:
+                mr = requests.get(
+                    "https://clob.polymarket.com/midpoint",
+                    params={"token_id": token_id},
+                    timeout=3,
+                )
+                mr.raise_for_status()
+                new_mid = float(mr.json().get("mid", 0)) or None
+            except Exception:
+                new_mid = None
+
+        # Track previous midpoint for direction arrow
+        old_mid = _book_cache.get("_midpoint") if _book_cache else None
+        data["_prev_midpoint"] = old_mid
+        data["_midpoint"] = new_mid
 
         _book_cache = data
         _book_cache_ts = now
+        _book_fetch_ok_ts = now
         return _book_cache
     except Exception:
         return _book_cache  # stale on error
@@ -237,9 +290,10 @@ def _fetch_clob_book(token_id: str) -> Optional[Dict[str, Any]]:
 _OB_LEVELS = 5  # number of price levels to show per side
 
 
-def _build_order_book_panel() -> Panel:
+def _build_order_book_panel(market: Optional[Dict[str, Any]] = None) -> Panel:
     """Build a Polymarket-style order book panel (asks on top, bids below)."""
-    market = _discover_market()
+    if market is None:
+        market = _discover_market()
     if market is None:
         return Panel(
             Text("No market found", style="dim italic"),
@@ -322,13 +376,27 @@ def _build_order_book_panel() -> Panel:
         best_bid = top_bids[0]["price"]
         best_ask = top_asks[0]["price"]
         spread = best_ask - best_bid
-        spread_cents = int(round(spread * 100))
-        last_str = f"{int(round(midpoint * 100))}\u00a2" if midpoint else "–"
+        spread_str = f"{spread * 100:.2f}"
+        # Direction arrow comparing to previous fetch
+        prev_mid = book_data.get("_prev_midpoint")
+        if midpoint and prev_mid:
+            if midpoint > prev_mid + 1e-6:
+                arrow = "\u2191"  # ↑
+            elif midpoint < prev_mid - 1e-6:
+                arrow = "\u2193"  # ↓
+            else:
+                arrow = "="
+        else:
+            arrow = ""
+        last_str = f"{midpoint * 100:.2f}\u00a2{arrow}" if midpoint else "–"
+        # Book age: seconds since last successful API fetch
+        age = time.time() - _book_fetch_ok_ts if _book_fetch_ok_ts > 0 else 0
+        age_str = f"{age:.0f}s ago" if age > 0 else ""
         tbl.add_row(
             Text("", style="dim"),
             Text(f"Last: {last_str}", style="bold yellow"),
-            Text("", style="dim"),
-            Text(f"Spread: {spread_cents}\u00a2", style="dim"),
+            Text(age_str, style="dim italic"),
+            Text(f"Spread: {spread_str}\u00a2", style="dim"),
         )
 
     # Bids — highest first
@@ -350,14 +418,71 @@ def _build_order_book_panel() -> Panel:
     )
 
 
+# ── CLOB midpoint cache (for unrealized PnL) ─────────────────────────────────
+
+_mid_cache: Dict[str, Tuple[float, float]] = {}  # token_id -> (mid, fetch_ts)
+_MID_CACHE_TTL = 5.0
+
+
+def _cached_midpoint(token_id: str) -> Optional[float]:
+    """Fetch CLOB midpoint for a token, cached for 5s."""
+    now = time.time()
+    cached = _mid_cache.get(token_id)
+    if cached is not None and (now - cached[1]) < _MID_CACHE_TTL:
+        return cached[0]
+    try:
+        r = requests.get(
+            "https://clob.polymarket.com/midpoint",
+            params={"token_id": token_id},
+            timeout=3,
+        )
+        r.raise_for_status()
+        mid = float(r.json().get("mid", 0)) or None
+        if mid is not None:
+            _mid_cache[token_id] = (mid, now)
+        return mid
+    except Exception:
+        return cached[0] if cached else None
+
+
+def _compute_total_unrealized(bot_state: dict) -> Optional[float]:
+    """Compute total unrealized PnL from active inventories + CLOB midpoints."""
+    inventories = bot_state.get("inventories", {})
+    active = {
+        tid: inv for tid, inv in inventories.items()
+        if inv.get("position", 0) != 0
+    }
+    if not active:
+        return None
+
+    total = 0.0
+    for tid, inv in active.items():
+        pos = inv.get("position", 0)
+        avg_cost = inv.get("avg_cost", 0)
+        mid = _cached_midpoint(tid)
+        if mid is None:
+            return None  # can't compute reliably — bail
+        total += (mid - avg_cost) * pos
+    return total
+
+
 # ── Bot state & positions helpers ─────────────────────────────────────────────
 
+_state_cache: Optional[Tuple[Dict[str, Any], float]] = None
+_state_cache_mtime: float = 0.0
+
+
 def _load_bot_state(path: str) -> Tuple[Optional[Dict[str, Any]], Optional[float]]:
-    """Read and parse bot_state.json. Returns (data, file_mtime) or (None, None)."""
+    """Read and parse bot_state.json. Cached; re-reads only when mtime changes."""
+    global _state_cache, _state_cache_mtime
     try:
         mtime = os.path.getmtime(path)
+        if _state_cache is not None and mtime == _state_cache_mtime:
+            return _state_cache
         with open(path, "r") as f:
             data = json.load(f)
+        _state_cache = (data, mtime)
+        _state_cache_mtime = mtime
         return data, mtime
     except (OSError, json.JSONDecodeError):
         return None, None
@@ -392,6 +517,7 @@ def _fetch_live_positions() -> Optional[List[dict]]:
 def _build_positions_panel(
     bot_state: Optional[dict],
     live_positions: Optional[List[dict]],
+    market: Optional[Dict[str, Any]] = None,
 ) -> Panel:
     """Build the Positions panel from bot state + optional live enrichment."""
     if bot_state is None:
@@ -423,6 +549,17 @@ def _build_positions_panel(
             if asset:
                 live_lookup[asset] = pos
 
+    # Build token_id → side label map from current market cache.
+    # Polymarket binary markets: tids[0] = YES, tids[1] = NO — always.
+    if market is None:
+        market = _discover_market()
+    token_to_outcome: dict = {}
+    if market:
+        if market.get("up_token"):
+            token_to_outcome[market["up_token"]] = "YES"
+        if market.get("down_token"):
+            token_to_outcome[market["down_token"]] = "NO"
+
     tbl = Table(show_header=True, box=None, padding=(0, 1), expand=True)
     tbl.add_column("Side", style="bold", no_wrap=True)
     tbl.add_column("Size", justify="right", no_wrap=True)
@@ -433,16 +570,22 @@ def _build_positions_panel(
         pos_size = inv.get("position", 0)
         avg_cost = inv.get("avg_cost", 0)
 
-        # Determine label from live data or truncated token id
+        # Determine label: market outcome > live API outcome > truncated ID
         live = live_lookup.get(tid)
-        if live and live.get("outcome"):
+        if tid in token_to_outcome:
+            label = token_to_outcome[tid]
+        elif live and live.get("outcome"):
             label = live["outcome"]
         else:
             label = tid[:8] + "…" if len(tid) > 8 else tid
 
-        # Unrealized PnL from live data
+        # Unrealized PnL: live API price > CLOB midpoint > fallback "–"
+        cur: Optional[float] = None
         if live and "cur_price" in live:
             cur = float(live["cur_price"])
+        if cur is None:
+            cur = _cached_midpoint(tid)
+        if cur is not None and avg_cost > 0:
             upnl = (cur - avg_cost) * pos_size
             upnl_style = "green" if upnl >= 0 else "red"
             upnl_str = f"{upnl:+.4f}"
@@ -458,7 +601,10 @@ def _build_positions_panel(
     return Panel(tbl, title="[dim]Positions[/dim]", border_style="dim")
 
 
-def _build_pnl_panel(bot_state: Optional[dict]) -> Panel:
+def _build_pnl_panel(
+    bot_state: Optional[dict],
+    total_upnl: Optional[float] = None,
+) -> Panel:
     """Build the PnL panel from bot state."""
     if bot_state is None:
         return Panel(
@@ -469,14 +615,39 @@ def _build_pnl_panel(bot_state: Optional[dict]) -> Panel:
 
     daily_pnl = bot_state.get("daily_realized_pnl", 0.0)
     reset_date = bot_state.get("daily_reset_date", "–")
+    session_wins = bot_state.get("session_wins", 0)
+    session_losses = bot_state.get("session_losses", 0)
 
-    pnl_style = "green" if daily_pnl >= 0 else "red"
+    rpnl_style = "green" if daily_pnl >= 0 else "red"
+
+    total_trades = session_wins + session_losses
+    if total_trades > 0:
+        win_rate = session_wins / total_trades
+        wr_str = f"{win_rate*100:.0f}%  ({session_wins}W/{session_losses}L)"
+        wr_style = "bold green" if win_rate >= 0.5 else "bold yellow"
+    else:
+        wr_str = "—"
+        wr_style = "dim"
+
+    slot_pnl = bot_state.get("slot_realized_pnl", 0.0)
+    slot_style = "green" if slot_pnl >= 0 else "red"
 
     tbl = Table(show_header=False, box=None, padding=(0, 1), expand=True)
     tbl.add_column(style="dim", width=8)
     tbl.add_column(justify="right")
-    tbl.add_row("Daily", Text(f"{daily_pnl:+.4f}", style=f"bold {pnl_style}"))
-    tbl.add_row("Date", Text(str(reset_date), style="dim"))
+    tbl.add_row("Slot PnL", Text(f"{slot_pnl:+.4f}", style=f"bold {slot_style}"))
+    tbl.add_row("Daily", Text(f"{daily_pnl:+.4f}", style=f"bold {rpnl_style}"))
+
+    if total_upnl is not None:
+        upnl_style = "green" if total_upnl >= 0 else "red"
+        tbl.add_row("Unreal.", Text(f"{total_upnl:+.4f}", style=f"bold {upnl_style}"))
+        combined = daily_pnl + total_upnl
+        comb_style = "green" if combined >= 0 else "red"
+        tbl.add_row("Total", Text(f"{combined:+.4f}", style=f"bold {comb_style}"))
+
+    tbl.add_row("Trades", Text(str(total_trades), style="white"))
+    tbl.add_row("Win Rate", Text(wr_str, style=wr_style))
+    tbl.add_row("Since", Text(str(reset_date), style="dim"))
 
     return Panel(tbl, title="[dim]PnL[/dim]", border_style="dim")
 
@@ -494,18 +665,28 @@ def _build_bot_status_panel(
         )
 
     cycle = bot_state.get("cycle_count", 0)
-    orders = bot_state.get("active_order_ids", [])
-    order_count = len(orders) if isinstance(orders, list) else 0
 
-    # Liveness: RUNNING if state file updated within last 10 minutes
-    if file_mtime is not None:
-        age_min = (time.time() - file_mtime) / 60.0
-        if age_min < 10:
-            status = Text("RUNNING", style="bold green")
-        else:
-            status = Text(f"STOPPED ({age_min:.0f}m ago)", style="bold red")
+    # active_order_ids is a dict {token_id: order_id|null}, not a list
+    orders = bot_state.get("active_order_ids", {})
+    if isinstance(orders, dict):
+        order_count = sum(1 for v in orders.values() if v is not None)
     else:
+        order_count = 0
+
+    # Derive operational status from file mtime + strategy state + orders
+    strategy_status = bot_state.get("strategy_status", "")
+    if file_mtime is None:
         status = Text("UNKNOWN", style="dim")
+    else:
+        age_min = (time.time() - file_mtime) / 60.0
+        if age_min >= 10:
+            status = Text(f"STOPPED ({age_min:.0f}m ago)", style="bold red")
+        elif strategy_status == "POSITION_OPEN":
+            status = Text("POSITION_OPEN", style="bold cyan")
+        elif order_count > 0:
+            status = Text("ORDER_PENDING", style="bold yellow")
+        else:
+            status = Text("RUNNING", style="bold green")
 
     tbl = Table(show_header=False, box=None, padding=(0, 1), expand=True)
     tbl.add_column(style="dim", width=8)
@@ -519,24 +700,48 @@ def _build_bot_status_panel(
 
 # ── Market Cycle panel ────────────────────────────────────────────────────────
 
-def _parse_reference_price(question: str) -> Optional[float]:
-    """Extract strike price from a Polymarket question like 'Will BTC > $84,500 ...'."""
-    m = re.search(r'\$([0-9,]+(?:\.[0-9]+)?)', question)
-    if m:
-        return float(m.group(1).replace(",", ""))
-    return None
+def _resolve_price_to_beat(
+    chainlink_feed: Optional[ChainlinkFeed],
+    bot_state: Optional[dict] = None,
+    current_slot: Optional[int] = None,
+) -> Tuple[Optional[float], str]:
+    """Resolve the authoritative current-slot price-to-beat."""
+    slot_ts = current_slot if current_slot is not None else _current_slot_ts()
+
+    if chainlink_feed is not None:
+        slot_open = chainlink_feed.get_slot_open_price()
+        if slot_open is not None and slot_open.slot_ts == slot_ts:
+            return slot_open.price, "Chainlink (live)"
+
+    if bot_state:
+        bot_price = bot_state.get("chainlink_ref_price")
+        bot_slot = bot_state.get("chainlink_ref_slot_ts")
+        if bot_price is not None and bot_slot == slot_ts:
+            return float(bot_price), "Chainlink (bot snapshot)"
+
+    return None, "Waiting for Chainlink"
 
 
-def _build_market_cycle_panel(feed) -> Panel:
-    """Show current 5-min slot info: countdown, strike price, BTC delta."""
-    market = _discover_market()
+def _build_market_cycle_panel(
+    feed: BtcPriceFeed,
+    chainlink_feed: Optional[ChainlinkFeed],
+    bot_state: Optional[dict] = None,
+    market: Optional[Dict[str, Any]] = None,
+) -> Panel:
+    """Show current 5-min slot info: countdown, price to beat, BTC delta."""
+    if market is None:
+        market = _discover_market()
 
-    now = time.time()
-    current_slot = int(math.floor(now / 300) * 300)
-    slot_end = current_slot + 300
+    now = _server_now()
+    current_slot = _current_slot_ts(now)
+    end_ts = (market or {}).get("end_ts")
+    if isinstance(end_ts, (int, float)) and current_slot < end_ts <= current_slot + 300:
+        slot_end = float(end_ts)
+    else:
+        slot_end = current_slot + 300
     remaining = max(0.0, slot_end - now)
 
-    slot_str = datetime.utcfromtimestamp(current_slot).strftime("%H:%M UTC")
+    slot_str = datetime.fromtimestamp(current_slot, tz=timezone.utc).strftime("%H:%M UTC")
     rem_m = int(remaining) // 60
     rem_s = int(remaining) % 60
     rem_str = f"{rem_m:02d}:{rem_s:02d}"
@@ -548,14 +753,18 @@ def _build_market_cycle_panel(feed) -> Panel:
     else:
         rem_style = "bold green"
 
-    # Strike price from question text
-    strike: Optional[float] = None
-    if market:
-        strike = _parse_reference_price(market.get("title", ""))
+    price_to_beat, price_source = _resolve_price_to_beat(
+        chainlink_feed,
+        bot_state=bot_state,
+        current_slot=current_slot,
+    )
 
     # Current BTC price from feed
     book = feed.get_latest_book()
     btc_now = book.mid if book is not None else None
+
+    # Chainlink health prefers the dashboard-owned feed.
+    cl_healthy = chainlink_feed.is_healthy() if chainlink_feed is not None else False
 
     tbl = Table(show_header=False, box=None, padding=(0, 1), expand=True)
     tbl.add_column(style="dim", width=10)
@@ -564,16 +773,25 @@ def _build_market_cycle_panel(feed) -> Panel:
     tbl.add_row("Slot", Text(slot_str, style="dim"))
     tbl.add_row("Remaining", Text(rem_str, style=rem_style))
 
-    if strike is not None:
-        tbl.add_row("Strike", Text(f"${strike:,.0f}", style="cyan"))
+    if price_to_beat is not None:
+        tbl.add_row("Price to beat", Text(f"${price_to_beat:,.2f}", style="cyan"))
     else:
-        tbl.add_row("Strike", Text("–", style="dim"))
+        tbl.add_row("Price to beat", Text("Waiting for Chainlink", style="dim"))
+
+    source_style = "cyan" if price_to_beat is not None else "dim"
+    tbl.add_row("Source", Text(price_source, style=source_style))
+
+    # Chainlink feed health
+    if cl_healthy:
+        tbl.add_row("Chainlink", Text("LIVE", style="bold green"))
+    else:
+        tbl.add_row("Chainlink", Text("DOWN", style="bold red"))
 
     if btc_now is not None:
         tbl.add_row("BTC Now", Text(f"${btc_now:,.2f}", style="bold yellow"))
-        if strike is not None:
-            delta = btc_now - strike
-            pct = delta / strike * 100 if strike > 0 else 0
+        if price_to_beat is not None:
+            delta = btc_now - price_to_beat
+            pct = delta / price_to_beat * 100 if price_to_beat > 0 else 0
             arrow = "▲" if delta >= 0 else "▼"
             delta_style = "bold green" if delta >= 0 else "bold red"
             tbl.add_row("Delta", Text(f"{arrow} {delta:+,.2f} ({pct:+.2f}%)", style=delta_style))
@@ -630,6 +848,30 @@ def _build_strategy_panel(bot_state: Optional[dict]) -> Panel:
         mom_style = "bold green" if momentum_pct >= 0 else "bold red"
         tbl.add_row("Momentum", Text(f"{momentum_pct * 100:+.2f}%", style=mom_style))
 
+    prob_yes = bot_state.get("strategy_prob_yes")
+    if prob_yes is not None:
+        prob_style = "bold green" if prob_yes >= 0.5 else "bold red"
+        tbl.add_row("Prob YES", Text(f"{prob_yes:.3f}", style=prob_style))
+
+    edge_yes = bot_state.get("strategy_edge_yes")
+    if edge_yes is not None:
+        edge_style = "bold green" if edge_yes >= 0 else "bold red"
+        tbl.add_row("Edge YES", Text(f"{edge_yes:+.3f}", style=edge_style))
+
+    edge_no = bot_state.get("strategy_edge_no")
+    if edge_no is not None:
+        edge_style = "bold green" if edge_no >= 0 else "bold red"
+        tbl.add_row("Edge NO", Text(f"{edge_no:+.3f}", style=edge_style))
+
+    model_version = bot_state.get("strategy_model_version", "")
+    if model_version:
+        tbl.add_row("Model", Text(model_version[-18:], style="white"))
+
+    feature_status = bot_state.get("strategy_feature_status", "")
+    if feature_status:
+        status_style = "bold green" if feature_status.startswith("ready") else "bold yellow"
+        tbl.add_row("Features", Text(feature_status, style=status_style))
+
     last_sig = bot_state.get("strategy_last_signal", "")
     last_ts = bot_state.get("strategy_last_signal_ts", 0.0)
     if last_sig:
@@ -643,15 +885,95 @@ def _build_strategy_panel(bot_state: Optional[dict]) -> Panel:
     return Panel(tbl, title="[dim]Strategy[/dim]", border_style="dim")
 
 
+def _build_trade_log_panel(bot_state: Optional[dict]) -> Panel:
+    """Show recent BUY/SELL trades from bot_state.trade_log."""
+    trades = (bot_state or {}).get("trade_log", [])
+    if not trades:
+        return Panel(
+            Text("No trades yet", style="dim italic"),
+            title="[dim]Trades[/dim]",
+            border_style="dim",
+        )
+
+    tbl = Table(show_header=True, box=None, padding=(0, 1), expand=True)
+    tbl.add_column("", width=4, no_wrap=True)       # BUY/SELL
+    tbl.add_column("", width=3, no_wrap=True)       # YES/NO
+    tbl.add_column("Price", justify="right", no_wrap=True, min_width=6)
+    tbl.add_column("Size", justify="right", no_wrap=True, min_width=6)
+    tbl.add_column("Age", justify="right", no_wrap=True, min_width=6)
+
+    now = time.time()
+    for entry in reversed(trades[-10:]):
+        action  = entry.get("action", "")
+        outcome = entry.get("outcome", "")
+        price   = entry.get("price", 0.0)
+        size    = entry.get("size", 0.0)
+        age_s   = int(now - entry.get("ts", now))
+        age_str = f"{age_s // 60}m{age_s % 60}s" if age_s >= 60 else f"{age_s}s"
+
+        act_style = "bold green" if action == "BUY" else "bold red"
+        tbl.add_row(
+            Text(action, style=act_style),
+            Text(outcome, style="white"),
+            Text(f"{price:.2f}", style="white"),
+            Text(f"{size:.1f}", style="dim"),
+            Text(age_str, style="dim"),
+        )
+
+    return Panel(tbl, title="[dim]Trades[/dim]", border_style="dim")
+
+
+_log_cache: Optional[list] = None
+_log_cache_mtime: float = 0.0
+
+
+def _build_log_panel(log_file: str, n: int = 18) -> Panel:
+    """Show last N lines of the bot log file, color-coded by level. Cached by mtime."""
+    global _log_cache, _log_cache_mtime
+    lines: list = []
+    try:
+        mtime = os.path.getmtime(log_file)
+        if _log_cache is not None and mtime == _log_cache_mtime:
+            lines = _log_cache
+        else:
+            from collections import deque
+            with open(log_file, "r") as f:
+                lines = list(deque(f, maxlen=n))
+            _log_cache = lines
+            _log_cache_mtime = mtime
+    except (FileNotFoundError, OSError):
+        pass
+
+    text = Text()
+    for line in lines:
+        line = line.rstrip()
+        if " - ERROR - " in line or " - CRITICAL - " in line:
+            style = "bold red"
+        elif " - WARNING - " in line:
+            style = "bold yellow"
+        elif " - INFO - " in line:
+            style = "cyan"
+        else:
+            style = "dim"
+        text.append(line + "\n", style=style)
+
+    if not lines:
+        text = Text("No log entries yet", style="dim italic")
+
+    return Panel(text, title="[bold]Logs[/bold]", border_style="dim", padding=(0, 1))
+
+
 # ── Dashboard builder ─────────────────────────────────────────────────────────
 
 def _build_panel(
     feed: BtcPriceFeed,
+    chainlink_feed: Optional[ChainlinkFeed],
     window_s: int,
     chart_w: int,
     chart_h: int,
     start_time: float,
     state_file: str = "bot_state.json",
+    log_file: str = "logs/btc_updown_bot.log",
 ) -> Panel:
     """Build the complete dashboard as a single Rich Panel."""
     book = feed.get_latest_book()
@@ -670,8 +992,9 @@ def _build_panel(
         age_style = "bold red"
 
     age_str = f"{age_ms:.0f} ms" if age_ms is not None else "–"
-    uptime = int(time.time() - start_time)
-    uptime_str = f"{uptime // 60}m {uptime % 60}s"
+    sn = _server_now()
+    slot_elapsed = int(sn - int(math.floor(sn / 300) * 300))
+    uptime_str = f"{slot_elapsed // 60}m {slot_elapsed % 60}s"
 
     # ── Status bar ────────────────────────────────────────────────────────
     reconnects = getattr(feed, "reconnect_count", "–")
@@ -684,7 +1007,7 @@ def _build_panel(
         status_text,
         Text(f"Age: {age_str}", style=age_style),
         Text(f"Reconnects: {reconnects}", style="dim"),
-        Text(f"Uptime: {uptime_str}", style="dim"),
+        Text(f"Slot: {uptime_str}", style="dim"),
     )
 
     # ── Stats table (left) ────────────────────────────────────────────────
@@ -735,15 +1058,19 @@ def _build_panel(
     body.add_column(ratio=1)
     body.add_row(stats_panel, chart_panel)
 
+    # ── Discover market once per render ──────────────────────────────────
+    market = _discover_market()
+
     # ── Polymarket order book (middle row) ────────────────────────────────
-    order_book_panel = _build_order_book_panel()
+    order_book_panel = _build_order_book_panel(market=market)
 
     # ── Bot state panels ──────────────────────────────────────────────────
     bot_state, file_mtime = _load_bot_state(state_file)
     live_positions = _fetch_live_positions()
 
-    positions_panel = _build_positions_panel(bot_state, live_positions)
-    pnl_panel = _build_pnl_panel(bot_state)
+    positions_panel = _build_positions_panel(bot_state, live_positions, market=market)
+    total_upnl = _compute_total_unrealized(bot_state) if bot_state else None
+    pnl_panel = _build_pnl_panel(bot_state, total_upnl=total_upnl)
     bot_status_panel = _build_bot_status_panel(bot_state, file_mtime)
 
     # Right column: stack positions + pnl + bot status vertically
@@ -759,14 +1086,21 @@ def _build_panel(
     middle_row.add_column(ratio=1)
     middle_row.add_row(order_book_panel, right_stack)
 
-    # ── Market Cycle + Strategy panels (bottom row) ───────────────────────
-    market_cycle_panel = _build_market_cycle_panel(feed)
+    # ── Market Cycle + Strategy + Trade Log panels (bottom row) ──────────
+    market_cycle_panel = _build_market_cycle_panel(
+        feed,
+        chainlink_feed,
+        bot_state=bot_state,
+        market=market,
+    )
     strategy_panel = _build_strategy_panel(bot_state)
+    trade_log_panel = _build_trade_log_panel(bot_state)
 
     bottom_row = Table.grid(expand=True)
     bottom_row.add_column(ratio=1)
     bottom_row.add_column(ratio=1)
-    bottom_row.add_row(market_cycle_panel, strategy_panel)
+    bottom_row.add_column(ratio=1)
+    bottom_row.add_row(market_cycle_panel, strategy_panel, trade_log_panel)
 
     # ── Footer ────────────────────────────────────────────────────────────
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
@@ -775,6 +1109,9 @@ def _build_panel(
         style="dim",
     )
 
+    # ── Logs panel ────────────────────────────────────────────────────────
+    log_panel = _build_log_panel(log_file)
+
     # ── Assemble ──────────────────────────────────────────────────────────
     outer = Table.grid(expand=True)
     outer.add_column()
@@ -782,6 +1119,7 @@ def _build_panel(
     outer.add_row(body)
     outer.add_row(middle_row)
     outer.add_row(bottom_row)
+    outer.add_row(log_panel)
     outer.add_row(footer)
 
     symbol = getattr(feed, "_symbol", "btcusdt").upper()
@@ -808,10 +1146,13 @@ def main() -> None:
                         help="Chart height in rows")
     parser.add_argument("--state-file", default="bot_state.json", dest="state_file",
                         help="Path to bot_state.json")
+    parser.add_argument("--log-file", default="logs/btc_updown_bot.log", dest="log_file",
+                        help="Path to bot log file")
     args = parser.parse_args()
 
     # Suppress feed internal logs so they don't interfere with the TUI
     logging.getLogger("btc_feed").setLevel(logging.WARNING)
+    logging.getLogger("chainlink_feed").setLevel(logging.WARNING)
 
     console = Console()
     console.print(f"\n[bold]BTC Feed Monitor[/bold] — connecting to [cyan]{args.symbol}[/cyan]…")
@@ -819,6 +1160,8 @@ def main() -> None:
 
     feed = BtcPriceFeed(symbol=args.symbol)
     feed.start()
+    chainlink_feed = ChainlinkFeed(symbol="btc/usd")
+    chainlink_feed.start()
     start_time = time.time()
 
     interval = 1.0 / max(args.refresh, 0.1)
@@ -830,13 +1173,25 @@ def main() -> None:
             refresh_per_second=args.refresh,
         ) as live:
             while True:
-                panel = _build_panel(feed, args.window, args.chart_w, args.chart_h, start_time, args.state_file)
+                t0 = time.monotonic()
+                panel = _build_panel(
+                    feed,
+                    chainlink_feed,
+                    args.window,
+                    args.chart_w,
+                    args.chart_h,
+                    start_time,
+                    args.state_file,
+                    args.log_file,
+                )
                 live.update(panel)
-                time.sleep(interval)
+                elapsed = time.monotonic() - t0
+                time.sleep(max(0, interval - elapsed))
     except KeyboardInterrupt:
         pass
     finally:
         feed.stop()
+        chainlink_feed.stop()
         console.print("\n[dim]Feed stopped.[/dim]")
 
 

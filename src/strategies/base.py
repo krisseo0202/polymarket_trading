@@ -34,6 +34,8 @@ class Strategy(ABC):
         self.enabled = config.get("enabled", True)
         self.min_confidence = config.get("min_confidence", 0.5)
         self.max_position_size = config.get("max_position_size", 1000.0)
+        self.max_entry_price = config.get("max_entry_price", 0.95)
+        self.min_entry_price = config.get("min_entry_price", 0.05)
 
         # Position state — authoritative after sync_position_from_inventory()
         self.active_token_id: Optional[str] = None
@@ -44,6 +46,8 @@ class Strategy(ABC):
         # Token context — subclasses populate via set_tokens()
         self._market_id: str = ""
         self._outcome_map: Dict[str, str] = {}
+        self._yes_token_id: str = ""
+        self._no_token_id: str = ""
 
         # Pending exit info for PnL computation
         self._pending_exit_entry_price: Optional[float] = None
@@ -117,10 +121,11 @@ class Strategy(ABC):
         if book is None:
             return None
         mid = get_mid_price(book)
-        if mid is None:
+        best_bid = book.bids[0].price if book.bids else mid
+        if not best_bid or best_bid <= 0:
             return None
 
-        profit_pct = (mid - self.entry_price) / self.entry_price
+        profit_pct = (best_bid - self.entry_price) / self.entry_price
         time_held  = now_ts - self.entry_timestamp if self.entry_timestamp else 0.0
 
         reason: Optional[str] = None
@@ -134,8 +139,7 @@ class Strategy(ABC):
         if reason is None:
             return None
 
-        tick     = book.tick_size or 0.001
-        best_bid = book.bids[0].price if book.bids else mid
+        tick = book.tick_size or 0.001
         return Signal(
             market_id=self._market_id,
             outcome=self._outcome_map.get(self.active_token_id, ""),
@@ -145,6 +149,16 @@ class Strategy(ABC):
             size=held_size,
             reason=reason,
         )
+
+    def is_flat(self, by_token: Dict[str, Any]) -> bool:
+        """True if no position held on either side."""
+        for tid in (self._yes_token_id, self._no_token_id):
+            if not tid:
+                continue
+            pos = by_token.get(tid)
+            if pos and pos.size > 0:
+                return False
+        return True
 
     def _reset_position_state(self) -> None:
         """Reset open position tracking fields to None."""

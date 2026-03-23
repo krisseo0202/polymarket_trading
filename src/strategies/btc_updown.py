@@ -46,10 +46,6 @@ class BTCUpDownStrategy(Strategy):
 
         self.current_bias: Bias = Bias[config.get("default_bias", "NONE").upper()]
 
-        # Token context — refreshed each cycle by set_tokens()
-        self._yes_token_id: str = ""
-        self._no_token_id: str = ""
-
         # Mid-price history: token_id → [(monotonic_ts, mid), ...]
         self._price_history: Dict[str, List[Tuple[float, float]]] = {}
         self._history_max_age: float = max(self.confirmation_window_seconds * 3, 300.0)
@@ -175,8 +171,7 @@ class BTCUpDownStrategy(Strategy):
         token_id = self._yes_token_id if self.current_bias == Bias.LONG \
                    else self._no_token_id
 
-        pos = by_token.get(token_id)
-        if pos and pos.size > 0:
+        if not self.is_flat(by_token):
             return None   # already holding — no pyramiding
 
         # Always measure momentum on YES token
@@ -205,6 +200,8 @@ class BTCUpDownStrategy(Strategy):
         tick     = book.tick_size or 0.001
         best_ask = book.asks[0].price if book.asks else mid_now
         if best_ask <= 0:
+            return None
+        if best_ask > self.max_entry_price or best_ask < self.min_entry_price:
             return None
         size       = round(self.position_size_usdc / best_ask, 2)
         confidence = min(0.5 + (abs(return_pct) / self.confirmation_pct) * 0.5, 1.0)
