@@ -27,23 +27,9 @@ class CoinTossStrategy(Strategy):
         self.max_hold_seconds: int     = int(config.get("max_hold_seconds", 240))
         self.position_size_usdc: float = config.get("position_size_usdc", 5.0)
 
-    # ------------------------------------------------------------------
-    # Public setters (same interface as BTCUpDownStrategy)
-    # ------------------------------------------------------------------
-
     def record_price(self, token_id: str, mid: float, ts: float = None) -> None:
         """No-op — coin toss needs no price history."""
         pass
-
-    def set_tokens(self, market_id: str, yes_token_id: str, no_token_id: str) -> None:
-        """Register current market tokens. Resets position state on rollover."""
-        if (yes_token_id != self._yes_token_id or no_token_id != self._no_token_id) \
-                and self._yes_token_id:
-            self._reset_position_state()
-        self._market_id    = market_id
-        self._yes_token_id = yes_token_id
-        self._no_token_id  = no_token_id
-        self._outcome_map  = {yes_token_id: "YES", no_token_id: "NO"}
 
     # ------------------------------------------------------------------
     # Strategy interface

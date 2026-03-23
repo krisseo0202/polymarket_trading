@@ -936,9 +936,16 @@ def _build_log_panel(log_file: str, n: int = 18) -> Panel:
         if _log_cache is not None and mtime == _log_cache_mtime:
             lines = _log_cache
         else:
-            from collections import deque
-            with open(log_file, "r") as f:
-                lines = list(deque(f, maxlen=n))
+            with open(log_file, "rb") as f:
+                # Seek near end to avoid reading entire file
+                try:
+                    f.seek(0, 2)
+                    size = f.tell()
+                    f.seek(max(0, size - 8192))
+                except OSError:
+                    f.seek(0)
+                tail = f.read().decode("utf-8", errors="replace")
+            lines = tail.splitlines(keepends=True)[-n:]
             _log_cache = lines
             _log_cache_mtime = mtime
     except (FileNotFoundError, OSError):

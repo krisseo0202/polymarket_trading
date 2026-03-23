@@ -19,14 +19,21 @@ from .feature_builder import build_live_features
 from .schema import FEATURE_COLUMNS, build_default_metadata
 
 
-@dataclass
 class PredictionResult:
     """Live prediction result consumed by the strategy."""
 
-    prob_yes: Optional[float]
-    prob_no: Optional[float]
-    model_version: str
-    feature_status: str
+    __slots__ = ("prob_yes", "model_version", "feature_status")
+
+    def __init__(self, prob_yes: Optional[float], model_version: str, feature_status: str, prob_no: Optional[float] = None):
+        self.prob_yes = prob_yes
+        self.model_version = model_version
+        self.feature_status = feature_status
+
+    @property
+    def prob_no(self) -> Optional[float]:
+        if self.prob_yes is None:
+            return None
+        return max(0.0, min(1.0, 1.0 - self.prob_yes))
 
 
 class BTCUpDownXGBModel:
@@ -97,7 +104,6 @@ class BTCUpDownXGBModel:
         if not self.ready or self.booster is None:
             return PredictionResult(
                 prob_yes=None,
-                prob_no=None,
                 model_version=self.model_version,
                 feature_status=self.load_error or "model_unavailable",
             )
@@ -106,7 +112,6 @@ class BTCUpDownXGBModel:
         if not built.ready:
             return PredictionResult(
                 prob_yes=None,
-                prob_no=None,
                 model_version=self.model_version,
                 feature_status=built.status,
             )
@@ -115,14 +120,12 @@ class BTCUpDownXGBModel:
         if prob_yes is None:
             return PredictionResult(
                 prob_yes=None,
-                prob_no=None,
                 model_version=self.model_version,
                 feature_status="predict_failed",
             )
 
         return PredictionResult(
             prob_yes=prob_yes,
-            prob_no=max(0.0, min(1.0, 1.0 - prob_yes)),
             model_version=self.model_version,
             feature_status=built.status,
         )

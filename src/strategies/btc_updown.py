@@ -46,23 +46,11 @@ class BTCUpDownStrategy(Strategy):
 
         self.current_bias: Bias = Bias[config.get("default_bias", "NONE").upper()]
 
-        # Mid-price history: token_id → [(monotonic_ts, mid), ...]
-        self._price_history: Dict[str, List[Tuple[float, float]]] = {}
-        self._history_max_age: float = max(self.confirmation_window_seconds * 3, 300.0)
+        self._history_max_age = max(self.confirmation_window_seconds * 3, 300.0)
 
     # ------------------------------------------------------------------
     # Public setters
     # ------------------------------------------------------------------
-
-    def set_tokens(self, market_id: str, yes_token_id: str, no_token_id: str) -> None:
-        """Register current market tokens. Resets position state on rollover."""
-        if (yes_token_id != self._yes_token_id or no_token_id != self._no_token_id) \
-                and self._yes_token_id:
-            self._reset_position_state()
-        self._market_id   = market_id
-        self._yes_token_id = yes_token_id
-        self._no_token_id  = no_token_id
-        self._outcome_map  = {yes_token_id: "YES", no_token_id: "NO"}
 
     def set_bias(self, bias: Bias) -> None:
         """
@@ -70,17 +58,6 @@ class BTCUpDownStrategy(Strategy):
         LONG / SHORT selects which token to enter; NONE keeps the bot flat.
         """
         self.current_bias = bias
-
-    def record_price(self, token_id: str, mid: float, ts: Optional[float] = None) -> None:
-        """Feed a mid-price observation into the internal history buffer.
-        Called by the ticker every 5 s so the 5-second lookback has data
-        between analyze() calls (which run every 5 minutes).
-        """
-        now = ts if ts is not None else time.monotonic()
-        buf = self._price_history.setdefault(token_id, [])
-        buf.append((now, mid))
-        cutoff = now - self._history_max_age
-        self._price_history[token_id] = [(t, p) for t, p in buf if t >= cutoff]
 
     # ------------------------------------------------------------------
     # Strategy interface
