@@ -10,6 +10,7 @@ Configuration: config/config.yaml
 """
 
 import argparse
+import email.utils
 import json
 import logging
 import math
@@ -19,7 +20,10 @@ import signal
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 import yaml
+from dotenv import load_dotenv
+load_dotenv()
 from datetime import date
 from typing import Dict, List, Optional
 
@@ -33,10 +37,14 @@ from src.engine.execution import ExecutionTracker
 from src.engine.inventory import InventoryState
 from src.engine.risk_manager import RiskLimits, RiskManager
 from src.engine.state_store import BotState, StateStore
+from src.models import parse_strike_price
 from src.strategies.base import Signal
 from src.strategies.btc_updown import BTCUpDownStrategy
+from src.strategies.btc_updown_xgb import BTCUpDownXGBStrategy
 from src.strategies.btc_vol_reversion import BTCVolatilityReversionStrategy
 from src.strategies.coin_toss import CoinTossStrategy
+from src.utils.btc_feed import BtcPriceFeed
+from src.utils.chainlink_feed import ChainlinkFeed
 from src.utils.config import load_config
 from src.utils.logger import setup_logger
 from src.utils.market_utils import cancel_if_exists, get_mid_price
@@ -49,15 +57,49 @@ _client: Optional[PolymarketClient] = None
 _state: Optional[BotState] = None
 _state_store: Optional[StateStore] = None
 _paper_trading: bool = True
+_server_offset: float = 0.0  # server_time - local_time, updated each market discovery
 
 # Session PnL counters — reset each run, not persisted
 _session_wins: int = 0
 _session_losses: int = 0
 
+# Structured trade log (JSONL) — set once at startup from config
+_trade_log_path: Optional[str] = None
+_price_tick_path: Optional[str] = None
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _log_price_tick(record: dict) -> None:
+    """Append one JSON price-tick record to the probability tick log."""
+    if _price_tick_path is None:
+        return
+    line = json.dumps({k: v for k, v in record.items() if v is not None}, default=str)
+    with open(_price_tick_path, "a") as f:
+        f.write(line + "\n")
+        f.flush()
+
+
+def _log_trade_jsonl(record: dict) -> None:
+    """Append one JSON trade record to the structured trade log."""
+    if _trade_log_path is None:
+        return
+    line = json.dumps({k: v for k, v in record.items() if v is not None}, default=str)
+    with open(_trade_log_path, "a") as f:
+        f.write(line + "\n")
+        f.flush()
+
+
+def _book_summary(yes_book, no_book) -> dict:
+    """Extract top-of-book bid/ask from OrderBook objects."""
+    return {
+        "yes_bid": yes_book.bids[0].price if yes_book and yes_book.bids else None,
+        "yes_ask": yes_book.asks[0].price if yes_book and yes_book.asks else None,
+        "no_bid": no_book.bids[0].price if no_book and no_book.bids else None,
+        "no_ask": no_book.asks[0].price if no_book and no_book.asks else None,
+    }
 
 def _apply_fill_to_state(
     inv: "InventoryState",
@@ -70,6 +112,7 @@ def _apply_fill_to_state(
     """Apply a fill to inventory + state PnL. Returns realized PnL."""
     realized = inv.apply_fill(side, price, size)
     state.daily_realized_pnl += realized
+    state.slot_realized_pnl += realized
     if realized != 0.0:
         risk_manager.record_trade(realized)
     return realized
@@ -86,6 +129,27 @@ def _sync_inventories_to_state(
         }
 
 
+def _snapshot_chainlink_state(
+    state: "BotState",
+    chainlink_feed: Optional["ChainlinkFeed"],
+) -> None:
+    """Persist the latest Chainlink slot-open snapshot for dashboard recovery."""
+    if chainlink_feed is None:
+        state.chainlink_ref_price = None
+        state.chainlink_ref_slot_ts = None
+        state.chainlink_healthy = False
+        return
+
+    slot_open = chainlink_feed.get_slot_open_price()
+    if slot_open is not None:
+        state.chainlink_ref_price = slot_open.price
+        state.chainlink_ref_slot_ts = slot_open.slot_ts
+    else:
+        state.chainlink_ref_price = None
+        state.chainlink_ref_slot_ts = None
+    state.chainlink_healthy = chainlink_feed.is_healthy()
+
+
 def _sync_strategy_from_inventories(
     strategy, inventories: Dict[str, "InventoryState"], token_ids: tuple
 ) -> None:
@@ -98,9 +162,24 @@ def _sync_strategy_from_inventories(
     strategy.sync_position_from_inventory(None, 0.0, 0.0)
 
 
+def _fetch_market_data_parallel(client, yes_tid, no_tid):
+    """Fetch order books, positions, and balance in parallel."""
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        f_yes = pool.submit(client.get_order_book, yes_tid)
+        f_no = pool.submit(client.get_order_book, no_tid)
+        f_pos = pool.submit(client.get_positions)
+        f_bal = pool.submit(client.get_balance)
+        return f_yes.result(), f_no.result(), f_pos.result(), f_bal.result()
+
+
+def _stime() -> float:
+    """Return local time corrected by the last-observed Polymarket server offset."""
+    return time.time() + _server_offset
+
+
 def sleep_until_next_cycle(interval_s: int) -> None:
     """Sleep until the next wall-clock-aligned cycle boundary (no drift)."""
-    now = time.time()
+    now = _stime()
     next_run = math.ceil(now / interval_s) * interval_s
     delay = max(0.0, next_run - now)
     if delay > 0:
@@ -114,7 +193,7 @@ def _fetch_book_top(yes_token_id: str, no_token_id: str, logger=None) -> tuple:
     Also fetches CLOB midpoint as a fallback when the book spread is wide.
     """
     def _top(token_id: str):
-        bid, ask, mid = None, None, None
+        bid, ask = None, None
         try:
             r = requests.get(
                 "https://clob.polymarket.com/book",
@@ -131,29 +210,34 @@ def _fetch_book_top(yes_token_id: str, no_token_id: str, logger=None) -> tuple:
             if logger:
                 logger.debug(f"Book fetch failed for {token_id[:12]}...: {e}")
 
-        # Fetch CLOB midpoint — more reliable than (bid+ask)/2 for wide spreads
-        try:
-            r = requests.get(
-                "https://clob.polymarket.com/midpoint",
-                params={"token_id": token_id},
-                timeout=5,
-            )
-            r.raise_for_status()
-            mid = float(r.json().get("mid", 0)) or None
-        except Exception:
-            pass
+        # Only fetch /midpoint when book is empty or spread is wide
+        spread = (ask - bid) if (bid is not None and ask is not None) else float("inf")
+        if bid is None or ask is None or spread > 0.50:
+            mid = None
+            try:
+                r = requests.get(
+                    "https://clob.polymarket.com/midpoint",
+                    params={"token_id": token_id},
+                    timeout=5,
+                )
+                r.raise_for_status()
+                mid = float(r.json().get("mid", 0)) or None
+            except Exception:
+                pass
 
-        # Use midpoint as bid/ask when book is too wide or empty
-        if mid is not None:
-            if bid is None or (ask is not None and (ask - bid) > 0.50):
-                bid = mid
-            if ask is None or (bid is not None and (ask - bid) > 0.50):
-                ask = mid
+            if mid is not None:
+                if bid is None or spread > 0.50:
+                    bid = mid
+                if ask is None or spread > 0.50:
+                    ask = mid
 
         return bid, ask
 
-    yes_bid, yes_ask = _top(yes_token_id)
-    no_bid,  no_ask  = _top(no_token_id)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f_yes = pool.submit(_top, yes_token_id)
+        f_no = pool.submit(_top, no_token_id)
+        yes_bid, yes_ask = f_yes.result()
+        no_bid, no_ask = f_no.result()
     return yes_bid, yes_ask, no_bid, no_ask
 
 
@@ -179,6 +263,7 @@ def ticker_until_next_cycle(
     no_bid:  List[Optional[float]] = [None]
     no_ask:  List[Optional[float]] = [None]
     stop_evt = threading.Event()
+    first_fetch_evt = threading.Event()
 
     def _fetch_loop():
         last_analyzed = time.monotonic()
@@ -192,17 +277,33 @@ def ticker_until_next_cycle(
             if n_bid is not None: no_bid[0]  = n_bid
             if n_ask is not None: no_ask[0]  = n_ask
 
+            if y_bid is not None or n_bid is not None:
+                first_fetch_evt.set()
+
             if y_bid is not None and y_ask is not None and strategy:
                 strategy.record_price(yes_token_id, (y_bid + y_ask) / 2)
             if n_bid is not None and n_ask is not None and strategy:
                 strategy.record_price(no_token_id, (n_bid + n_ask) / 2)
+
+            yb, ya = yes_bid[0], yes_ask[0]
+            nb, na = no_bid[0], no_ask[0]
+            _log_price_tick({
+                "ts": time.time(),
+                "slot_ts": int(math.floor(_stime() / 300) * 300),
+                "yes_bid": yb, "yes_ask": ya,
+                "no_bid": nb, "no_ask": na,
+                "yes_mid": (yb + ya) / 2 if yb and ya else None,
+                "no_mid": (nb + na) / 2 if nb and na else None,
+                "yes_spread": ya - yb if yb and ya else None,
+                "no_spread": na - nb if nb and na else None,
+            })
 
             now_m = time.monotonic()
             if intra_cycle_analyze_fn and (now_m - last_analyzed) >= 30:
                 intra_cycle_analyze_fn()
                 last_analyzed = now_m
 
-            stop_evt.wait(1.0)
+            stop_evt.wait(5.0)
 
     fetcher = threading.Thread(target=_fetch_loop, daemon=True)
     fetcher.start()
@@ -239,11 +340,11 @@ def ticker_until_next_cycle(
         )
 
     # Wait for first price fetch, then log status every 30 seconds until next cycle
-    time.sleep(2)
+    first_fetch_evt.wait(timeout=5)
     last_logged = 0.0
 
     def _log_status():
-        now = time.time()
+        now = _stime()
         next_run = math.ceil(now / interval_s) * interval_s
         remaining = max(0, next_run - now)
         mins, secs = divmod(int(remaining), 60)
@@ -256,13 +357,13 @@ def ticker_until_next_cycle(
             )
 
     # Compute the target boundary ONCE — break when we reach it.
-    _now = time.time()
+    _now = _stime()
     target_boundary = math.ceil(_now / interval_s) * interval_s
 
     # Sleep in 1-second increments, refreshing status every 30 s
     try:
         while not _shutdown_requested:
-            now = time.time()
+            now = _stime()
             if now >= target_boundary:
                 break
             if now - last_logged >= 30.0:
@@ -287,6 +388,7 @@ def _execute_signals(
     paper_trading: bool,
     logger,
     inventories: Dict[str, "InventoryState"] = None,
+    book_summary: Optional[dict] = None,
 ) -> None:
     """Risk-gate BUY signals and place orders for all passing signals."""
     for sig in signals:
@@ -322,6 +424,60 @@ def _execute_signals(
                 f"{sig.action} {sig.outcome} @ {sig.price:.4f} | {sig.reason[:60]}"
             )
             state.strategy_last_signal_ts = time.time()
+            state.trade_log.append({
+                "ts": time.time(),
+                "action": sig.action,
+                "outcome": sig.outcome,
+                "price": sig.price,
+                "size": sig.size,
+            })
+            state.trade_log = state.trade_log[-20:]
+
+            # -- Structured JSONL trade log --
+            _pre_inv = inventories.get(token_id) if inventories else None
+            _slot_ts = int(math.floor(time.time() / 300) * 300) + 300
+            _log_trade_jsonl({
+                # timing
+                "ts": time.time(),
+                "cycle": state.cycle_count,
+                "slot_expiry_ts": _slot_ts,
+                "seconds_to_expiry": _slot_ts - time.time(),
+                # trade
+                "action": sig.action,
+                "outcome": sig.outcome,
+                "price": sig.price,
+                "size": sig.size,
+                "confidence": sig.confidence,
+                "reason": sig.reason,
+                "market_id": current_market_id,
+                "token_id": token_id,
+                "order_id": order.order_id,
+                # market snapshot
+                **(book_summary or {}),
+                "balance": balance,
+                # pre-trade position
+                "pre_position": _pre_inv.position if _pre_inv else 0,
+                "pre_avg_cost": _pre_inv.avg_cost if _pre_inv else 0,
+                # pnl
+                "daily_pnl": state.daily_realized_pnl,
+                "slot_pnl": state.slot_realized_pnl,
+                # strategy state
+                "strategy_name": state.strategy_name,
+                "prob_yes": state.strategy_prob_yes,
+                "edge_yes": state.strategy_edge_yes,
+                "edge_no": state.strategy_edge_no,
+                "bias": state.strategy_bias,
+                "momentum_pct": state.strategy_momentum_pct,
+                "zscore": state.strategy_zscore,
+                "model_version": state.strategy_model_version or None,
+                "feature_status": state.strategy_feature_status or None,
+                # chainlink
+                "chainlink_ref_price": state.chainlink_ref_price,
+                "chainlink_healthy": state.chainlink_healthy or None,
+                # meta
+                "paper_trading": paper_trading,
+            })
+
             if sig.action == "BUY":
                 state.strategy_status = "POSITION_OPEN"
             elif sig.action == "SELL":
@@ -396,6 +552,12 @@ def _snapshot_strategy_state(strategy, state: "BotState") -> None:
     else:
         state.strategy_zscore = None
 
+    state.strategy_prob_yes = getattr(strategy, "last_prob_yes", None)
+    state.strategy_edge_yes = getattr(strategy, "last_edge_yes", None)
+    state.strategy_edge_no = getattr(strategy, "last_edge_no", None)
+    state.strategy_model_version = getattr(strategy, "last_model_version", "")
+    state.strategy_feature_status = getattr(strategy, "last_feature_status", "")
+
 
 def _make_intra_cycle_fn(
     client: PolymarketClient,
@@ -406,10 +568,13 @@ def _make_intra_cycle_fn(
     market_id: str,
     yes_tid: str,
     no_tid: str,
+    question: str,
+    strike_price: Optional[float],
     paper_trading: bool,
     logger,
     execution_tracker=None,
     inventories=None,
+    chainlink_feed: Optional["ChainlinkFeed"] = None,
 ):
     """Return a zero-arg callable for intra-cycle analyze+execute passes."""
     captured_slot = int(math.floor(time.time() / 300) * 300)
@@ -437,20 +602,33 @@ def _make_intra_cycle_fn(
                 for fill in execution_tracker.inferred_fills:
                     inv = inventories.get(fill.token_id)
                     if inv:
-                        _apply_fill_to_state(inv, fill.side, fill.price, fill.size, state, risk_manager)
+                        realized = _apply_fill_to_state(inv, fill.side, fill.price, fill.size, state, risk_manager)
+                        if realized > 0:
+                            state.session_wins += 1
+                        elif realized < 0:
+                            state.session_losses += 1
                 _sync_inventories_to_state(state, inventories)
                 _sync_strategy_from_inventories(strategy, inventories, (yes_tid, no_tid))
 
-            yes_book  = client.get_order_book(yes_tid)
-            no_book   = client.get_order_book(no_tid)
-            positions = client.get_positions()
-            balance   = client.get_balance()
+            # Re-read Chainlink reference price (may change on slot rollover)
+            effective_strike = strike_price
+            if chainlink_feed is not None:
+                cl_ref = chainlink_feed.get_reference_price()
+                if cl_ref is not None:
+                    effective_strike = cl_ref
+
+            yes_book, no_book, positions, balance = _fetch_market_data_parallel(
+                client, yes_tid, no_tid,
+            )
             market_data = {
                 "markets": [],
                 "order_books": {yes_tid: yes_book, no_tid: no_book},
                 "positions": positions,
                 "balance": balance,
                 "price_history": {},
+                "question": question,
+                "strike_price": effective_strike,
+                "slot_expiry_ts": slot_expiry_ts,
             }
             signals = strategy.analyze(market_data)
 
@@ -470,8 +648,10 @@ def _make_intra_cycle_fn(
                     signals, client, strategy, risk_manager, state,
                     market_id, yes_tid, no_tid, balance, positions,
                     paper_trading, logger, inventories=inventories,
+                    book_summary=_book_summary(yes_book, no_book),
                 )
                 _snapshot_strategy_state(strategy, state)
+                _snapshot_chainlink_state(state, chainlink_feed)
                 state_store.save(state)
         except Exception as e:
             logger.error(f"Intra-cycle analyze error: {e}", exc_info=True)
@@ -489,6 +669,7 @@ def _parse_event_market(event: dict) -> Optional[Dict]:
                 "market_id": m.get("id") or m.get("market_id", ""),
                 "yes_token_id": yes_id,
                 "no_token_id": no_id,
+                "question": m.get("question", event.get("title", "")),
             }
     return None
 
@@ -512,7 +693,7 @@ def find_btc_updown_market(
     lower_kws = [k.lower() for k in keywords]
 
     # --- 1. Slug-based lookup (fastest, most precise) ---
-    slot = int(math.floor(time.time() / 300) * 300)
+    slot = int(math.floor(_stime() / 300) * 300)
     slug = f"btc-updown-5m-{slot}"
     try:
         resp = requests.get(
@@ -521,6 +702,14 @@ def find_btc_updown_market(
             timeout=10,
         )
         resp.raise_for_status()
+        # Update server-clock offset from HTTP Date: header
+        global _server_offset
+        date_hdr = resp.headers.get("Date")
+        if date_hdr:
+            try:
+                _server_offset = email.utils.parsedate_to_datetime(date_hdr).timestamp() - time.time()
+            except Exception:
+                pass
         data = resp.json()
         events = data if isinstance(data, list) else [data]
         for event in events:
@@ -582,6 +771,7 @@ def find_btc_updown_market(
                         "market_id": m.get("id", ""),
                         "yes_token_id": yes_id,
                         "no_token_id": no_id,
+                        "question": m.get("question", ""),
                     }
     except Exception as e:
         logger.warning(f"gamma-api/markets search failed: {e}")
@@ -600,6 +790,8 @@ def check_daily_reset(state: BotState, risk_manager: RiskManager, logger) -> Non
         )
         state.daily_realized_pnl = 0.0
         state.daily_reset_date = today
+        state.session_wins = 0
+        state.session_losses = 0
         risk_manager.reset_daily()
 
 
@@ -609,6 +801,8 @@ def graceful_shutdown(
     client: PolymarketClient,
     paper_trading: bool,
     logger,
+    btc_feed: Optional[BtcPriceFeed] = None,
+    chainlink_feed: Optional["ChainlinkFeed"] = None,
 ) -> None:
     """Cancel all resting orders, save state, log summary, exit."""
     logger.info("Graceful shutdown initiated")
@@ -616,6 +810,11 @@ def graceful_shutdown(
         if order_id:
             logger.info(f"Cancelling resting order {order_id} for token {token_id[:12]}...")
             cancel_if_exists(client, order_id, dry_run=paper_trading)
+    if btc_feed is not None:
+        btc_feed.stop()
+    if chainlink_feed is not None:
+        chainlink_feed.stop()
+    _snapshot_chainlink_state(state, chainlink_feed)
     state_store.save(state)
     trades = _session_wins + _session_losses
     win_rate = _session_wins / trades if trades > 0 else 0.0
@@ -633,6 +832,94 @@ def _handle_signal(signum, frame):
 
 
 # ---------------------------------------------------------------------------
+# Pre-launch config display
+# ---------------------------------------------------------------------------
+
+def _display_and_confirm_config(
+    strategy_name: str,
+    strategy_cfg: dict,
+    risk_cfg: dict,
+    paper_trading: bool,
+    interval: int,
+) -> dict:
+    """Display active config and allow inline overrides before launch."""
+    W = 48  # inner width between box edges
+    mode_str = "PAPER TRADING" if paper_trading else "LIVE TRADING"
+
+    # Detect whether stdout can handle box-drawing chars
+    try:
+        "╔═╗║╠╣╚╝".encode(sys.stdout.encoding or "utf-8")
+        TL, H, TR, V, ML, MR, BL, BR = "╔", "═", "╗", "║", "╠", "╣", "╚", "╝"
+    except (UnicodeEncodeError, LookupError):
+        TL, H, TR, V, ML, MR, BL, BR = "+", "-", "+", "|", "+", "+", "+", "+"
+
+    def _row(label: str, value: str) -> str:
+        content = f"  {label:<15}{value}"
+        return f"{V}{content:<{W}}{V}"
+
+    def _header(text: str) -> str:
+        content = f"  {text}"
+        return f"{V}{content:<{W}}{V}"
+
+    border_top = f"{TL}{H * W}{TR}"
+    border_mid = f"{ML}{H * W}{MR}"
+    border_bot = f"{BL}{H * W}{BR}"
+
+    lines = [border_top]
+    lines.append(_header("Polymarket Bot — Pre-launch Config"))
+    lines.append(border_mid)
+    lines.append(_row("Mode:", mode_str))
+    lines.append(_row("Strategy:", strategy_name))
+    lines.append(_row("Interval:", f"{interval}s ({interval // 60}-min cycles)"))
+    lines.append(border_mid)
+    lines.append(_header("Strategy Parameters"))
+
+    for key in sorted(strategy_cfg.keys()):
+        val = strategy_cfg[key]
+        lines.append(_row(f"  {key}:", str(val)))
+
+    lines.append(border_mid)
+    lines.append(_header("Risk Limits"))
+    for key in sorted(risk_cfg.keys()):
+        val = risk_cfg[key]
+        lines.append(_row(f"  {key}:", str(val)))
+
+    lines.append(border_bot)
+    print("\n".join(lines))
+
+    # Override loop
+    while True:
+        try:
+            user_input = input("\nOverride? (e.g. 'stop_loss_pct=0.08', Enter to start)\n> ").strip()
+        except EOFError:
+            break
+        if not user_input:
+            break
+        if "=" not in user_input:
+            print("  Invalid format. Use key=value")
+            continue
+        key, _, raw_value = user_input.partition("=")
+        key = key.strip()
+        raw_value = raw_value.strip()
+        if key not in strategy_cfg:
+            print(f"  Unknown key '{key}'. Valid keys: {', '.join(sorted(strategy_cfg.keys()))}")
+            continue
+        # Type coercion: int → float → str
+        old_value = strategy_cfg[key]
+        try:
+            new_value = int(raw_value)
+        except ValueError:
+            try:
+                new_value = float(raw_value)
+            except ValueError:
+                new_value = raw_value
+        strategy_cfg[key] = new_value
+        print(f"  Updated {key}: {old_value} → {new_value}")
+
+    return strategy_cfg
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -643,7 +930,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Polymarket trading bot")
     parser.add_argument(
         "--strategy",
-        choices=["btc_updown", "btc_vol_reversion", "coin_toss"],
+        choices=["btc_updown", "btc_updown_xgb", "btc_vol_reversion", "coin_toss"],
         default="btc_updown",
         help="Strategy to run (default: btc_updown)",
     )
@@ -658,6 +945,12 @@ def main() -> None:
         action="store_true",
         default=None,
         help="Force live trading mode",
+    )
+    parser.add_argument(
+        "--no-confirm",
+        action="store_true",
+        default=False,
+        help="Skip interactive config confirmation prompt",
     )
     args = parser.parse_args()
 
@@ -686,12 +979,34 @@ def main() -> None:
     strategy_cfg: dict = cfg.strategies.get(args.strategy, {})
 
     # -----------------------------------------------------------------------
+    # Pre-launch config display + optional override
+    # -----------------------------------------------------------------------
+    if not args.no_confirm and sys.stdin.isatty():
+        strategy_cfg = _display_and_confirm_config(
+            strategy_name=args.strategy,
+            strategy_cfg=strategy_cfg,
+            risk_cfg=raw_yaml.get("risk", {}),
+            paper_trading=paper_trading,
+            interval=interval,
+        )
+
+    # -----------------------------------------------------------------------
     # Logger
     # -----------------------------------------------------------------------
     log_file = raw_yaml.get("logging", {}).get("file")
     if log_file:
         os.makedirs(os.path.dirname(log_file), exist_ok=True)
     logger = setup_logger(level=cfg.log_level, log_file=log_file)
+
+    # Structured trade log (JSONL)
+    global _trade_log_path, _price_tick_path
+    _trade_log_path = raw_yaml.get("logging", {}).get("trade_log_file")
+    if _trade_log_path:
+        os.makedirs(os.path.dirname(_trade_log_path), exist_ok=True)
+    _price_tick_path = raw_yaml.get("logging", {}).get("price_tick_file")
+    if _price_tick_path:
+        os.makedirs(os.path.dirname(_price_tick_path), exist_ok=True)
+
     logger.info(
         f"Starting bot | strategy={args.strategy} | paper_trading={paper_trading} | interval={interval}s"
     )
@@ -714,23 +1029,40 @@ def main() -> None:
         max_total_exposure=cfg.risk_limits.get("max_total_exposure", 0.15),
         max_daily_loss=cfg.risk_limits.get("max_daily_loss", 0.05),
         max_exposure_per_market=cfg.risk_limits.get("max_exposure_per_market", 0.10),
-        stop_loss_pct=cfg.risk_limits.get("stop_loss_pct", 0.12),
         circuit_breaker_enabled=cfg.risk_limits.get("circuit_breaker_enabled", True),
         circuit_breaker_threshold=cfg.risk_limits.get("circuit_breaker_threshold", 0.20),
     )
     risk_manager = RiskManager(limits=risk_limits)
+    session_loss_cap: float = raw_yaml.get("risk", {}).get("max_session_loss_usdc", float("inf"))
 
     execution_tracker = ExecutionTracker(
         orders_sync_interval_s=5.0,       # reconcile orders every 5s (intra-cycle needs fast detection)
         positions_sync_interval_s=10.0,   # reconcile positions every 10s
     )
 
+    btc_feed: Optional[BtcPriceFeed] = None
     if args.strategy == "coin_toss":
         strategy = CoinTossStrategy(config=strategy_cfg)
+    elif args.strategy == "btc_updown_xgb":
+        btc_feed = BtcPriceFeed(symbol=str(strategy_cfg.get("btc_symbol", "btcusdt")), logger=logger).start()
+        strategy = BTCUpDownXGBStrategy(config=strategy_cfg, btc_feed=btc_feed, logger=logger)
     elif args.strategy == "btc_vol_reversion":
         strategy = BTCVolatilityReversionStrategy(config=strategy_cfg)
     else:
         strategy = BTCUpDownStrategy(config=strategy_cfg)
+
+    # -----------------------------------------------------------------------
+    # Chainlink reference price feed
+    # -----------------------------------------------------------------------
+    chainlink_cfg = raw_yaml.get("chainlink_feed", {})
+    chainlink_feed: Optional[ChainlinkFeed] = None
+    if chainlink_cfg.get("enabled", True):
+        chainlink_feed = ChainlinkFeed(
+            symbol=chainlink_cfg.get("symbol", "btc/usd"),
+            slot_interval_s=interval,
+            logger=logger,
+        ).start()
+        logger.info("Chainlink reference price feed started")
 
     # -----------------------------------------------------------------------
     # State + inventories
@@ -756,6 +1088,8 @@ def main() -> None:
     current_market_id: str = ""
     yes_token_id: str = ""
     no_token_id: str = ""
+    current_question: str = ""
+    current_strike_price: Optional[float] = None
     intra_cycle_analyze_fn = None
 
     # -----------------------------------------------------------------------
@@ -763,14 +1097,15 @@ def main() -> None:
     # -----------------------------------------------------------------------
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
-    signal.signal(signal.SIGTSTP, _handle_signal)
+    if hasattr(signal, "SIGTSTP"):
+        signal.signal(signal.SIGTSTP, _handle_signal)
 
     # -----------------------------------------------------------------------
     # Main loop
     # -----------------------------------------------------------------------
     while True:
         if _shutdown_requested:
-            graceful_shutdown(state, state_store, client, paper_trading, logger)
+            graceful_shutdown(state, state_store, client, paper_trading, logger, btc_feed=btc_feed, chainlink_feed=chainlink_feed)
 
         cycle_start = time.monotonic()
         logger.info(f"=== Main loop iteration (cycle {state.cycle_count + 1}) ===")
@@ -790,8 +1125,10 @@ def main() -> None:
             # Detect rollover: clear stale order IDs for old tokens
             if new_market_id != current_market_id and current_market_id:
                 logger.info(
-                    f"Market rolled over: {current_market_id} → {new_market_id}"
+                    f"Market rolled over: {current_market_id} → {new_market_id} | "
+                    f"Slot PnL for {current_market_id[:8]}: {state.slot_realized_pnl:+.4f}"
                 )
+                state.slot_realized_pnl = 0.0
                 # Old token order IDs are now stale — clear them
                 for old_tid in (yes_token_id, no_token_id):
                     state.active_order_ids.pop(old_tid, None)
@@ -806,6 +1143,25 @@ def main() -> None:
             current_market_id = new_market_id
             yes_token_id = market_info["yes_token_id"]
             no_token_id  = market_info["no_token_id"]
+            current_question = market_info.get("question", "")
+
+            # Strike price: prefer Chainlink slot-open, fall back to regex
+            if chainlink_feed is not None:
+                cl_ref = chainlink_feed.get_reference_price()
+                if cl_ref is not None:
+                    current_strike_price = cl_ref
+                    logger.info(f"Strike from Chainlink: ${cl_ref:,.2f}")
+                else:
+                    current_strike_price = parse_strike_price(current_question)
+                    logger.warning(
+                        f"Chainlink feed has no slot-open price yet, "
+                        f"falling back to regex: ${current_strike_price:,.2f}"
+                        if current_strike_price else
+                        "Chainlink feed has no slot-open price and regex parse failed"
+                    )
+            else:
+                current_strike_price = parse_strike_price(current_question)
+
             logger.debug(
                 f"Cycle {state.cycle_count}: market={current_market_id[:8]} "
                 f"yes={yes_token_id[:8]}"
@@ -814,6 +1170,13 @@ def main() -> None:
             # ------------------------------------------------------------------
             balance = client.get_balance()
             check_daily_reset(state, risk_manager, logger)
+
+            if state.slot_realized_pnl <= -abs(session_loss_cap):
+                logger.warning(
+                    f"Slot loss cap reached ({state.slot_realized_pnl:.2f} <= "
+                    f"-{session_loss_cap:.2f}) — shutting down"
+                )
+                graceful_shutdown(state, state_store, client, paper_trading, logger, btc_feed=btc_feed, chainlink_feed=chainlink_feed)
 
             if risk_manager.check_circuit_breaker(balance):
                 logger.warning(
@@ -845,9 +1208,9 @@ def main() -> None:
                 if inv:
                     realized = _apply_fill_to_state(inv, fill.side, fill.price, fill.size, state, risk_manager)
                     if realized > 0:
-                        _session_wins += 1
+                        state.session_wins += 1
                     elif realized < 0:
-                        _session_losses += 1
+                        state.session_losses += 1
 
             _sync_inventories_to_state(state, inventories)
 
@@ -857,11 +1220,11 @@ def main() -> None:
             _sync_strategy_from_inventories(strategy, inventories, (yes_token_id, no_token_id))
 
             # ------------------------------------------------------------------
-            # Fetch order books and positions
+            # Fetch order books and positions (parallel)
             # ------------------------------------------------------------------
-            yes_book  = client.get_order_book(yes_token_id)
-            no_book   = client.get_order_book(no_token_id)
-            positions = client.get_positions()
+            yes_book, no_book, positions, _bal = _fetch_market_data_parallel(
+                client, yes_token_id, no_token_id,
+            )
 
             # ------------------------------------------------------------------
             # Orphaned position cleanup: both YES and NO open simultaneously
@@ -899,7 +1262,9 @@ def main() -> None:
                         current_market_id, yes_token_id, no_token_id,
                         balance, positions, paper_trading, logger,
                         inventories=inventories,
+                        book_summary=_book_summary(yes_book, no_book),
                     )
+                    _snapshot_chainlink_state(state, chainlink_feed)
                     state_store.save(state)
                     positions = client.get_positions()  # refresh after cleanup
 
@@ -912,6 +1277,9 @@ def main() -> None:
                 "positions": positions,
                 "balance": balance,
                 "price_history": {},
+                "question": current_question,
+                "strike_price": current_strike_price,
+                "slot_expiry_ts": (int(math.floor(time.time() / 300) * 300) + 300),
             }
 
             # ------------------------------------------------------------------
@@ -920,8 +1288,11 @@ def main() -> None:
             strategy.set_tokens(current_market_id, yes_token_id, no_token_id)
             intra_cycle_analyze_fn = _make_intra_cycle_fn(
                 client, strategy, risk_manager, state, state_store,
-                current_market_id, yes_token_id, no_token_id, paper_trading, logger,
+                current_market_id, yes_token_id, no_token_id,
+                current_question, current_strike_price,
+                paper_trading, logger,
                 execution_tracker=execution_tracker, inventories=inventories,
+                chainlink_feed=chainlink_feed,
             )
             signals = strategy.analyze(market_data)
 
@@ -945,11 +1316,13 @@ def main() -> None:
                 current_market_id, yes_token_id, no_token_id,
                 balance, positions, paper_trading, logger,
                 inventories=inventories,
+                book_summary=_book_summary(yes_book, no_book),
             )
 
             # ------------------------------------------------------------------
             state.cycle_count += 1
             _snapshot_strategy_state(strategy, state)
+            _snapshot_chainlink_state(state, chainlink_feed)
             state_store.save(state)
 
             elapsed = time.monotonic() - cycle_start
@@ -960,11 +1333,12 @@ def main() -> None:
             )
 
         except KeyboardInterrupt:
-            graceful_shutdown(state, state_store, client, paper_trading, logger)
+            graceful_shutdown(state, state_store, client, paper_trading, logger, btc_feed=btc_feed, chainlink_feed=chainlink_feed)
 
         except Exception as e:
             logger.error(f"Cycle error: {e}", exc_info=True)
             try:
+                _snapshot_chainlink_state(state, chainlink_feed)
                 state_store.save(state)
             except Exception:
                 pass
