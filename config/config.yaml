@@ -38,6 +38,26 @@ strategies:
     position_size_usdc: 20.0   # spend ~$20 USDC per trade
     min_confidence: 0.7
 
+  btc_updown_xgb:
+    enabled: true
+    btc_symbol: "btcusdt"
+    model_path: "models/btc_updown_xgb.json"
+    feature_schema_path: "models/btc_updown_xgb_features.json"
+    metadata_path: "models/btc_updown_xgb_meta.json"
+
+    position_size_usdc: 20.0
+    min_confidence: 0.54
+    stop_loss_pct: 0.12
+    max_hold_seconds: 240
+
+    min_edge: 0.03
+    min_prob_yes: 0.54
+    max_prob_yes_for_no: 0.46
+    max_spread_pct: 0.06
+    exit_edge: -0.01
+    min_seconds_to_expiry: 20
+    max_seconds_to_expiry: 240
+
   btc_vol_reversion:
     enabled: true
     # Z-score mean-reversion: fade overreactions by monitoring price volatility
@@ -58,13 +78,19 @@ strategies:
 risk:
   max_position_size: 200.0        # max shares per position
   max_position_pct: 0.05          # 5% of balance per position
-  max_total_exposure: 0.15        # 15% of balance across all positions
+  max_total_exposure: 1.0         # allow full balance in open positions (guarded by session loss cap)
   max_daily_loss: 0.05            # 5% of balance daily loss cap
-  max_exposure_per_market: 0.10   # 10% of balance on this market
-  stop_loss_pct: 0.12
+  max_exposure_per_market: 0.50   # 50% of balance on one market
   circuit_breaker_enabled: true
   circuit_breaker_threshold: 0.20
+  max_session_loss_usdc: 5.0   # absolute session loss cap; bot shuts down when reached
+
+chainlink_feed:
+  enabled: true
+  symbol: "btc/usd"
 
 logging:
   level: "INFO"
   file: "logs/btc_updown_bot.log"
+  trade_log_file: "logs/trades.jsonl"
+  price_tick_file: "data/probability_ticks.jsonl"
