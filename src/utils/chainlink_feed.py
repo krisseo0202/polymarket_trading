@@ -121,11 +121,32 @@ class ChainlinkFeed:
             return False
         return age < self._stale_warn_s * 1000
 
+    def is_connecting(self) -> bool:
+        """Return True if the feed has started but not yet received any message.
+
+        Distinguishes the startup window from a feed that was live and went stale.
+        """
+        with self._lock:
+            return self._latest is None
+
     def get_recent_prices(self, window_s: int = 300) -> List[Tuple[float, float]]:
         """Return (timestamp, price) pairs for the last N seconds."""
         cutoff = time.time() - window_s
         with self._lock:
             return [(ts, p) for ts, p in self._buffer if ts >= cutoff]
+
+    def get_earliest_slot_price(self, slot_ts: int) -> Optional[float]:
+        """Return the earliest buffered price at or after slot_ts.
+
+        Used as a fallback when _slot_open is missing for the current slot but
+        the feed received ticks after the slot boundary (e.g. mid-slot reconnect).
+        The buffer is chronological, so the first match is the earliest tick.
+        """
+        with self._lock:
+            for ts, price in self._buffer:
+                if ts >= slot_ts:
+                    return price
+        return None
 
     # ── Message handling ──────────────────────────────────────────────────
 

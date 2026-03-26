@@ -44,12 +44,15 @@ _POS_CACHE_TTL = 30.0  # seconds
 _market_cache: Optional[Dict[str, Any]] = None
 _market_cache_ts: float = 0.0
 _market_cache_slot: int = 0
-_MARKET_CACHE_TTL = 60.0  # re-discover every 60s
+_MARKET_CACHE_TTL = 5.0  # re-discover every 5s for fresh outcomePrices
 
 _book_cache: Optional[Dict[str, Any]] = None
 _book_cache_ts: float = 0.0
 _BOOK_CACHE_TTL = 3.0  # refresh book every 3s
 _book_fetch_ok_ts: float = 0.0  # last SUCCESSFUL fetch timestamp
+
+_slot_price_rest_cache: Dict[int, Tuple[float, str]] = {}   # slot_ts → (price, source)
+_slot_price_rest_failed: Dict[int, float] = {}             # slot_ts → last failure time
 
 # Server-clock offset: updated from HTTP Date: headers on each market fetch.
 # Compensates for WSL clock drift vs. Polymarket server time.
@@ -214,6 +217,14 @@ def _discover_market() -> Optional[Dict[str, Any]]:
                             end_ts = datetime.fromisoformat(raw_end.replace("Z", "+00:00")).timestamp()
                         except Exception:
                             pass
+                    # outcomePrices[0] = YES/Up price; updated each time market is re-fetched
+                    up_price: Optional[float] = None
+                    try:
+                        raw_prices = json.loads(m.get("outcomePrices", "[]"))
+                        if raw_prices:
+                            up_price = float(raw_prices[0])
+                    except Exception:
+                        pass
                     _market_cache = {
                         "up_token": tids[0],
                         "down_token": tids[1],
@@ -221,6 +232,7 @@ def _discover_market() -> Optional[Dict[str, Any]]:
                         "volume": volume,
                         "title": m.get("question", ""),
                         "end_ts": end_ts,
+                        "up_price": up_price,
                     }
                     _market_cache_ts = now
                     _market_cache_slot = current_slot
@@ -377,25 +389,39 @@ def _build_order_book_panel(market: Optional[Dict[str, Any]] = None) -> Panel:
         best_ask = top_asks[0]["price"]
         spread = best_ask - best_bid
         spread_str = f"{spread * 100:.2f}"
-        # Direction arrow comparing to previous fetch
+
+        # Prefer gamma-api outcomePrices (updated every 5s) over CLOB midpoint
+        # (which falls back to a fixed 0.50 when the order book is empty).
+        gamma_price = market.get("up_price") if market else None
+        display_price = gamma_price if gamma_price is not None else midpoint
+
         prev_mid = book_data.get("_prev_midpoint")
-        if midpoint and prev_mid:
-            if midpoint > prev_mid + 1e-6:
+        if display_price and prev_mid:
+            if display_price > prev_mid + 1e-6:
                 arrow = "\u2191"  # ↑
-            elif midpoint < prev_mid - 1e-6:
+            elif display_price < prev_mid - 1e-6:
                 arrow = "\u2193"  # ↓
             else:
                 arrow = "="
         else:
             arrow = ""
-        last_str = f"{midpoint * 100:.2f}\u00a2{arrow}" if midpoint else "–"
-        # Book age: seconds since last successful API fetch
+        last_str = f"{display_price * 100:.2f}\u00a2{arrow}" if display_price else "–"
+
+        # Book age: seconds since last successful CLOB fetch
         age = time.time() - _book_fetch_ok_ts if _book_fetch_ok_ts > 0 else 0
-        age_str = f"{age:.0f}s ago" if age > 0 else ""
+        if age > 15:
+            age_style = "bold red"
+            age_str = f"STALE {age:.0f}s"
+        elif age > _BOOK_CACHE_TTL * 2:
+            age_style = "yellow"
+            age_str = f"{age:.0f}s ago"
+        else:
+            age_style = "dim italic"
+            age_str = f"{age:.0f}s ago" if age > 0 else ""
         tbl.add_row(
             Text("", style="dim"),
             Text(f"Last: {last_str}", style="bold yellow"),
-            Text(age_str, style="dim italic"),
+            Text(age_str, style=age_style),
             Text(f"Spread: {spread_str}\u00a2", style="dim"),
         )
 
@@ -410,11 +436,14 @@ def _build_order_book_panel(market: Optional[Dict[str, Any]] = None) -> Panel:
         )
 
     vol_str = f"${volume:,.0f} Vol." if volume else ""
+    is_stale = _book_fetch_ok_ts > 0 and (time.time() - _book_fetch_ok_ts) > 15
+    panel_title = "[bold red]Order Book — STALE[/bold red]" if is_stale else "[dim]Order Book — Trade Up[/dim]"
+    panel_border = "red" if is_stale else "dim"
     return Panel(
         tbl,
-        title=f"[dim]Order Book — Trade Up[/dim]",
+        title=panel_title,
         subtitle=f"[dim]{vol_str}[/dim]" if vol_str else None,
-        border_style="dim",
+        border_style=panel_border,
     )
 
 
@@ -700,6 +729,44 @@ def _build_bot_status_panel(
 
 # ── Market Cycle panel ────────────────────────────────────────────────────────
 
+_BINANCE_RETRY_S = 30.0  # seconds before retrying a failed Binance fetch
+
+
+def _fetch_slot_open_from_binance(slot_ts: int) -> Optional[Tuple[float, str]]:
+    """Fetch BTC/USDT 1-minute open price at slot_ts from Binance REST.
+
+    Cached per slot on success. Failures are suppressed for 30s to avoid
+    hammering the API on every dashboard refresh cycle.
+    """
+    if slot_ts in _slot_price_rest_cache:
+        return _slot_price_rest_cache[slot_ts]
+    last_fail = _slot_price_rest_failed.get(slot_ts)
+    if last_fail is not None and (time.time() - last_fail) < _BINANCE_RETRY_S:
+        return None
+    try:
+        resp = requests.get(
+            "https://api.binance.com/api/v3/klines",
+            params={
+                "symbol": "BTCUSDT",
+                "interval": "1m",
+                "startTime": slot_ts * 1000,  # ms
+                "limit": 1,
+            },
+            timeout=5,
+        )
+        resp.raise_for_status()
+        klines = resp.json()
+        if klines:
+            open_price = float(klines[0][1])  # index 1 = open
+            result = (open_price, "Binance 1m (est.)")
+            _slot_price_rest_cache[slot_ts] = result
+            return result
+    except Exception as e:
+        logging.getLogger(__name__).debug("Binance kline fetch failed for slot %s: %s", slot_ts, e)
+        _slot_price_rest_failed[slot_ts] = time.time()
+    return None
+
+
 def _resolve_price_to_beat(
     chainlink_feed: Optional[ChainlinkFeed],
     bot_state: Optional[dict] = None,
@@ -708,16 +775,29 @@ def _resolve_price_to_beat(
     """Resolve the authoritative current-slot price-to-beat."""
     slot_ts = current_slot if current_slot is not None else _current_slot_ts()
 
+    # 1. Live Chainlink slot-open (best)
     if chainlink_feed is not None:
         slot_open = chainlink_feed.get_slot_open_price()
         if slot_open is not None and slot_open.slot_ts == slot_ts:
             return slot_open.price, "Chainlink (live)"
 
+    # 2. Bot state snapshot
     if bot_state:
         bot_price = bot_state.get("chainlink_ref_price")
         bot_slot = bot_state.get("chainlink_ref_slot_ts")
         if bot_price is not None and bot_slot == slot_ts:
             return float(bot_price), "Chainlink (bot snapshot)"
+
+    # 3. ChainlinkFeed buffer — earliest tick this slot (mid-slot reconnect case)
+    if chainlink_feed is not None:
+        buffered = chainlink_feed.get_earliest_slot_price(slot_ts)
+        if buffered is not None:
+            return buffered, "Chainlink (buffered)"
+
+    # 4. Binance 1m REST — approximation when feed is completely down
+    binance = _fetch_slot_open_from_binance(slot_ts)
+    if binance is not None:
+        return binance
 
     return None, "Waiting for Chainlink"
 
@@ -784,6 +864,8 @@ def _build_market_cycle_panel(
     # Chainlink feed health
     if cl_healthy:
         tbl.add_row("Chainlink", Text("LIVE", style="bold green"))
+    elif chainlink_feed is not None and chainlink_feed.is_connecting():
+        tbl.add_row("Chainlink", Text("Connecting...", style="bold yellow"))
     else:
         tbl.add_row("Chainlink", Text("DOWN", style="bold red"))
 
