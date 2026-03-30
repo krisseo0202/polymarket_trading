@@ -34,6 +34,8 @@ class BotState:
     strategy_last_signal: str = ""              # e.g. "BUY YES @ 0.6500 | momentum=2.3%"
     strategy_last_signal_ts: float = 0.0
     strategy_status: str = ""                   # "WATCHING" | "POSITION_OPEN" | "EXITED"
+    strategy_score_breakdown: Optional[dict] = None  # sigmoid model feature contributions
+    strategy_required_edge: Optional[float] = None   # dynamic TTE-scaled entry threshold
 
     # Chainlink reference price (slot-open "price to beat")
     chainlink_ref_price: Optional[float] = None
@@ -91,6 +93,8 @@ class StateStore:
                 strategy_last_signal=data.get("strategy_last_signal", ""),
                 strategy_last_signal_ts=float(data.get("strategy_last_signal_ts", 0.0)),
                 strategy_status=data.get("strategy_status", ""),
+                strategy_score_breakdown=data.get("strategy_score_breakdown"),
+                strategy_required_edge=data.get("strategy_required_edge"),
                 chainlink_ref_price=data.get("chainlink_ref_price"),
                 chainlink_ref_slot_ts=data.get("chainlink_ref_slot_ts"),
                 chainlink_healthy=data.get("chainlink_healthy", False),

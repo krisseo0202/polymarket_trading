@@ -20,6 +20,7 @@ import json
 import logging
 import math
 import os
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -53,6 +54,12 @@ _book_fetch_ok_ts: float = 0.0  # last SUCCESSFUL fetch timestamp
 
 _slot_price_rest_cache: Dict[int, Tuple[float, str]] = {}   # slot_ts → (price, source)
 _slot_price_rest_failed: Dict[int, float] = {}             # slot_ts → last failure time
+
+# Resolved market outcome cache per slot
+_slot_outcome_cache: Dict[int, str] = {}    # slot_ts → "Up" | "Down"
+_slot_outcome_retry_ts: Dict[int, float] = {}
+_slot_outcome_lock = threading.Lock()
+_SLOT_OUTCOME_RETRY_S = 60.0  # retry unresolved slots every 60s
 
 # Server-clock offset: updated from HTTP Date: headers on each market fetch.
 # Compensates for WSL clock drift vs. Polymarket server time.
@@ -500,6 +507,25 @@ def _compute_total_unrealized(bot_state: dict) -> Optional[float]:
 _state_cache: Optional[Tuple[Dict[str, Any], float]] = None
 _state_cache_mtime: float = 0.0
 
+_snapshot_cache: Optional[Dict[str, Any]] = None
+_snapshot_cache_mtime: float = 0.0
+
+
+def _load_snapshot(path: str) -> Optional[Dict[str, Any]]:
+    """Read bot_snapshot.json (cycle source of truth). Cached; re-reads on mtime change."""
+    global _snapshot_cache, _snapshot_cache_mtime
+    try:
+        mtime = os.path.getmtime(path)
+        if _snapshot_cache is not None and mtime == _snapshot_cache_mtime:
+            return _snapshot_cache
+        with open(path, "r") as f:
+            data = json.load(f)
+        _snapshot_cache = data
+        _snapshot_cache_mtime = mtime
+        return data
+    except (OSError, json.JSONDecodeError):
+        return _snapshot_cache  # return stale on error
+
 
 def _load_bot_state(path: str) -> Tuple[Optional[Dict[str, Any]], Optional[float]]:
     """Read and parse bot_state.json. Cached; re-reads only when mtime changes."""
@@ -684,33 +710,48 @@ def _build_pnl_panel(
 def _build_bot_status_panel(
     bot_state: Optional[dict],
     file_mtime: Optional[float],
+    snapshot: Optional[dict] = None,
 ) -> Panel:
-    """Build the Bot Status panel."""
-    if bot_state is None:
+    """Build the Bot Status panel.
+
+    Prefers snapshot data (written by bot every cycle) over inferred state.
+    """
+    if bot_state is None and snapshot is None:
         return Panel(
             Text("Bot offline", style="dim italic"),
             title="[dim]Bot Status[/dim]",
             border_style="dim",
         )
 
-    cycle = bot_state.get("cycle_count", 0)
+    cycle = (snapshot or bot_state or {}).get("cycle_count", 0)
 
-    # active_order_ids is a dict {token_id: order_id|null}, not a list
-    orders = bot_state.get("active_order_ids", {})
-    if isinstance(orders, dict):
-        order_count = sum(1 for v in orders.values() if v is not None)
+    # Active orders: snapshot has full Order objects; fallback to order ID count
+    if snapshot and snapshot.get("active_orders") is not None:
+        order_count = len(snapshot["active_orders"])
     else:
-        order_count = 0
+        orders = (bot_state or {}).get("active_order_ids", {})
+        order_count = sum(1 for v in orders.values() if v is not None) if isinstance(orders, dict) else 0
 
-    # Derive operational status from file mtime + strategy state + orders
-    strategy_status = bot_state.get("strategy_status", "")
-    if file_mtime is None:
-        status = Text("UNKNOWN", style="dim")
+    # Bot status: use snapshot's explicit enum when fresh (< 10 min old)
+    snap_status = snapshot.get("bot_status") if snapshot else None
+    snap_age = (time.time() - float(snapshot.get("updated_at", 0))) if snapshot else float("inf")
+
+    if file_mtime is not None and (time.time() - file_mtime) >= 600:
+        status = Text(f"STOPPED ({(time.time() - file_mtime) / 60:.0f}m ago)", style="bold red")
+    elif snap_status and snap_age < 600:
+        _style_map = {
+            "IN_POSITION": "bold cyan",
+            "EVALUATING":  "bold green",
+            "COOLDOWN":    "bold yellow",
+            "ERROR":       "bold red",
+            "STOPPED":     "bold red",
+            "INIT":        "dim",
+        }
+        status = Text(snap_status, style=_style_map.get(snap_status, "white"))
     else:
-        age_min = (time.time() - file_mtime) / 60.0
-        if age_min >= 10:
-            status = Text(f"STOPPED ({age_min:.0f}m ago)", style="bold red")
-        elif strategy_status == "POSITION_OPEN":
+        # Fallback: derive from legacy strategy_status field
+        strategy_status = (bot_state or {}).get("strategy_status", "")
+        if strategy_status == "POSITION_OPEN":
             status = Text("POSITION_OPEN", style="bold cyan")
         elif order_count > 0:
             status = Text("ORDER_PENDING", style="bold yellow")
@@ -723,6 +764,15 @@ def _build_bot_status_panel(
     tbl.add_row("Cycle", Text(str(cycle), style="white"))
     tbl.add_row("Orders", Text(str(order_count), style="white"))
     tbl.add_row("Bot", status)
+
+    # Show YES/NO mids from snapshot when available
+    if snapshot:
+        yes_mid = snapshot.get("yes_mid")
+        no_mid = snapshot.get("no_mid")
+        if yes_mid is not None:
+            tbl.add_row("YES mid", Text(f"{yes_mid:.4f}", style="green"))
+        if no_mid is not None:
+            tbl.add_row("NO mid", Text(f"{no_mid:.4f}", style="red"))
 
     return Panel(tbl, title="[dim]Bot Status[/dim]", border_style="dim")
 
@@ -765,6 +815,67 @@ def _fetch_slot_open_from_binance(slot_ts: int) -> Optional[Tuple[float, str]]:
         logging.getLogger(__name__).debug("Binance kline fetch failed for slot %s: %s", slot_ts, e)
         _slot_price_rest_failed[slot_ts] = time.time()
     return None
+
+
+def _fetch_slot_outcome_bg(slot_ts: int) -> None:
+    """Background thread: fetch and cache the resolved outcome for a past slot."""
+    slug = f"btc-updown-5m-{slot_ts}"
+    result: Optional[str] = None
+    try:
+        resp = requests.get(
+            "https://gamma-api.polymarket.com/events",
+            params={"slug": slug},
+            timeout=5,
+        )
+        resp.raise_for_status()
+        events = resp.json()
+        for event in (events if isinstance(events, list) else [events]):
+            for m in event.get("markets", []):
+                raw_prices = m.get("outcomePrices")
+                if not raw_prices:
+                    continue
+                try:
+                    prices = json.loads(raw_prices)
+                    if len(prices) >= 2:
+                        p0, p1 = float(prices[0]), float(prices[1])
+                        if p0 >= 0.99:
+                            result = "Up"
+                        elif p1 >= 0.99:
+                            result = "Down"
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    if result is not None:
+        with _slot_outcome_lock:
+            _slot_outcome_cache[slot_ts] = result
+
+
+def _ensure_slot_outcomes(slot_tss: List[int]) -> None:
+    """Kick off background fetches for uncached/unretried slots (non-blocking)."""
+    now = time.time()
+    current_slot = _current_slot_ts(now)
+    cutoff = current_slot - 48 * 3600  # evict entries older than 48h
+
+    for slot_ts in slot_tss:
+        with _slot_outcome_lock:
+            if slot_ts in _slot_outcome_cache:
+                continue
+            last = _slot_outcome_retry_ts.get(slot_ts, 0)
+            # Recently-closed slot: retry every 10s until resolved
+            retry_s = 10.0 if slot_ts >= current_slot - 300 else _SLOT_OUTCOME_RETRY_S
+            if now - last < retry_s:
+                continue
+            _slot_outcome_retry_ts[slot_ts] = now
+        threading.Thread(target=_fetch_slot_outcome_bg, args=(slot_ts,), daemon=True).start()
+
+    # Evict stale entries (runs at most once per render cycle, O(n) on cache size)
+    with _slot_outcome_lock:
+        stale = [s for s in _slot_outcome_cache if s < cutoff]
+        for s in stale:
+            del _slot_outcome_cache[s]
+            _slot_outcome_retry_ts.pop(s, None)
 
 
 def _resolve_price_to_beat(
@@ -935,6 +1046,25 @@ def _build_strategy_panel(bot_state: Optional[dict]) -> Panel:
         prob_style = "bold green" if prob_yes >= 0.5 else "bold red"
         tbl.add_row("Prob YES", Text(f"{prob_yes:.3f}", style=prob_style))
 
+    breakdown = bot_state.get("strategy_score_breakdown") or {}
+    if breakdown:
+        tbl.add_row("── score ──", Text("", style="dim"))
+
+        def _contrib_row(label: str, val: float):
+            style = "green" if val > 0 else ("red" if val < 0 else "dim")
+            return label, Text(f"{val:+.4f}", style=style)
+
+        tbl.add_row(*_contrib_row("  dist",   breakdown.get("dist_contrib", 0)))
+        tbl.add_row(*_contrib_row("  mom 1m", breakdown.get("mom1_contrib", 0)))
+        tbl.add_row(*_contrib_row("  mom 3m", breakdown.get("mom3_contrib", 0)))
+        tbl.add_row(*_contrib_row("  mom 5m", breakdown.get("mom5_contrib", 0)))
+        td_c = breakdown.get("td_contrib", 0)
+        if td_c != 0:
+            tbl.add_row(*_contrib_row("  TD", td_c))
+        tbl.add_row("  t-weight", Text(f"{breakdown.get('time_weight', 1.0):.2f}×", style="dim"))
+        raw_score = breakdown.get("score", 0)
+        tbl.add_row("  score", Text(f"{raw_score:+.4f}", style="bold green" if raw_score > 0 else "bold red"))
+
     edge_yes = bot_state.get("strategy_edge_yes")
     if edge_yes is not None:
         edge_style = "bold green" if edge_yes >= 0 else "bold red"
@@ -944,6 +1074,10 @@ def _build_strategy_panel(bot_state: Optional[dict]) -> Panel:
     if edge_no is not None:
         edge_style = "bold green" if edge_no >= 0 else "bold red"
         tbl.add_row("Edge NO", Text(f"{edge_no:+.3f}", style=edge_style))
+
+    req_edge = bot_state.get("strategy_required_edge")
+    if req_edge is not None:
+        tbl.add_row("Req Edge", Text(f"{req_edge:.3f}", style="dim"))
 
     model_version = bot_state.get("strategy_model_version", "")
     if model_version:
@@ -1003,6 +1137,67 @@ def _build_trade_log_panel(bot_state: Optional[dict]) -> Panel:
         )
 
     return Panel(tbl, title="[dim]Trades[/dim]", border_style="dim")
+
+
+def _build_slot_history_panel(
+    bot_state: Optional[dict],
+    n_slots: int = 12,
+) -> Panel:
+    """Show last N resolved 5-min slots: market outcome (green=Up, red=Down) and my bet."""
+    now = _server_now()
+    current_slot = _current_slot_ts(now)
+
+    past_slots = [current_slot - 300 * i for i in range(n_slots - 1, -1, -1)]
+
+    # Trigger background fetches (non-blocking)
+    _ensure_slot_outcomes(past_slots)
+
+    # Build trade lookup: slot_ts → outcome side ("YES"/"NO") from first BUY per slot
+    trade_lookup: Dict[int, str] = {}
+    if bot_state:
+        for entry in (bot_state.get("trade_log") or []):
+            if entry.get("action") != "BUY":
+                continue
+            slot = _current_slot_ts(entry.get("ts") or now)
+            if slot not in trade_lookup:
+                trade_lookup[slot] = entry.get("outcome", "")
+
+    # Snapshot outcome cache once (avoids per-slot lock acquisition in render loop)
+    with _slot_outcome_lock:
+        cached_outcomes = {s: _slot_outcome_cache.get(s) for s in past_slots}
+
+    # Build table: label column + one column per slot
+    tbl = Table(show_header=True, box=None, padding=(0, 0), expand=True)
+    tbl.add_column("", width=7, style="dim", no_wrap=True)
+    for slot_ts in past_slots:
+        label = datetime.fromtimestamp(slot_ts + 300, tz=timezone.utc).strftime("%H:%M")
+        tbl.add_column(label, justify="center", min_width=5, no_wrap=True)
+
+    # Build both rows in a single pass
+    market_cells: List[Any] = [Text("Market", style="dim")]
+    my_cells: List[Any] = [Text("My bet", style="dim")]
+    for slot_ts in past_slots:
+        outcome = cached_outcomes.get(slot_ts)
+        side = trade_lookup.get(slot_ts)
+
+        if outcome == "Up":
+            market_cells.append(Text(" ● ", style="bold green"))
+        elif outcome == "Down":
+            market_cells.append(Text(" ● ", style="bold red"))
+        else:
+            market_cells.append(Text(" ? ", style="dim"))
+
+        if side is None:
+            my_cells.append(Text(" ○ ", style="dim"))
+        elif side in ("YES", "Up"):
+            my_cells.append(Text(" ● ", style="bold green"))
+        else:
+            my_cells.append(Text(" ● ", style="bold red"))
+
+    tbl.add_row(*market_cells)
+    tbl.add_row(*my_cells)
+
+    return Panel(tbl, title="[dim]Slot History  (past 1h · green=Up · red=Down)[/dim]", border_style="dim")
 
 
 _log_cache: Optional[list] = None
@@ -1155,12 +1350,28 @@ def _build_panel(
 
     # ── Bot state panels ──────────────────────────────────────────────────
     bot_state, file_mtime = _load_bot_state(state_file)
+    snapshot = _load_snapshot(state_file.replace(".json", "_snapshot.json"))
     live_positions = _fetch_live_positions()
 
-    positions_panel = _build_positions_panel(bot_state, live_positions, market=market)
-    total_upnl = _compute_total_unrealized(bot_state) if bot_state else None
+    # Build token→outcome map from snapshot (avoids extra market API call)
+    if snapshot and market is None:
+        snap_market = {
+            "up_token": snapshot.get("yes_token_id", ""),
+            "down_token": snapshot.get("no_token_id", ""),
+        }
+    else:
+        snap_market = market
+
+    positions_panel = _build_positions_panel(
+        bot_state, live_positions, market=snap_market or market
+    )
+    # Use pre-computed unrealized PnL from snapshot (no extra CLOB API calls)
+    snap_upnl = snapshot.get("unrealized_pnl") if snapshot else None
+    total_upnl = snap_upnl if snap_upnl is not None else (
+        _compute_total_unrealized(bot_state) if bot_state else None
+    )
     pnl_panel = _build_pnl_panel(bot_state, total_upnl=total_upnl)
-    bot_status_panel = _build_bot_status_panel(bot_state, file_mtime)
+    bot_status_panel = _build_bot_status_panel(bot_state, file_mtime, snapshot=snapshot)
 
     # Right column: stack positions + pnl + bot status vertically
     right_stack = Table.grid(expand=True)
@@ -1174,6 +1385,9 @@ def _build_panel(
     middle_row.add_column(no_wrap=True)
     middle_row.add_column(ratio=1)
     middle_row.add_row(order_book_panel, right_stack)
+
+    # ── Slot history panel (full-width) ───────────────────────────────────
+    slot_history_panel = _build_slot_history_panel(bot_state)
 
     # ── Market Cycle + Strategy + Trade Log panels (bottom row) ──────────
     market_cycle_panel = _build_market_cycle_panel(
@@ -1207,6 +1421,7 @@ def _build_panel(
     outer.add_row(status_bar)
     outer.add_row(body)
     outer.add_row(middle_row)
+    outer.add_row(slot_history_panel)
     outer.add_row(bottom_row)
     outer.add_row(log_panel)
     outer.add_row(footer)
@@ -1226,7 +1441,7 @@ def main() -> None:
         description="Live BTC/USDT price feed monitor",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--symbol",  default="btcusdt",      help="Binance symbol")
+    parser.add_argument("--symbol",  default="BTC-USD",       help="Exchange symbol (Coinbase: BTC-USD, Binance.US: btcusd)")
     parser.add_argument("--refresh", type=float, default=4,  help="Refresh rate in Hz")
     parser.add_argument("--window",  type=int, default=300,  help="Chart window (seconds)")
     parser.add_argument("--chart-w", type=int, default=_CHART_W, dest="chart_w",

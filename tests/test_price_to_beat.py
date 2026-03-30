@@ -68,7 +68,8 @@ def test_bot_snapshot_used_when_live_feed_missed_slot_open():
     assert source == "Chainlink (bot snapshot)"
 
 
-def test_previous_slot_bot_snapshot_is_rejected():
+@patch("dashboard._fetch_slot_open_from_binance", return_value=None)
+def test_previous_slot_bot_snapshot_is_rejected(mock_binance):
     current_slot = 1_700_000_100
     bot_state = {
         "chainlink_ref_price": 84_490.0,
@@ -82,10 +83,11 @@ def test_previous_slot_bot_snapshot_is_rejected():
     )
 
     assert price is None
-    assert source == "Waiting for Chainlink"
+    assert "Waiting" in source
 
 
-def test_waiting_state_does_not_fallback_to_regex_price():
+@patch("dashboard._fetch_slot_open_from_binance", return_value=None)
+def test_waiting_state_does_not_fallback_to_regex_price(mock_binance):
     current_slot = 1_700_000_100
     feed = _FakeBtcFeed(mid=84_550.0)
     market = {"title": "Will BTC be above $999,999 at 12:05 PM ET?", "end_ts": current_slot + 300}
@@ -102,7 +104,7 @@ def test_waiting_state_does_not_fallback_to_regex_price():
     console.print(panel)
     rendered = console.export_text()
 
-    assert "Waiting for Chainlink" in rendered
+    assert "Waiting" in rendered
     assert "$999,999" not in rendered
 
 

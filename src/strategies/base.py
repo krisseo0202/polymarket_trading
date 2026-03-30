@@ -193,6 +193,24 @@ class Strategy(ABC):
         self.entry_timestamp = None
         self.entry_size      = None
 
+    def _auto_recover_position(self, by_token: Dict[str, Any], now_ts: float) -> None:
+        """Recover position state from live positions after a bot restart.
+
+        No-op when already tracking a position. Checks YES then NO token.
+        """
+        if self.active_token_id is not None:
+            return
+        for tid in (self._yes_token_id, self._no_token_id):
+            if not tid:
+                continue
+            pos = by_token.get(tid)
+            if pos and pos.size > 0:
+                self.active_token_id = tid
+                self.entry_price = pos.average_price
+                self.entry_timestamp = now_ts
+                self.entry_size = pos.size
+                break
+
     def sync_position_from_inventory(
         self,
         token_id: Optional[str],

@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import logging
-import math
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from .base import Signal, Strategy
 from ..api.types import OrderBook, Position
 from ..models import BTCUpDownXGBModel
-from ..utils.market_utils import get_mid_price, round_to_tick
+from ..utils.market_utils import get_mid_price, round_to_tick, spread_pct
 
 
 class BTCUpDownXGBStrategy(Strategy):
@@ -71,15 +70,7 @@ class BTCUpDownXGBStrategy(Strategy):
                 continue
             self.record_price(tid, mid, now_mono)
 
-        if self.active_token_id is None:
-            for tid in (self._yes_token_id, self._no_token_id):
-                pos = by_token.get(tid)
-                if pos and pos.size > 0:
-                    self.active_token_id = tid
-                    self.entry_price = pos.average_price
-                    self.entry_timestamp = now_mono
-                    self.entry_size = pos.size
-                    break
+        self._auto_recover_position(by_token, now_mono)
 
         prediction = self._predict(order_books, market_data, now_wall)
 
@@ -172,8 +163,8 @@ class BTCUpDownXGBStrategy(Strategy):
         no_bid = float(no_book.bids[0].price) if no_book.bids else 0.0
         no_ask = float(no_book.asks[0].price) if no_book.asks else 0.0
 
-        yes_spread_pct = _spread_pct(yes_bid, yes_ask)
-        no_spread_pct = _spread_pct(no_bid, no_ask)
+        yes_spread_pct = spread_pct(yes_bid, yes_ask)
+        no_spread_pct = spread_pct(no_bid, no_ask)
         if yes_spread_pct > self.max_spread_pct and no_spread_pct > self.max_spread_pct:
             self.last_feature_status = "spread_too_wide"
             return []
@@ -280,11 +271,3 @@ class BTCUpDownXGBStrategy(Strategy):
             reason=reason,
         )
 
-
-def _spread_pct(bid: float, ask: float) -> float:
-    if bid <= 0 or ask <= 0:
-        return math.inf
-    mid = (bid + ask) / 2.0
-    if mid <= 0:
-        return math.inf
-    return max(0.0, ask - bid) / mid

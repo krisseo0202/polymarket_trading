@@ -22,12 +22,22 @@ from .schema import FEATURE_COLUMNS, build_default_metadata
 class PredictionResult:
     """Live prediction result consumed by the strategy."""
 
-    __slots__ = ("prob_yes", "model_version", "feature_status")
+    __slots__ = ("prob_yes", "model_version", "feature_status", "edge_yes", "edge_no")
 
-    def __init__(self, prob_yes: Optional[float], model_version: str, feature_status: str, prob_no: Optional[float] = None):
+    def __init__(
+        self,
+        prob_yes: Optional[float],
+        model_version: str,
+        feature_status: str,
+        prob_no: Optional[float] = None,
+        edge_yes: Optional[float] = None,
+        edge_no: Optional[float] = None,
+    ):
         self.prob_yes = prob_yes
         self.model_version = model_version
         self.feature_status = feature_status
+        self.edge_yes = edge_yes
+        self.edge_no = edge_no
 
     @property
     def prob_no(self) -> Optional[float]:
@@ -178,4 +188,3 @@ class BTCUpDownXGBModel:
         except Exception as exc:  # pragma: no cover - defensive
             self.logger.warning("Failed to load JSON from %s: %s", path, exc)
             return None
-

@@ -92,16 +92,7 @@ class BTCUpDownStrategy(Strategy):
             cutoff = now_ts - self._history_max_age
             self._price_history[tid] = [(ts, p) for ts, p in buf if ts >= cutoff]
 
-        # 2. Auto-recover state after restart (positions are source of truth)
-        if self.active_token_id is None:
-            for tid in (self._yes_token_id, self._no_token_id):
-                pos = by_token.get(tid)
-                if pos and pos.size > 0:
-                    self.active_token_id  = tid
-                    self.entry_price      = pos.average_price
-                    self.entry_timestamp  = now_ts   # conservative: treat as just entered
-                    self.entry_size       = pos.size
-                    break
+        self._auto_recover_position(by_token, now_ts)
 
         # 3. Exit check — always before entry
         exit_sig = self.check_exit(order_books, by_token, now_ts)

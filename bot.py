@@ -33,16 +33,21 @@ from typing import Dict, List, Optional
 sys.path.insert(0, os.path.dirname(__file__))
 
 from src.api.client import PolymarketClient
+from src.engine.cycle_snapshot import BotStatus, CycleSnapshot, SnapshotStore
 from src.engine.execution import ExecutionTracker
 from src.engine.inventory import InventoryState
 from src.engine.risk_manager import RiskLimits, RiskManager
+from src.engine.slot_state import SLOT_INTERVAL_S, SlotContext, SlotStateManager
+from src.engine.performance_store import PerformanceStore
 from src.engine.state_store import BotState, StateStore
-from src.models import parse_strike_price
+from src.models import BTCSigmoidModel, parse_strike_price
+from src.models.feature_builder import _realized_vol
 from src.strategies.base import Signal
 from src.strategies.btc_updown import BTCUpDownStrategy
 from src.strategies.btc_updown_xgb import BTCUpDownXGBStrategy
 from src.strategies.btc_vol_reversion import BTCVolatilityReversionStrategy
 from src.strategies.coin_toss import CoinTossStrategy
+from src.strategies.prob_edge import ProbEdgeStrategy
 from src.utils.btc_feed import BtcPriceFeed
 from src.utils.chainlink_feed import ChainlinkFeed
 from src.utils.config import load_config
@@ -62,6 +67,7 @@ _server_offset: float = 0.0  # server_time - local_time, updated each market dis
 # Session PnL counters — reset each run, not persisted
 _session_wins: int = 0
 _session_losses: int = 0
+_bot_start_ts: float = 0.0
 
 # Structured trade log (JSONL) — set once at startup from config
 _trade_log_path: Optional[str] = None
@@ -101,6 +107,217 @@ def _book_summary(yes_book, no_book) -> dict:
         "no_ask": no_book.asks[0].price if no_book and no_book.asks else None,
     }
 
+def _compute_unrealized_pnl(
+    inventories: Dict[str, "InventoryState"],
+    yes_token_id: str,
+    no_token_id: str,
+    yes_book,
+    no_book,
+) -> Optional[float]:
+    """Compute total unrealized PnL from live book mids. Returns None if any mid is missing."""
+    book_map = {yes_token_id: yes_book, no_token_id: no_book}
+    total = 0.0
+    has_position = False
+    for tid, inv in inventories.items():
+        if inv.position == 0:
+            continue
+        has_position = True
+        book = book_map.get(tid)
+        mid = get_mid_price(book) if book else None
+        if mid is None:
+            return None
+        total += (mid - inv.avg_cost) * inv.position
+    return total if has_position else None
+
+
+def _build_and_save_snapshot(
+    snapshot_store: "SnapshotStore",
+    state: "BotState",
+    market_id: str,
+    question: str,
+    yes_token_id: str,
+    no_token_id: str,
+    strike: Optional[float],
+    btc_now: Optional[float],
+    yes_book,
+    no_book,
+    inventories: Dict[str, "InventoryState"],
+    execution_tracker: "ExecutionTracker",
+    risk_manager: "RiskManager",
+    paper_trading: bool,
+) -> None:
+    """Assemble CycleSnapshot from current cycle state and write atomically."""
+    now = time.time()
+    start_ts = int(math.floor(now / 300) * 300)
+    end_ts = start_ts + 300
+
+    yes_bid = yes_book.bids[0].price if yes_book and yes_book.bids else None
+    yes_ask = yes_book.asks[0].price if yes_book and yes_book.asks else None
+    no_bid  = no_book.bids[0].price  if no_book  and no_book.bids  else None
+    no_ask  = no_book.asks[0].price  if no_book  and no_book.asks  else None
+    yes_mid = (yes_bid + yes_ask) / 2 if yes_bid and yes_ask else (yes_bid or yes_ask)
+    no_mid  = (no_bid  + no_ask)  / 2 if no_bid  and no_ask  else (no_bid  or no_ask)
+
+    pos_dict = {
+        tid: {"size": inv.position, "avg_cost": inv.avg_cost}
+        for tid, inv in inventories.items()
+        if inv.position != 0
+    }
+
+    orders = [
+        {
+            "order_id": o.order_id,
+            "token_id": o.token_id,
+            "outcome": o.outcome,
+            "side": o.side,
+            "price": o.price,
+            "size": o.size,
+            "status": o.status,
+            "filled_qty": o.filled_qty,
+        }
+        for o in execution_tracker.active_orders.values()
+    ]
+
+    has_position = any(inv.position != 0 for inv in inventories.values())
+    cb_active = getattr(risk_manager, "circuit_breaker_active", False)
+    if cb_active:
+        status = BotStatus.COOLDOWN.value
+    elif has_position:
+        status = BotStatus.IN_POSITION.value
+    else:
+        status = BotStatus.EVALUATING.value
+
+    unrealized = _compute_unrealized_pnl(
+        inventories, yes_token_id, no_token_id, yes_book, no_book
+    )
+
+    snap = CycleSnapshot(
+        market_id=market_id,
+        question=question,
+        yes_token_id=yes_token_id,
+        no_token_id=no_token_id,
+        start_ts=start_ts,
+        end_ts=end_ts,
+        tte_seconds=max(0.0, end_ts - now),
+        strike=strike,
+        btc_now=btc_now,
+        yes_bid=yes_bid,
+        yes_ask=yes_ask,
+        yes_mid=yes_mid,
+        no_bid=no_bid,
+        no_ask=no_ask,
+        no_mid=no_mid,
+        positions=pos_dict,
+        active_orders=orders,
+        bot_status=status,
+        daily_realized_pnl=state.daily_realized_pnl,
+        slot_realized_pnl=state.slot_realized_pnl,
+        unrealized_pnl=unrealized,
+        cycle_count=state.cycle_count,
+        paper_trading=paper_trading,
+    )
+    try:
+        snapshot_store.save(snap)
+    except Exception:
+        pass  # never let snapshot write crash the main loop
+
+
+_GAMMA_API = "https://gamma-api.polymarket.com"
+
+
+def _fetch_slot_outcome(slot_ts: int, logger) -> Optional[str]:
+    """
+    Query Gamma API for the resolution outcome of a specific 5-min slot.
+    Returns "Up", "Down", or None (unresolved / API error).
+    """
+    slug = f"btc-updown-5m-{slot_ts}"
+    try:
+        resp = requests.get(
+            f"{_GAMMA_API}/events",
+            params={"slug": slug},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        events = resp.json()
+        if not events:
+            return None
+        market = (events[0].get("markets") or [{}])[0]
+        closed = market.get("closed", False)
+        raw = market.get("outcomePrices", "")
+        outcome_prices: list = json.loads(raw) if isinstance(raw, str) else (raw or [])
+        if not closed or len(outcome_prices) < 2:
+            return None
+        if float(outcome_prices[0]) > 0.9:
+            return "Up"
+        if float(outcome_prices[1]) > 0.9:
+            return "Down"
+        return None
+    except Exception as exc:
+        logger.warning(f"Gamma API error fetching outcome for slot {slot_ts}: {exc}")
+        return None
+
+
+def _settle_expiring_positions(
+    yes_token_id: str,
+    no_token_id: str,
+    slot_ts: int,
+    inventories: Dict[str, "InventoryState"],
+    state: "BotState",
+    risk_manager: "RiskManager",
+    paper_trading: bool,
+    logger,
+) -> None:
+    """
+    Apply synthetic settlement SELLs for open positions in an expired slot.
+
+    Called at market rollover BEFORE resetting slot_realized_pnl.
+    Queries Gamma API for the outcome, then realizes PnL at settlement price
+    (0.99 for the winning side, 0.01 for the losing side).
+    """
+    positions_to_settle = [
+        (yes_token_id, "YES"),
+        (no_token_id,  "NO"),
+    ]
+    has_open = any(
+        inventories.get(tid, None) is not None and inventories[tid].position > 0
+        for tid, _ in positions_to_settle
+    )
+    if not has_open:
+        return
+
+    outcome = _fetch_slot_outcome(slot_ts, logger)
+    if outcome is None:
+        logger.warning(
+            f"Cannot settle slot {slot_ts}: outcome not yet available "
+            "(market may still be resolving — positions left open)"
+        )
+        return
+
+    # YES wins if outcome == "Up"; NO wins if outcome == "Down"
+    settlement = {
+        "YES": 0.99 if outcome == "Up"   else 0.01,
+        "NO":  0.99 if outcome == "Down" else 0.01,
+    }
+
+    for token_id, side in positions_to_settle:
+        inv = inventories.get(token_id)
+        if inv is None or inv.position <= 0:
+            continue
+        price  = settlement[side]
+        size   = inv.position
+        realized = _apply_fill_to_state(inv, "SELL", price, size, state, risk_manager)
+        if realized > 0:
+            state.session_wins += 1
+        elif realized < 0:
+            state.session_losses += 1
+        label = "paper" if paper_trading else "live"
+        logger.info(
+            f"[{label}] Settlement SELL: {side} {token_id[:8]} "
+            f"{size:.2f}sh @ {price:.2f} → realized {realized:+.4f} "
+            f"(slot outcome: {outcome})"
+        )
+
+
 def _apply_fill_to_state(
     inv: "InventoryState",
     side: str,
@@ -132,22 +349,23 @@ def _sync_inventories_to_state(
 def _snapshot_chainlink_state(
     state: "BotState",
     chainlink_feed: Optional["ChainlinkFeed"],
+    slot_mgr: Optional["SlotStateManager"] = None,
 ) -> None:
     """Persist the latest Chainlink slot-open snapshot for dashboard recovery."""
-    if chainlink_feed is None:
-        state.chainlink_ref_price = None
-        state.chainlink_ref_slot_ts = None
-        state.chainlink_healthy = False
-        return
-
-    slot_open = chainlink_feed.get_slot_open_price()
-    if slot_open is not None:
-        state.chainlink_ref_price = slot_open.price
-        state.chainlink_ref_slot_ts = slot_open.slot_ts
+    if slot_mgr is not None:
+        slot_mgr.sync_to_bot_state(state)
+    elif chainlink_feed is not None:
+        slot_open = chainlink_feed.get_slot_open_price()
+        if slot_open is not None:
+            state.chainlink_ref_price = slot_open.price
+            state.chainlink_ref_slot_ts = slot_open.slot_ts
+        else:
+            state.chainlink_ref_price = None
+            state.chainlink_ref_slot_ts = None
     else:
         state.chainlink_ref_price = None
         state.chainlink_ref_slot_ts = None
-    state.chainlink_healthy = chainlink_feed.is_healthy()
+    state.chainlink_healthy = chainlink_feed.is_healthy() if chainlink_feed else False
 
 
 def _sync_strategy_from_inventories(
@@ -249,6 +467,8 @@ def ticker_until_next_cycle(
     strategy=None,
     intra_cycle_analyze_fn=None,
     logger=None,
+    btc_feed: Optional["BtcPriceFeed"] = None,
+    slot_mgr: Optional["SlotStateManager"] = None,
 ) -> None:
     """
     Record prices in the background while waiting for the next cycle.
@@ -287,15 +507,30 @@ def ticker_until_next_cycle(
 
             yb, ya = yes_bid[0], yes_ask[0]
             nb, na = no_bid[0], no_ask[0]
+            _now_ts = time.time()
+            _btc_now = btc_feed.get_latest_mid() if btc_feed else None
+            _btc_prices = btc_feed.get_recent_prices(300) if btc_feed else []
+            _vol_30s = _realized_vol(_btc_prices, _now_ts, 30) if len(_btc_prices) >= 3 else None
+            _vol_60s = _realized_vol(_btc_prices, _now_ts, 60) if len(_btc_prices) >= 3 else None
+            _strike, _strike_src = None, None
+            if slot_mgr:
+                _ctx = slot_mgr.get()
+                if _ctx:
+                    _strike, _strike_src = _ctx.strike_price, _ctx.strike_source
             _log_price_tick({
-                "ts": time.time(),
-                "slot_ts": int(math.floor(_stime() / 300) * 300),
+                "ts": _now_ts,
+                "slot_ts": SlotContext.slot_for(_stime()),
                 "yes_bid": yb, "yes_ask": ya,
                 "no_bid": nb, "no_ask": na,
                 "yes_mid": (yb + ya) / 2 if yb and ya else None,
                 "no_mid": (nb + na) / 2 if nb and na else None,
                 "yes_spread": ya - yb if yb and ya else None,
                 "no_spread": na - nb if nb and na else None,
+                "btc_now": _btc_now,
+                "strike": _strike,
+                "strike_source": _strike_src,
+                "realized_vol_30s": _vol_30s,
+                "realized_vol_60s": _vol_60s,
             })
 
             now_m = time.monotonic()
@@ -303,7 +538,11 @@ def ticker_until_next_cycle(
                 intra_cycle_analyze_fn()
                 last_analyzed = now_m
 
-            stop_evt.wait(5.0)
+            # Wait up to 5 s before the next fetch, but check the stop
+            # signal every 1 s so shutdown exits promptly.
+            for _ in range(5):
+                if stop_evt.wait(1.0):
+                    return
 
     fetcher = threading.Thread(target=_fetch_loop, daemon=True)
     fetcher.start()
@@ -435,7 +674,7 @@ def _execute_signals(
 
             # -- Structured JSONL trade log --
             _pre_inv = inventories.get(token_id) if inventories else None
-            _slot_ts = int(math.floor(time.time() / 300) * 300) + 300
+            _slot_ts = SlotContext.slot_for(time.time()) + SLOT_INTERVAL_S
             _log_trade_jsonl({
                 # timing
                 "ts": time.time(),
@@ -557,6 +796,8 @@ def _snapshot_strategy_state(strategy, state: "BotState") -> None:
     state.strategy_edge_no = getattr(strategy, "last_edge_no", None)
     state.strategy_model_version = getattr(strategy, "last_model_version", "")
     state.strategy_feature_status = getattr(strategy, "last_feature_status", "")
+    state.strategy_score_breakdown = getattr(strategy, "last_score_breakdown", None)
+    state.strategy_required_edge = getattr(strategy, "last_required_edge", None)
 
 
 def _make_intra_cycle_fn(
@@ -575,15 +816,16 @@ def _make_intra_cycle_fn(
     execution_tracker=None,
     inventories=None,
     chainlink_feed: Optional["ChainlinkFeed"] = None,
+    slot_mgr: Optional["SlotStateManager"] = None,
 ):
     """Return a zero-arg callable for intra-cycle analyze+execute passes."""
-    captured_slot = int(math.floor(time.time() / 300) * 300)
-    slot_expiry_ts = captured_slot + 300
+    captured_slot = slot_mgr.current_slot_ts() if slot_mgr else SlotContext.slot_for(time.time())
+    slot_expiry_ts = captured_slot + SLOT_INTERVAL_S
 
     def _fn():
         try:
             now_wall = time.time()
-            if int(math.floor(now_wall / 300) * 300) != captured_slot:
+            if SlotContext.slot_for(now_wall) != captured_slot:
                 logger.debug("Intra-cycle skipped: market slot rolled over")
                 return
 
@@ -611,11 +853,15 @@ def _make_intra_cycle_fn(
                 _sync_strategy_from_inventories(strategy, inventories, (yes_tid, no_tid))
 
             # Re-read Chainlink reference price (may change on slot rollover)
-            effective_strike = strike_price
-            if chainlink_feed is not None:
-                cl_ref = chainlink_feed.get_reference_price()
-                if cl_ref is not None:
-                    effective_strike = cl_ref
+            if slot_mgr is not None:
+                ctx = slot_mgr.update_from_chainlink(chainlink_feed, fallback_question=question)
+                effective_strike = ctx.strike_price if ctx.strike_price is not None else strike_price
+            else:
+                effective_strike = strike_price
+                if chainlink_feed is not None:
+                    cl_ref = chainlink_feed.get_reference_price()
+                    if cl_ref is not None:
+                        effective_strike = cl_ref
 
             yes_book, no_book, positions, balance = _fetch_market_data_parallel(
                 client, yes_tid, no_tid,
@@ -651,7 +897,7 @@ def _make_intra_cycle_fn(
                     book_summary=_book_summary(yes_book, no_book),
                 )
                 _snapshot_strategy_state(strategy, state)
-                _snapshot_chainlink_state(state, chainlink_feed)
+                _snapshot_chainlink_state(state, chainlink_feed, slot_mgr=slot_mgr)
                 state_store.save(state)
         except Exception as e:
             logger.error(f"Intra-cycle analyze error: {e}", exc_info=True)
@@ -795,6 +1041,39 @@ def check_daily_reset(state: BotState, risk_manager: RiskManager, logger) -> Non
         risk_manager.reset_daily()
 
 
+def _close_open_positions(
+    client: PolymarketClient,
+    state: BotState,
+    market_id: str,
+    token_outcome_map: dict,
+    logger,
+) -> None:
+    """SELL any open positions at shutdown. Uses a low limit price (0.01) to sweep all bids."""
+    if not market_id or not token_outcome_map:
+        logger.warning("Shutdown: no market context — cannot close open positions")
+        return
+
+    for token_id, inv in state.inventories.items():
+        size = inv.get("position", 0) if isinstance(inv, dict) else getattr(inv, "position", 0)
+        if size <= 0:
+            continue
+        outcome = token_outcome_map.get(token_id, "")
+        if not outcome:
+            continue
+        logger.info(f"Shutdown: closing {outcome} position  {size:.4f}sh @ market-sell")
+        try:
+            client.place_order(
+                market_id=market_id,
+                token_id=token_id,
+                outcome=outcome,
+                side="SELL",
+                price=0.01,
+                size=round(size, 4),
+            )
+        except Exception as exc:
+            logger.error(f"Shutdown: failed to close {outcome} position: {exc}")
+
+
 def graceful_shutdown(
     state: BotState,
     state_store: StateStore,
@@ -803,13 +1082,18 @@ def graceful_shutdown(
     logger,
     btc_feed: Optional[BtcPriceFeed] = None,
     chainlink_feed: Optional["ChainlinkFeed"] = None,
+    current_market_id: str = "",
+    token_outcome_map: Optional[dict] = None,
+    perf_store: Optional[PerformanceStore] = None,
+    strategy_name: str = "",
 ) -> None:
-    """Cancel all resting orders, save state, log summary, exit."""
+    """Cancel all resting orders, close open positions, save state, log summary, exit."""
     logger.info("Graceful shutdown initiated")
     for token_id, order_id in list(state.active_order_ids.items()):
         if order_id:
             logger.info(f"Cancelling resting order {order_id} for token {token_id[:12]}...")
             cancel_if_exists(client, order_id, dry_run=paper_trading)
+    _close_open_positions(client, state, current_market_id, token_outcome_map or {}, logger)
     if btc_feed is not None:
         btc_feed.stop()
     if chainlink_feed is not None:
@@ -823,6 +1107,17 @@ def graceful_shutdown(
         f"| daily_pnl={state.daily_realized_pnl:+.4f} "
         f"| session trades={trades} wins={_session_wins} ({win_rate:.0%} win rate)"
     )
+    if perf_store is not None:
+        try:
+            perf_store.record_session(
+                state,
+                strategy_name=strategy_name or state.strategy_name,
+                start_ts=_bot_start_ts,
+                end_ts=time.time(),
+                paper_trading=paper_trading,
+            )
+        except Exception as exc:
+            logger.warning(f"Failed to record session to perf.db: {exc}")
     sys.exit(0)
 
 
@@ -925,12 +1220,13 @@ def _display_and_confirm_config(
 
 def main() -> None:
     global _shutdown_requested, _client, _state, _state_store, _paper_trading
-    global _session_wins, _session_losses
+    global _session_wins, _session_losses, _bot_start_ts
+    _bot_start_ts = time.time()
 
     parser = argparse.ArgumentParser(description="Polymarket trading bot")
     parser.add_argument(
         "--strategy",
-        choices=["btc_updown", "btc_updown_xgb", "btc_vol_reversion", "coin_toss"],
+        choices=["btc_updown", "btc_updown_xgb", "btc_vol_reversion", "coin_toss", "prob_edge"],
         default="btc_updown",
         help="Strategy to run (default: btc_updown)",
     )
@@ -1011,6 +1307,10 @@ def main() -> None:
         f"Starting bot | strategy={args.strategy} | paper_trading={paper_trading} | interval={interval}s"
     )
 
+    # Performance store
+    perf_db_path: str = bot_cfg.get("perf_db_path", "perf.db")
+    perf_store = PerformanceStore(perf_db_path)
+
     # -----------------------------------------------------------------------
     # Core components
     # -----------------------------------------------------------------------
@@ -1044,8 +1344,24 @@ def main() -> None:
     if args.strategy == "coin_toss":
         strategy = CoinTossStrategy(config=strategy_cfg)
     elif args.strategy == "btc_updown_xgb":
-        btc_feed = BtcPriceFeed(symbol=str(strategy_cfg.get("btc_symbol", "btcusdt")), logger=logger).start()
+        btc_feed = BtcPriceFeed(
+            symbol=str(strategy_cfg.get("btc_symbol", "BTC-USD")),
+            exchange=str(strategy_cfg.get("btc_exchange", "coinbase")),
+            logger=logger,
+        ).start()
         strategy = BTCUpDownXGBStrategy(config=strategy_cfg, btc_feed=btc_feed, logger=logger)
+    elif args.strategy == "prob_edge":
+        btc_feed = BtcPriceFeed(
+            symbol=str(strategy_cfg.get("btc_symbol", "BTC-USD")),
+            exchange=str(strategy_cfg.get("btc_exchange", "coinbase")),
+            logger=logger,
+        ).start()
+        strategy = ProbEdgeStrategy(
+            config=strategy_cfg,
+            btc_feed=btc_feed,
+            model_service=BTCSigmoidModel(logger=logger),
+            logger=logger,
+        )
     elif args.strategy == "btc_vol_reversion":
         strategy = BTCVolatilityReversionStrategy(config=strategy_cfg)
     else:
@@ -1064,6 +1380,8 @@ def main() -> None:
         ).start()
         logger.info("Chainlink reference price feed started")
 
+    slot_mgr = SlotStateManager(clock_fn=_stime)
+
     # -----------------------------------------------------------------------
     # State + inventories
     # -----------------------------------------------------------------------
@@ -1071,6 +1389,10 @@ def main() -> None:
     _state_store = state_store
     state = state_store.load()
     _state = state
+
+    snapshot_store = SnapshotStore(
+        path=state_file.replace(".json", "_snapshot.json")
+    )
 
     inventories: Dict[str, InventoryState] = {}
     for token_id, inv_data in state.inventories.items():
@@ -1083,6 +1405,9 @@ def main() -> None:
         f"State loaded | cycle_count={state.cycle_count} "
         f"| daily_pnl={state.daily_realized_pnl:.4f}"
     )
+    # Sync risk manager with persisted daily PnL so validate_signal() uses
+    # the real accumulated loss, not the stale 0.0 from __init__.
+    risk_manager.daily_pnl = state.daily_realized_pnl
 
     # Track current market so we can detect rollover
     current_market_id: str = ""
@@ -1105,7 +1430,13 @@ def main() -> None:
     # -----------------------------------------------------------------------
     while True:
         if _shutdown_requested:
-            graceful_shutdown(state, state_store, client, paper_trading, logger, btc_feed=btc_feed, chainlink_feed=chainlink_feed)
+            graceful_shutdown(
+                state, state_store, client, paper_trading, logger,
+                btc_feed=btc_feed, chainlink_feed=chainlink_feed,
+                current_market_id=current_market_id,
+                token_outcome_map={yes_token_id: "YES", no_token_id: "NO"} if yes_token_id else None,
+                perf_store=perf_store, strategy_name=args.strategy,
+            )
 
         cycle_start = time.monotonic()
         logger.info(f"=== Main loop iteration (cycle {state.cycle_count + 1}) ===")
@@ -1124,6 +1455,20 @@ def main() -> None:
 
             # Detect rollover: clear stale order IDs for old tokens
             if new_market_id != current_market_id and current_market_id:
+                # Settle any open positions in the expiring slot BEFORE resetting PnL
+                ended_slot_ts = SlotContext.slot_for(_stime()) - SLOT_INTERVAL_S
+                _settle_expiring_positions(
+                    yes_token_id=yes_token_id,
+                    no_token_id=no_token_id,
+                    slot_ts=ended_slot_ts,
+                    inventories=inventories,
+                    state=state,
+                    risk_manager=risk_manager,
+                    paper_trading=paper_trading,
+                    logger=logger,
+                )
+                _sync_inventories_to_state(state, inventories)
+
                 logger.info(
                     f"Market rolled over: {current_market_id} → {new_market_id} | "
                     f"Slot PnL for {current_market_id[:8]}: {state.slot_realized_pnl:+.4f}"
@@ -1146,21 +1491,14 @@ def main() -> None:
             current_question = market_info.get("question", "")
 
             # Strike price: prefer Chainlink slot-open, fall back to regex
-            if chainlink_feed is not None:
-                cl_ref = chainlink_feed.get_reference_price()
-                if cl_ref is not None:
-                    current_strike_price = cl_ref
-                    logger.info(f"Strike from Chainlink: ${cl_ref:,.2f}")
-                else:
-                    current_strike_price = parse_strike_price(current_question)
-                    logger.warning(
-                        f"Chainlink feed has no slot-open price yet, "
-                        f"falling back to regex: ${current_strike_price:,.2f}"
-                        if current_strike_price else
-                        "Chainlink feed has no slot-open price and regex parse failed"
-                    )
-            else:
-                current_strike_price = parse_strike_price(current_question)
+            _slot_ctx = slot_mgr.update_from_chainlink(
+                chainlink_feed, fallback_question=current_question
+            )
+            current_strike_price = _slot_ctx.strike_price
+            logger.info(
+                f"Strike from {_slot_ctx.strike_source}: "
+                + (f"${current_strike_price:,.2f}" if current_strike_price else "None")
+            )
 
             logger.debug(
                 f"Cycle {state.cycle_count}: market={current_market_id[:8]} "
@@ -1176,7 +1514,13 @@ def main() -> None:
                     f"Slot loss cap reached ({state.slot_realized_pnl:.2f} <= "
                     f"-{session_loss_cap:.2f}) — shutting down"
                 )
-                graceful_shutdown(state, state_store, client, paper_trading, logger, btc_feed=btc_feed, chainlink_feed=chainlink_feed)
+                graceful_shutdown(
+                state, state_store, client, paper_trading, logger,
+                btc_feed=btc_feed, chainlink_feed=chainlink_feed,
+                current_market_id=current_market_id,
+                token_outcome_map={yes_token_id: "YES", no_token_id: "NO"} if yes_token_id else None,
+                perf_store=perf_store, strategy_name=args.strategy,
+            )
 
             if risk_manager.check_circuit_breaker(balance):
                 logger.warning(
@@ -1187,7 +1531,7 @@ def main() -> None:
                 ticker_until_next_cycle(
                     client, yes_token_id, no_token_id, interval,
                     strategy=strategy, intra_cycle_analyze_fn=None,
-                    logger=logger,
+                    logger=logger, btc_feed=btc_feed, slot_mgr=slot_mgr,
                 )
                 continue
 
@@ -1264,7 +1608,7 @@ def main() -> None:
                         inventories=inventories,
                         book_summary=_book_summary(yes_book, no_book),
                     )
-                    _snapshot_chainlink_state(state, chainlink_feed)
+                    _snapshot_chainlink_state(state, chainlink_feed, slot_mgr=slot_mgr)
                     state_store.save(state)
                     positions = client.get_positions()  # refresh after cleanup
 
@@ -1279,7 +1623,7 @@ def main() -> None:
                 "price_history": {},
                 "question": current_question,
                 "strike_price": current_strike_price,
-                "slot_expiry_ts": (int(math.floor(time.time() / 300) * 300) + 300),
+                "slot_expiry_ts": slot_mgr.get().slot_end_ts if slot_mgr.get() else SlotContext.slot_for(time.time()) + SLOT_INTERVAL_S,
             }
 
             # ------------------------------------------------------------------
@@ -1293,11 +1637,12 @@ def main() -> None:
                 paper_trading, logger,
                 execution_tracker=execution_tracker, inventories=inventories,
                 chainlink_feed=chainlink_feed,
+                slot_mgr=slot_mgr,
             )
             signals = strategy.analyze(market_data)
 
             # Guard: suppress BUY entries if insufficient time remains in market window
-            _slot_expiry = (int(math.floor(time.time() / 300) * 300) + 300)
+            _slot_expiry = slot_mgr.get().slot_end_ts if slot_mgr.get() else SlotContext.slot_for(time.time()) + SLOT_INTERVAL_S
             _time_remaining = _slot_expiry - time.time()
             _min_entry = getattr(strategy, 'max_hold_seconds', 240)
             if _time_remaining < _min_entry:
@@ -1322,8 +1667,24 @@ def main() -> None:
             # ------------------------------------------------------------------
             state.cycle_count += 1
             _snapshot_strategy_state(strategy, state)
-            _snapshot_chainlink_state(state, chainlink_feed)
+            _snapshot_chainlink_state(state, chainlink_feed, slot_mgr=slot_mgr)
             state_store.save(state)
+
+            # Write cycle snapshot (single source of truth for dashboard)
+            _btc_now = None
+            if btc_feed is not None:
+                _bk = btc_feed.get_latest_book()
+                if _bk is not None:
+                    _btc_now = _bk.mid
+            _build_and_save_snapshot(
+                snapshot_store, state,
+                current_market_id, current_question,
+                yes_token_id, no_token_id,
+                current_strike_price, _btc_now,
+                yes_book, no_book,
+                inventories, execution_tracker,
+                risk_manager, paper_trading,
+            )
 
             elapsed = time.monotonic() - cycle_start
             logger.info(
@@ -1333,12 +1694,18 @@ def main() -> None:
             )
 
         except KeyboardInterrupt:
-            graceful_shutdown(state, state_store, client, paper_trading, logger, btc_feed=btc_feed, chainlink_feed=chainlink_feed)
+            graceful_shutdown(
+                state, state_store, client, paper_trading, logger,
+                btc_feed=btc_feed, chainlink_feed=chainlink_feed,
+                current_market_id=current_market_id,
+                token_outcome_map={yes_token_id: "YES", no_token_id: "NO"} if yes_token_id else None,
+                perf_store=perf_store, strategy_name=args.strategy,
+            )
 
         except Exception as e:
             logger.error(f"Cycle error: {e}", exc_info=True)
             try:
-                _snapshot_chainlink_state(state, chainlink_feed)
+                _snapshot_chainlink_state(state, chainlink_feed, slot_mgr=slot_mgr)
                 state_store.save(state)
             except Exception:
                 pass
@@ -1350,7 +1717,7 @@ def main() -> None:
                 client, yes_token_id, no_token_id, interval,
                 strategy=strategy,
                 intra_cycle_analyze_fn=intra_cycle_analyze_fn,
-                logger=logger,
+                logger=logger, btc_feed=btc_feed, slot_mgr=slot_mgr,
             )
         else:
             sleep_until_next_cycle(interval)

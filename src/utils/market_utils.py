@@ -140,6 +140,12 @@ def get_mid_price(order_book: OrderBook) -> Optional[float]:
     return None
 
 
+def spread_pct(bid: float, ask: float) -> float:
+    """Spread as a fraction of mid price. Returns inf when mid is zero."""
+    mid = (bid + ask) / 2.0
+    return (ask - bid) / mid if mid > 0 else float("inf")
+
+
 def cancel_if_exists(client: PolymarketClient, order_id: Optional[str], dry_run: bool) -> None:
     """
     Cancel an order if it exists (safe wrapper).

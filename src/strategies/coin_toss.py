@@ -50,16 +50,7 @@ class CoinTossStrategy(Strategy):
         by_token: Dict[str, Position]     = {p.token_id: p for p in positions}
         now_ts = time.monotonic()
 
-        # 1. Auto-recover state after restart
-        if self.active_token_id is None:
-            for tid in (self._yes_token_id, self._no_token_id):
-                pos = by_token.get(tid)
-                if pos and pos.size > 0:
-                    self.active_token_id = tid
-                    self.entry_price     = pos.average_price
-                    self.entry_timestamp = now_ts
-                    self.entry_size      = pos.size
-                    break
+        self._auto_recover_position(by_token, now_ts)
 
         # 2. Exit check — always before entry
         exit_sig = self.check_exit(order_books, by_token, now_ts)
