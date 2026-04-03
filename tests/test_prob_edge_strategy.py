@@ -59,6 +59,34 @@ class _MockModel:
         return self._result
 
 
+class _NullProbModel:
+    """Stub model that simulates unavailable probability output."""
+
+    model_version = "null_prob_v1"
+
+    def predict(self, snapshot: Mapping[str, Any]) -> PredictionResult:
+        return PredictionResult(
+            prob_yes=None,
+            model_version=self.model_version,
+            feature_status="insufficient_btc_history",
+            edge_yes=None,
+            edge_no=None,
+        )
+
+
+class _MockBtcFeed:
+    """Healthy BTC feed stub with deterministic recent prices."""
+
+    def __init__(self, prices):
+        self._prices = prices
+
+    def is_healthy(self) -> bool:
+        return True
+
+    def get_recent_prices(self, window: int = 300):
+        return self._prices
+
+
 CFG_BASE = {
     "min_edge": 0.04,
     "max_spread_pct": 0.20,
@@ -140,6 +168,23 @@ class TestEntry:
         data = _market_data(yes_bid=0.49, yes_ask=0.50, no_bid=0.49, no_ask=0.50)
         sigs = strat.analyze(data)
         assert sigs == []
+
+    def test_no_trade_when_fee_erases_positive_edge(self):
+        """Raw edge can be positive while net edge falls below threshold after fees."""
+        strat = _make_strategy(
+            prob_yes=0.62,
+            yes_ask=0.58,
+            no_ask=0.42,
+            fee_enabled=True,
+            taker_fee_rate=0.072,
+            taker_fee_exponent=1.0,
+            min_edge=0.03,
+        )
+        data = _market_data(yes_bid=0.57, yes_ask=0.58, no_bid=0.41, no_ask=0.42)
+        sigs = strat.analyze(data)
+        assert sigs == []
+        assert strat.last_edge_yes == pytest.approx(0.04, abs=0.001)
+        assert strat.last_net_edge_yes < 0.03
 
     def test_picks_higher_edge_when_both_sides_qualify(self):
         """Both sides clear min_edge but YES has higher edge — should pick YES."""
@@ -303,6 +348,7 @@ class TestObservableState:
         data = _market_data(yes_bid=0.54, yes_ask=0.55, no_bid=0.47, no_ask=0.48)
         strat.analyze(data)
         assert strat.last_prob_yes == pytest.approx(0.65)
+        assert strat.last_prob_no == pytest.approx(0.35)
 
     def test_last_edge_yes_and_no_updated(self):
         strat = _make_strategy(prob_yes=0.65, yes_ask=0.55, no_ask=0.48)
@@ -311,11 +357,70 @@ class TestObservableState:
         assert strat.last_edge_yes == pytest.approx(0.65 - 0.55, abs=0.001)
         assert strat.last_edge_no  == pytest.approx(0.35 - 0.48, abs=0.001)
 
+    def test_last_net_edge_matches_raw_edge_when_fees_disabled(self):
+        strat = _make_strategy(prob_yes=0.65, yes_ask=0.55, no_ask=0.48)
+        data = _market_data(yes_bid=0.54, yes_ask=0.55, no_bid=0.47, no_ask=0.48)
+        strat.analyze(data)
+        assert strat.last_net_edge_yes == pytest.approx(strat.last_edge_yes, abs=0.001)
+
+    def test_probability_context_observables_updated(self):
+        strat = _make_strategy(prob_yes=0.65, yes_ask=0.55, no_ask=0.48)
+        now = time.time()
+        strat.btc_feed = _MockBtcFeed([
+            (now - 60, 49_900.0),
+            (now, 50_100.0),
+        ])
+        data = _market_data(yes_bid=0.54, yes_ask=0.55, no_bid=0.47, no_ask=0.48)
+        strat.analyze(data)
+        assert strat.last_expected_fill_yes == pytest.approx(0.55, abs=0.001)
+        assert strat.last_expected_fill_no is None
+        assert strat.last_tte_seconds is not None
+        assert strat.last_tte_seconds > 0
+        assert strat.last_distance_to_break_pct == pytest.approx((50_100.0 - 50_000.0) / 50_000.0, abs=1e-6)
+        assert strat.last_distance_to_strike_bps == pytest.approx(20.0, abs=0.1)
+
     def test_last_feature_status_propagated(self):
         strat = _make_strategy(prob_yes=0.65, yes_ask=0.55, no_ask=0.48)
         data = _market_data(yes_bid=0.54, yes_ask=0.55, no_bid=0.47, no_ask=0.48)
         strat.analyze(data)
         assert strat.last_feature_status == "ready"
+
+    def test_missing_prob_clears_probability_observables(self):
+        strat = _make_strategy(prob_yes=0.65, yes_ask=0.55, no_ask=0.48)
+        data = _market_data(yes_bid=0.54, yes_ask=0.55, no_bid=0.47, no_ask=0.48)
+        strat.analyze(data)
+        strat.model_service = _NullProbModel()
+        sigs = strat.analyze(data)
+        assert sigs == []
+        assert strat.last_prob_yes is None
+        assert strat.last_prob_no is None
+        assert strat.last_edge_yes is None
+        assert strat.last_edge_no is None
+        assert strat.last_net_edge_yes is None
+        assert strat.last_net_edge_no is None
+
+
+# ── Dynamic edge threshold ────────────────────────────────────────────────────
+
+class TestRequiredEdge:
+    def test_required_edge_higher_near_expiry(self):
+        """Near expiry the required edge must be HIGHER, not lower.
+
+        Books thin and gamma is high near expiry — the strategy should demand more
+        confirmation, not less.  This is a regression guard for the direction of the
+        dynamic threshold formula.
+        """
+        strat = _make_strategy(prob_yes=0.60, yes_ask=0.55, no_ask=0.44)
+        max_tte = strat.max_seconds_to_expiry
+        edge_at_zero = strat._required_edge(0.0)
+        edge_at_max = strat._required_edge(max_tte)
+        assert edge_at_zero > edge_at_max, (
+            f"required_edge at tte=0 ({edge_at_zero:.4f}) should exceed "
+            f"required_edge at tte={max_tte}s ({edge_at_max:.4f})"
+        )
+        # Sanity: both should be at least min_edge
+        assert edge_at_zero >= strat.min_edge
+        assert edge_at_max >= strat.min_edge
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

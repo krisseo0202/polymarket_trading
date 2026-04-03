@@ -82,9 +82,19 @@ strategies:
     # Kelly sizing
     kelly_fraction: 0.15         # fractional Kelly multiplier (range 0.10–0.25)
     position_size_usdc: 30.0     # hard cap on notional per trade
+    fee_enabled: true            # enable fee-aware net-edge filter for Polymarket fee-enabled crypto markets
+    taker_fee_rate: 0.072        # docs formula input for crypto category as of 2026-04-02
+    taker_fee_exponent: 1.0      # docs formula exponent for crypto category as of 2026-04-02
 
     # Confidence gate
     min_confidence: 0.51         # minimum model prob to allow trade
+
+    # Sequential re-entry within a slot
+    allow_reentry: true
+    max_trades_per_slot: 3       # hard cap on entries per 5-min market
+    re_entry_edge_mult: 1.5      # 2nd+ entry requires 1.5× the normal edge threshold
+    re_entry_size_mult: 0.5      # 2nd+ entry uses 50% Kelly size (correlation haircut)
+    slot_loss_limit_usdc: 15.0   # halt slot trading if cumulative loss exceeds this
 
   btc_vol_reversion:
     enabled: true
@@ -116,6 +126,9 @@ risk:
 chainlink_feed:
   enabled: true
   symbol: "btc/usd"
+
+vpn:
+  require_non_us: true   # abort startup if external IP is US-based; set false to skip check
 
 logging:
   level: "INFO"

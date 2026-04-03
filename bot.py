@@ -213,6 +213,23 @@ def _build_and_save_snapshot(
         daily_realized_pnl=state.daily_realized_pnl,
         slot_realized_pnl=state.slot_realized_pnl,
         unrealized_pnl=unrealized,
+        strategy_name=state.strategy_name,
+        strategy_status=state.strategy_status,
+        strategy_prob_yes=state.strategy_prob_yes,
+        strategy_prob_no=state.strategy_prob_no,
+        strategy_edge_yes=state.strategy_edge_yes,
+        strategy_edge_no=state.strategy_edge_no,
+        strategy_net_edge_yes=state.strategy_net_edge_yes,
+        strategy_net_edge_no=state.strategy_net_edge_no,
+        strategy_expected_fill_yes=state.strategy_expected_fill_yes,
+        strategy_expected_fill_no=state.strategy_expected_fill_no,
+        strategy_required_edge=state.strategy_required_edge,
+        strategy_tte_seconds=state.strategy_tte_seconds,
+        strategy_distance_to_break_pct=state.strategy_distance_to_break_pct,
+        strategy_distance_to_strike_bps=state.strategy_distance_to_strike_bps,
+        strategy_model_version=state.strategy_model_version,
+        strategy_feature_status=state.strategy_feature_status,
+        strategy_score_breakdown=state.strategy_score_breakdown,
         cycle_count=state.cycle_count,
         paper_trading=paper_trading,
     )
@@ -792,8 +809,16 @@ def _snapshot_strategy_state(strategy, state: "BotState") -> None:
         state.strategy_zscore = None
 
     state.strategy_prob_yes = getattr(strategy, "last_prob_yes", None)
+    state.strategy_prob_no = getattr(strategy, "last_prob_no", None)
     state.strategy_edge_yes = getattr(strategy, "last_edge_yes", None)
     state.strategy_edge_no = getattr(strategy, "last_edge_no", None)
+    state.strategy_net_edge_yes = getattr(strategy, "last_net_edge_yes", None)
+    state.strategy_net_edge_no = getattr(strategy, "last_net_edge_no", None)
+    state.strategy_expected_fill_yes = getattr(strategy, "last_expected_fill_yes", None)
+    state.strategy_expected_fill_no = getattr(strategy, "last_expected_fill_no", None)
+    state.strategy_tte_seconds = getattr(strategy, "last_tte_seconds", None)
+    state.strategy_distance_to_break_pct = getattr(strategy, "last_distance_to_break_pct", None)
+    state.strategy_distance_to_strike_bps = getattr(strategy, "last_distance_to_strike_bps", None)
     state.strategy_model_version = getattr(strategy, "last_model_version", "")
     state.strategy_feature_status = getattr(strategy, "last_feature_status", "")
     state.strategy_score_breakdown = getattr(strategy, "last_score_breakdown", None)
@@ -1130,6 +1155,52 @@ def _handle_signal(signum, frame):
 # Pre-launch config display
 # ---------------------------------------------------------------------------
 
+_STRATEGIES = ["btc_updown", "btc_updown_xgb", "btc_vol_reversion", "coin_toss", "prob_edge"]
+
+
+def _prompt_strategy_and_mode(default_strategy: str, default_paper: bool):
+    """Interactively ask user to pick strategy and trading mode. Returns (strategy, paper_trading)."""
+    print("\nAvailable strategies:")
+    for i, s in enumerate(_STRATEGIES, 1):
+        marker = " (default)" if s == default_strategy else ""
+        print(f"  {i}. {s}{marker}")
+
+    while True:
+        try:
+            raw = input(f"\nSelect strategy [1-{len(_STRATEGIES)}] or name (Enter = {default_strategy}): ").strip()
+        except EOFError:
+            return default_strategy, default_paper
+        if not raw:
+            strategy = default_strategy
+            break
+        if raw.isdigit() and 1 <= int(raw) <= len(_STRATEGIES):
+            strategy = _STRATEGIES[int(raw) - 1]
+            break
+        if raw in _STRATEGIES:
+            strategy = raw
+            break
+        print(f"  Invalid choice. Enter a number 1–{len(_STRATEGIES)} or a strategy name.")
+
+    default_mode = "paper" if default_paper else "live"
+    while True:
+        try:
+            raw = input(f"Trading mode — paper or live? (Enter = {default_mode}): ").strip().lower()
+        except EOFError:
+            return strategy, default_paper
+        if not raw:
+            paper_trading = default_paper
+            break
+        if raw in ("paper", "p"):
+            paper_trading = True
+            break
+        if raw in ("live", "l"):
+            paper_trading = False
+            break
+        print("  Enter 'paper' or 'live'.")
+
+    return strategy, paper_trading
+
+
 def _display_and_confirm_config(
     strategy_name: str,
     strategy_cfg: dict,
@@ -1226,20 +1297,20 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Polymarket trading bot")
     parser.add_argument(
         "--strategy",
-        choices=["btc_updown", "btc_updown_xgb", "btc_vol_reversion", "coin_toss", "prob_edge"],
-        default="btc_updown",
-        help="Strategy to run (default: btc_updown)",
+        choices=_STRATEGIES,
+        default=None,
+        help="Strategy to run (prompted interactively if omitted)",
     )
     parser.add_argument(
         "--paper",
         action="store_true",
-        default=None,
+        default=False,
         help="Force paper trading mode",
     )
     parser.add_argument(
         "--live",
         action="store_true",
-        default=None,
+        default=False,
         help="Force live trading mode",
     )
     parser.add_argument(
@@ -1265,21 +1336,34 @@ def main() -> None:
     state_file: str = bot_cfg.get("state_file", "bot_state.json")
     min_volume: int = int(bot_cfg.get("min_volume", 1_000_000))
     interval: int = int(raw_yaml.get("trading", {}).get("interval", 300))
+
+    # Determine paper/live mode from config, then CLI flags
     paper_trading: bool = cfg.paper_trading
     if args.live:
         paper_trading = False
     elif args.paper:
         paper_trading = True
+
+    # If no --strategy flag and running interactively, prompt the user
+    strategy_name: str
+    if args.strategy is None and sys.stdin.isatty() and not args.no_confirm:
+        strategy_name, paper_trading = _prompt_strategy_and_mode(
+            default_strategy="btc_updown_xgb",
+            default_paper=paper_trading,
+        )
+    else:
+        strategy_name = args.strategy or "btc_updown_xgb"
+
     _paper_trading = paper_trading
 
-    strategy_cfg: dict = cfg.strategies.get(args.strategy, {})
+    strategy_cfg: dict = cfg.strategies.get(strategy_name, {})
 
     # -----------------------------------------------------------------------
     # Pre-launch config display + optional override
     # -----------------------------------------------------------------------
     if not args.no_confirm and sys.stdin.isatty():
         strategy_cfg = _display_and_confirm_config(
-            strategy_name=args.strategy,
+            strategy_name=strategy_name,
             strategy_cfg=strategy_cfg,
             risk_cfg=raw_yaml.get("risk", {}),
             paper_trading=paper_trading,
@@ -1304,8 +1388,13 @@ def main() -> None:
         os.makedirs(os.path.dirname(_price_tick_path), exist_ok=True)
 
     logger.info(
-        f"Starting bot | strategy={args.strategy} | paper_trading={paper_trading} | interval={interval}s"
+        f"Starting bot | strategy={strategy_name} | paper_trading={paper_trading} | interval={interval}s"
     )
+
+    # VPN pre-flight check
+    from src.utils.vpn import check_vpn
+    if raw_yaml.get("vpn", {}).get("require_non_us", True):
+        check_vpn(abort_if_us=True)
 
     # Performance store
     perf_db_path: str = bot_cfg.get("perf_db_path", "perf.db")
@@ -1341,16 +1430,16 @@ def main() -> None:
     )
 
     btc_feed: Optional[BtcPriceFeed] = None
-    if args.strategy == "coin_toss":
+    if strategy_name == "coin_toss":
         strategy = CoinTossStrategy(config=strategy_cfg)
-    elif args.strategy == "btc_updown_xgb":
+    elif strategy_name == "btc_updown_xgb":
         btc_feed = BtcPriceFeed(
             symbol=str(strategy_cfg.get("btc_symbol", "BTC-USD")),
             exchange=str(strategy_cfg.get("btc_exchange", "coinbase")),
             logger=logger,
         ).start()
         strategy = BTCUpDownXGBStrategy(config=strategy_cfg, btc_feed=btc_feed, logger=logger)
-    elif args.strategy == "prob_edge":
+    elif strategy_name == "prob_edge":
         btc_feed = BtcPriceFeed(
             symbol=str(strategy_cfg.get("btc_symbol", "BTC-USD")),
             exchange=str(strategy_cfg.get("btc_exchange", "coinbase")),
@@ -1362,7 +1451,7 @@ def main() -> None:
             model_service=BTCSigmoidModel(logger=logger),
             logger=logger,
         )
-    elif args.strategy == "btc_vol_reversion":
+    elif strategy_name == "btc_vol_reversion":
         strategy = BTCVolatilityReversionStrategy(config=strategy_cfg)
     else:
         strategy = BTCUpDownStrategy(config=strategy_cfg)
@@ -1435,7 +1524,7 @@ def main() -> None:
                 btc_feed=btc_feed, chainlink_feed=chainlink_feed,
                 current_market_id=current_market_id,
                 token_outcome_map={yes_token_id: "YES", no_token_id: "NO"} if yes_token_id else None,
-                perf_store=perf_store, strategy_name=args.strategy,
+                perf_store=perf_store, strategy_name=strategy_name,
             )
 
         cycle_start = time.monotonic()
@@ -1474,6 +1563,9 @@ def main() -> None:
                     f"Slot PnL for {current_market_id[:8]}: {state.slot_realized_pnl:+.4f}"
                 )
                 state.slot_realized_pnl = 0.0
+                # Reset per-slot re-entry counters for strategies that support it
+                if hasattr(strategy, "reset_slot_state"):
+                    strategy.reset_slot_state()
                 # Old token order IDs are now stale — clear them
                 for old_tid in (yes_token_id, no_token_id):
                     state.active_order_ids.pop(old_tid, None)
@@ -1519,7 +1611,7 @@ def main() -> None:
                 btc_feed=btc_feed, chainlink_feed=chainlink_feed,
                 current_market_id=current_market_id,
                 token_outcome_map={yes_token_id: "YES", no_token_id: "NO"} if yes_token_id else None,
-                perf_store=perf_store, strategy_name=args.strategy,
+                perf_store=perf_store, strategy_name=strategy_name,
             )
 
             if risk_manager.check_circuit_breaker(balance):
@@ -1699,7 +1791,7 @@ def main() -> None:
                 btc_feed=btc_feed, chainlink_feed=chainlink_feed,
                 current_market_id=current_market_id,
                 token_outcome_map={yes_token_id: "YES", no_token_id: "NO"} if yes_token_id else None,
-                perf_store=perf_store, strategy_name=args.strategy,
+                perf_store=perf_store, strategy_name=strategy_name,
             )
 
         except Exception as e:

@@ -126,18 +126,22 @@ class BTCUpDownBaselineModel:
         if len(log_returns) < max(2, self.min_samples - 1):
             return None
 
-        mean_dt = sum(dt_seconds) / len(dt_seconds)
-        if mean_dt <= 0:
+        # Use total-elapsed / (n-1) for mean_dt: robust against burst ticks from
+        # WebSocket reconnects or clustering, which inflate sample count and bias
+        # arithmetic mean toward shorter intervals.
+        total_elapsed = window[-1][0] - window[0][0]
+        if total_elapsed <= 0 or len(log_returns) < 1:
             return None
+        mean_dt = total_elapsed / len(log_returns)
 
         mean_lr = sum(log_returns) / len(log_returns)
-        variance = sum((value - mean_lr) ** 2 for value in log_returns) / len(log_returns)
+        variance = sum((value - mean_lr) ** 2 for value in log_returns) / max(1, len(log_returns) - 1)
         annualized_vol = math.sqrt(max(variance, 0.0)) * math.sqrt(_SECONDS_PER_YEAR / mean_dt)
         annualized_vol = min(max(annualized_vol, self.min_annualized_vol), self.max_annualized_vol)
 
-        # For GBM: log-return mean ~= (mu - 0.5 * sigma^2) * dt.
-        annualized_drift = mean_lr * (_SECONDS_PER_YEAR / mean_dt) + 0.5 * annualized_vol * annualized_vol
-        annualized_drift = min(max(annualized_drift, -self.max_abs_drift), self.max_abs_drift)
+        # Drift estimated from 120s of tick data is extremely noisy (std error >> mean).
+        # At 5-min horizons the vol term dominates d2; zeroing drift reduces noise injection.
+        annualized_drift = 0.0
         return annualized_vol, annualized_drift
 
     def _probability_above_strike(

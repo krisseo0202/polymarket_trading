@@ -105,9 +105,9 @@ def _realized_vol(prices: Sequence[Tuple[float, float]], now_ts: float, window_s
         return 0.0
     arr = np.asarray(window, dtype=float)
     returns = np.diff(np.log(arr))
-    if len(returns) == 0:
+    if len(returns) < 2:
         return 0.0
-    return float(np.std(returns))
+    return float(np.std(returns, ddof=1))
 
 
 def _latest_value(prices: Sequence[Tuple[float, float]]) -> Optional[float]:

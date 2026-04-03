@@ -27,8 +27,16 @@ class BotState:
     strategy_zscore: Optional[float] = None     # btc_vol_reversion only
     strategy_momentum_pct: Optional[float] = None  # btc_updown only
     strategy_prob_yes: Optional[float] = None
+    strategy_prob_no: Optional[float] = None
     strategy_edge_yes: Optional[float] = None
     strategy_edge_no: Optional[float] = None
+    strategy_net_edge_yes: Optional[float] = None
+    strategy_net_edge_no: Optional[float] = None
+    strategy_expected_fill_yes: Optional[float] = None
+    strategy_expected_fill_no: Optional[float] = None
+    strategy_tte_seconds: Optional[float] = None
+    strategy_distance_to_break_pct: Optional[float] = None
+    strategy_distance_to_strike_bps: Optional[float] = None
     strategy_model_version: str = ""
     strategy_feature_status: str = ""
     strategy_last_signal: str = ""              # e.g. "BUY YES @ 0.6500 | momentum=2.3%"
@@ -86,8 +94,16 @@ class StateStore:
                 strategy_zscore=data.get("strategy_zscore"),
                 strategy_momentum_pct=data.get("strategy_momentum_pct"),
                 strategy_prob_yes=data.get("strategy_prob_yes"),
+                strategy_prob_no=data.get("strategy_prob_no"),
                 strategy_edge_yes=data.get("strategy_edge_yes"),
                 strategy_edge_no=data.get("strategy_edge_no"),
+                strategy_net_edge_yes=data.get("strategy_net_edge_yes"),
+                strategy_net_edge_no=data.get("strategy_net_edge_no"),
+                strategy_expected_fill_yes=data.get("strategy_expected_fill_yes"),
+                strategy_expected_fill_no=data.get("strategy_expected_fill_no"),
+                strategy_tte_seconds=data.get("strategy_tte_seconds"),
+                strategy_distance_to_break_pct=data.get("strategy_distance_to_break_pct"),
+                strategy_distance_to_strike_bps=data.get("strategy_distance_to_strike_bps"),
                 strategy_model_version=data.get("strategy_model_version", ""),
                 strategy_feature_status=data.get("strategy_feature_status", ""),
                 strategy_last_signal=data.get("strategy_last_signal", ""),

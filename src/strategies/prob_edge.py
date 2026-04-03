@@ -62,11 +62,34 @@ class ProbEdgeStrategy(Strategy):
         # ── Sizing ────────────────────────────────────────────────────────────
         self.kelly_fraction: float = float(config.get("kelly_fraction", 0.15))
         self.position_size_usdc: float = float(config.get("position_size_usdc", 30.0))
+        self.fee_enabled: bool = bool(config.get("fee_enabled", False))
+        self.taker_fee_rate: float = float(config.get("taker_fee_rate", 0.072))
+        self.taker_fee_exponent: float = float(config.get("taker_fee_exponent", 1.0))
+
+        # ── Re-entry config ───────────────────────────────────────────────────
+        self.allow_reentry: bool = bool(config.get("allow_reentry", True))
+        self.max_trades_per_slot: int = int(config.get("max_trades_per_slot", 3))
+        self.re_entry_edge_mult: float = float(config.get("re_entry_edge_mult", 1.5))
+        self.re_entry_size_mult: float = float(config.get("re_entry_size_mult", 0.5))
+        self.slot_loss_limit_usdc: float = float(config.get("slot_loss_limit_usdc", 15.0))
+
+        # Per-slot counters — reset by reset_slot_state() on market rollover
+        self._slot_trade_count: int = 0
+        self._slot_realized_pnl: float = 0.0
+        self._slot_blocked_direction: Optional[str] = None  # "YES" or "NO"
 
         # ── Observable state (written every cycle — read by dashboard) ─────────
         self.last_prob_yes: Optional[float] = None
+        self.last_prob_no: Optional[float] = None
         self.last_edge_yes: Optional[float] = None
         self.last_edge_no: Optional[float] = None
+        self.last_net_edge_yes: Optional[float] = None
+        self.last_net_edge_no: Optional[float] = None
+        self.last_expected_fill_yes: Optional[float] = None
+        self.last_expected_fill_no: Optional[float] = None
+        self.last_tte_seconds: Optional[float] = None
+        self.last_distance_to_break_pct: Optional[float] = None
+        self.last_distance_to_strike_bps: Optional[float] = None
         self.last_feature_status: str = ""
         self.last_model_version: str = getattr(self.model_service, "model_version", "")
         self.last_score_breakdown: Optional[dict] = None
@@ -102,6 +125,13 @@ class ProbEdgeStrategy(Strategy):
         if exit_sig:
             self._pending_exit_entry_price = self.entry_price
             self._pending_exit_entry_size = self.entry_size
+            # Record slot-level accounting before resetting position state
+            self._slot_trade_count += 1
+            if self.entry_price is not None and self.entry_size is not None:
+                trade_pnl = (exit_sig.price - self.entry_price) * self.entry_size
+                self._slot_realized_pnl += trade_pnl
+            if "stop_loss" in exit_sig.reason:
+                self._slot_blocked_direction = exit_sig.outcome
             self._reset_position_state()
             return [exit_sig]
 
@@ -127,8 +157,16 @@ class ProbEdgeStrategy(Strategy):
     ):
         """Build snapshot, call model.predict(), cache observables. Returns None on failure."""
         self.last_prob_yes = None
+        self.last_prob_no = None
         self.last_edge_yes = None
         self.last_edge_no = None
+        self.last_net_edge_yes = None
+        self.last_net_edge_no = None
+        self.last_expected_fill_yes = None
+        self.last_expected_fill_no = None
+        self.last_tte_seconds = None
+        self.last_distance_to_break_pct = None
+        self.last_distance_to_strike_bps = None
         self.last_score_breakdown = None
 
         yes_book = order_books.get(self._yes_token_id)
@@ -150,6 +188,27 @@ class ProbEdgeStrategy(Strategy):
             "now_ts": now_wall,
         }
 
+        strike_price = snapshot.get("strike_price")
+        if btc_prices:
+            try:
+                btc_now = float(btc_prices[-1][1])
+            except (IndexError, TypeError, ValueError):
+                btc_now = None
+        else:
+            btc_now = None
+        try:
+            strike = float(strike_price) if strike_price is not None else None
+        except (TypeError, ValueError):
+            strike = None
+        try:
+            slot_expiry_ts = float(snapshot.get("slot_expiry_ts") or 0.0)
+        except (TypeError, ValueError):
+            slot_expiry_ts = 0.0
+        if btc_now is not None and strike is not None and strike > 0:
+            distance_pct = (btc_now - strike) / strike
+            self.last_distance_to_break_pct = distance_pct
+            self.last_distance_to_strike_bps = distance_pct * 10_000.0
+
         try:
             prediction = self.model_service.predict(snapshot)
         except Exception as exc:
@@ -166,6 +225,7 @@ class ProbEdgeStrategy(Strategy):
         yes_ask = float(yes_book.asks[0].price) if yes_book and yes_book.asks else None
         no_ask = float(no_book.asks[0].price) if no_book and no_book.asks else None
         self.last_prob_yes = prediction.prob_yes
+        self.last_prob_no = prediction.prob_no
         if yes_ask:
             self.last_edge_yes = prediction.prob_yes - yes_ask
         if no_ask and prediction.prob_no is not None:
@@ -191,8 +251,27 @@ class ProbEdgeStrategy(Strategy):
         if prediction is None or prediction.prob_yes is None or prediction.prob_no is None:
             return []
 
+        # ── Re-entry guards ────────────────────────────────────────────────────
+        is_reentry = self._slot_trade_count > 0
+        if is_reentry:
+            if not self.allow_reentry:
+                return []
+            if self._slot_trade_count >= self.max_trades_per_slot:
+                self.logger.debug(
+                    "prob_edge: slot trade cap reached (%d/%d), skipping entry",
+                    self._slot_trade_count, self.max_trades_per_slot,
+                )
+                return []
+            if self._slot_realized_pnl < -self.slot_loss_limit_usdc:
+                self.logger.debug(
+                    "prob_edge: slot loss cap hit (pnl=%.2f), skipping entry",
+                    self._slot_realized_pnl,
+                )
+                return []
+
         slot_expiry_ts = float(market_data.get("slot_expiry_ts") or 0.0)
         tte = max(0.0, slot_expiry_ts - now_wall)
+        self.last_tte_seconds = tte
         if tte < self.min_seconds_to_expiry or tte > self.max_seconds_to_expiry:
             return []
 
@@ -209,28 +288,49 @@ class ProbEdgeStrategy(Strategy):
         if yes_ask <= 0 or no_ask <= 0:
             return []
 
-        edge_yes = prediction.prob_yes - yes_ask
-        edge_no  = prediction.prob_no  - no_ask
-        self.last_edge_yes = edge_yes
-        self.last_edge_no  = edge_no
+        # last_edge_yes/no already set in _predict(); raw edge not re-computed here
 
-        required = self._required_edge(tte)
+        # Elevate edge requirement on re-entries to compensate for within-slot correlation
+        edge_mult = self.re_entry_edge_mult if is_reentry else 1.0
+        required = self._required_edge(tte) * edge_mult
         self.last_required_edge = required
+
+        tentative_yes_usdc = self._kelly_size(prediction.prob_yes, yes_ask, balance)
+        tentative_no_usdc = self._kelly_size(prediction.prob_no, no_ask, balance)
+        if is_reentry:
+            tentative_yes_usdc *= self.re_entry_size_mult
+            tentative_no_usdc *= self.re_entry_size_mult
+
+        self.last_expected_fill_yes = self._estimate_buy_vwap(yes_book, tentative_yes_usdc)
+        self.last_expected_fill_no = self._estimate_buy_vwap(no_book, tentative_no_usdc)
+        net_edge_yes = self._net_edge(prediction.prob_yes, self.last_expected_fill_yes)
+        net_edge_no = self._net_edge(prediction.prob_no, self.last_expected_fill_no)
+        self.last_net_edge_yes = net_edge_yes
+        self.last_net_edge_no = net_edge_no
 
         candidates: List[Tuple[str, OrderBook, float, float]] = []
         if (
-            edge_yes >= required
+            net_edge_yes >= required
             and spread_pct(yes_bid, yes_ask) <= self.max_spread_pct
             and self.min_entry_price <= yes_ask <= self.max_entry_price
         ):
-            candidates.append(("YES", yes_book, yes_ask, edge_yes))
+            candidates.append(("YES", yes_book, yes_ask, net_edge_yes))
 
         if (
-            edge_no >= required
+            net_edge_no >= required
             and spread_pct(no_bid, no_ask) <= self.max_spread_pct
             and self.min_entry_price <= no_ask <= self.max_entry_price
         ):
-            candidates.append(("NO", no_book, no_ask, edge_no))
+            candidates.append(("NO", no_book, no_ask, net_edge_no))
+
+        # Remove direction blocked by a prior stop-loss exit this slot
+        if self._slot_blocked_direction and candidates:
+            candidates = [c for c in candidates if c[0] != self._slot_blocked_direction]
+            if not candidates:
+                self.logger.debug(
+                    "prob_edge: re-entry blocked on %s (stop-loss cooldown)",
+                    self._slot_blocked_direction,
+                )
 
         if not candidates:
             return []
@@ -238,33 +338,45 @@ class ProbEdgeStrategy(Strategy):
             self.logger.debug("prob_edge: edge found but already in position, skipping entry")
             return []
 
-        outcome, book, best_ask, edge = max(candidates, key=lambda c: c[3])
+        outcome, book, best_ask, net_edge = max(candidates, key=lambda c: c[3])
         token_id = self._yes_token_id if outcome == "YES" else self._no_token_id
         prob = prediction.prob_yes if outcome == "YES" else prediction.prob_no
 
-        size_usdc = self._kelly_size(prob, best_ask, balance)
+        # Reduce Kelly size on re-entries to account for within-slot correlation
+        size_mult = self.re_entry_size_mult if is_reentry else 1.0
+        size_usdc = self._kelly_size(prob, best_ask, balance) * size_mult
         if size_usdc <= 0:
             return []
 
+        # Reuse VWAP already computed for this side above (same size_usdc)
+        expected_fill = (
+            self.last_expected_fill_yes if outcome == "YES" else self.last_expected_fill_no
+        )
+        if expected_fill is None:
+            return []
+        size = round(size_usdc / expected_fill, 2)
+        if size <= 0:
+            return []
+
         tick = book.tick_size or 0.001
-        size = round(size_usdc / best_ask, 2)
         confidence = min(1.0, max(self.min_confidence, prob))
 
         self.active_token_id = token_id
-        self.entry_price = best_ask
+        self.entry_price = expected_fill
         self.entry_timestamp = now_mono
         self.entry_size = size
 
+        reentry_tag = f" reentry={self._slot_trade_count}" if is_reentry else ""
         return [Signal(
             market_id=self._market_id,
             outcome=outcome,
             action="BUY",
             confidence=confidence,
-            price=round_to_tick(best_ask, tick),
+            price=round_to_tick(expected_fill, tick),
             size=size,
             reason=(
-                f"prob={prob:.3f} edge={edge:+.3f} "
-                f"tte={tte:.0f}s status={prediction.feature_status}"
+                f"prob={prob:.3f} net_edge={net_edge:+.3f} "
+                f"tte={tte:.0f}s status={prediction.feature_status}{reentry_tag}"
             ),
         )]
 
@@ -344,19 +456,32 @@ class ProbEdgeStrategy(Strategy):
         )
 
     # ──────────────────────────────────────────────────────────────────────────
+    # Slot state management
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def reset_slot_state(self) -> None:
+        """Reset per-slot counters. Call on market rollover (new market_id)."""
+        self._slot_trade_count = 0
+        self._slot_realized_pnl = 0.0
+        self._slot_blocked_direction = None
+
+    # ──────────────────────────────────────────────────────────────────────────
     # Dynamic edge threshold
     # ──────────────────────────────────────────────────────────────────────────
 
     def _required_edge(self, tte: float) -> float:
         """Dynamic min-edge scaled by time remaining in the slot.
 
-        At tte=max_seconds_to_expiry: required = 2 × min_edge  (most uncertain)
-        At tte=0:                     required = 1 × min_edge  (least uncertain)
+        Near expiry (tte→0): spread widens, book thins, gamma is high — require MORE edge.
+        With plenty of time (tte→max): model has time to be right — allow lower threshold.
 
-        Formula: min_edge × (1 + tte / max_seconds_to_expiry)
+        At tte=0:                     required = 2 × min_edge  (coin-flip zone)
+        At tte=max_seconds_to_expiry: required = 1 × min_edge  (plenty of time)
+
+        Formula: min_edge × (1 + (1 - tte / max_seconds_to_expiry))
         """
         tte_clamped = max(0.0, min(tte, self.max_seconds_to_expiry))
-        return self.min_edge * (1.0 + tte_clamped / self.max_seconds_to_expiry)
+        return self.min_edge * (1.0 + (1.0 - tte_clamped / self.max_seconds_to_expiry))
 
     # ──────────────────────────────────────────────────────────────────────────
     # Kelly sizing
@@ -375,3 +500,43 @@ class ProbEdgeStrategy(Strategy):
         f_used = max(0.0, self.kelly_fraction * f_full)
         usdc = f_used * balance if balance > 0 else self.position_size_usdc
         return min(usdc, self.position_size_usdc)
+
+    def _estimate_buy_vwap(self, book: OrderBook, size_usdc: float) -> Optional[float]:
+        """Estimate average fill price for a marketable buy from ask depth."""
+        if size_usdc <= 0 or not book.asks:
+            return None
+
+        remaining_usdc = size_usdc
+        filled_shares = 0.0
+        spent_usdc = 0.0
+
+        for level in book.asks:
+            ask = float(level.price)
+            available_shares = max(0.0, float(level.size))
+            if ask <= 0 or available_shares <= 0:
+                continue
+
+            level_capacity_usdc = ask * available_shares
+            take_usdc = min(remaining_usdc, level_capacity_usdc)
+            take_shares = take_usdc / ask
+            spent_usdc += take_usdc
+            filled_shares += take_shares
+            remaining_usdc -= take_usdc
+            if remaining_usdc <= 1e-9:
+                break
+
+        if filled_shares <= 0:
+            return None
+        return spent_usdc / filled_shares
+
+    def _taker_fee_per_share(self, price: float) -> float:
+        if not self.fee_enabled or price <= 0.0 or price >= 1.0:
+            return 0.0
+        return self.taker_fee_rate * price * ((price * (1.0 - price)) ** self.taker_fee_exponent)
+
+    def _net_edge(self, prob: float, expected_fill: Optional[float]) -> float:
+        """Compute net edge given a pre-computed expected fill price."""
+        if expected_fill is None:
+            return float("-inf")
+        fee_per_share = self._taker_fee_per_share(expected_fill)
+        return prob - expected_fill - fee_per_share

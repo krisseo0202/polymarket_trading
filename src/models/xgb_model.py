@@ -29,10 +29,11 @@ class PredictionResult:
         prob_yes: Optional[float],
         model_version: str,
         feature_status: str,
-        prob_no: Optional[float] = None,
         edge_yes: Optional[float] = None,
         edge_no: Optional[float] = None,
     ):
+        # prob_no is always derived as 1 - prob_yes (see property below).
+        # There is no separate storage: the two probabilities sum to 1 by construction.
         self.prob_yes = prob_yes
         self.model_version = model_version
         self.feature_status = feature_status
@@ -124,6 +125,16 @@ class BTCUpDownXGBModel:
                 prob_yes=None,
                 model_version=self.model_version,
                 feature_status=built.status,
+            )
+
+        # Block predictions during indicator warmup: FVG/TDSeq features default to 0.0
+        # which is out-of-distribution for the trained model (it never saw all-zero indicators
+        # during training for a normal market regime).
+        if built.status == "ready_indicator_warmup":
+            return PredictionResult(
+                prob_yes=None,
+                model_version=self.model_version,
+                feature_status="indicator_warmup",
             )
 
         prob_yes = self.predict_from_features(built.features)

@@ -8,6 +8,7 @@ import numpy as np
 from ..strategies.base import Strategy
 from ..api.types import MarketData, OrderBook, OrderBookEntry
 from .data_loader import DataLoader
+from ..engine.performance_store import PerformanceStore
 from ..engine.risk_manager import RiskManager, RiskLimits
 
 
@@ -87,19 +88,13 @@ class Backtester:
         self,
         initial_balance: float = 10000.0,
         data_loader: Optional[DataLoader] = None,
-        risk_limits: Optional[RiskLimits] = None
+        risk_limits: Optional[RiskLimits] = None,
+        perf_store: Optional[PerformanceStore] = None,
     ):
-        """
-        Initialize backtester
-        
-        Args:
-            initial_balance: Starting balance for backtest
-            data_loader: Data loader instance
-            risk_limits: Risk limits to apply
-        """
         self.initial_balance = initial_balance
         self.data_loader = data_loader or DataLoader()
         self.risk_manager = RiskManager(risk_limits)
+        self.perf_store = perf_store
     
     def run(
         self,
@@ -222,7 +217,16 @@ class Backtester:
         
         # Calculate metrics
         result.calculate_metrics()
-        
+
+        if self.perf_store is not None:
+            strategy_name = getattr(strategy, "name", type(strategy).__name__)
+            self.perf_store.record_backtest(
+                result,
+                strategy_name=strategy_name,
+                data_start=start_date.date().isoformat(),
+                data_end=end_date.date().isoformat(),
+            )
+
         return result
     
     def _create_market_data(
@@ -235,12 +239,18 @@ class Backtester:
         price_history: Dict[str, List[float]]
     ) -> Dict[str, Any]:
         """Create market data dictionary for strategy"""
-        # Create mock order book
-        def create_order_book(token_id: str, price: float) -> Dict[str, Any]:
+        # Create typed OrderBook objects so strategies that do isinstance() checks work correctly
+        def create_order_book(token_id: str, price: float) -> OrderBook:
             spread = 0.01
-            bids = [{"price": price - spread/2 - i*0.01, "size": 100.0} for i in range(3)]
-            asks = [{"price": price + spread/2 + i*0.01, "size": 100.0} for i in range(3)]
-            return {"bids": bids, "asks": asks, "last_price": price}
+            bids = [OrderBookEntry(price=max(0.01, price - spread/2 - i*0.01), size=100.0) for i in range(3)]
+            asks = [OrderBookEntry(price=min(0.99, price + spread/2 + i*0.01), size=100.0) for i in range(3)]
+            return OrderBook(
+                market_id=market_id,
+                token_id=token_id,
+                bids=bids,
+                asks=asks,
+                tick_size=0.01,
+            )
         
         market = MarketData(
             market_id=market_id,

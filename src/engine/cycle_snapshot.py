@@ -73,6 +73,25 @@ class CycleSnapshot:
     slot_realized_pnl: float = 0.0
     unrealized_pnl: Optional[float] = None
 
+    # ── Strategy telemetry ────────────────────────────────────────────────────
+    strategy_name: str = ""
+    strategy_status: str = ""
+    strategy_prob_yes: Optional[float] = None
+    strategy_prob_no: Optional[float] = None
+    strategy_edge_yes: Optional[float] = None
+    strategy_edge_no: Optional[float] = None
+    strategy_net_edge_yes: Optional[float] = None
+    strategy_net_edge_no: Optional[float] = None
+    strategy_expected_fill_yes: Optional[float] = None
+    strategy_expected_fill_no: Optional[float] = None
+    strategy_required_edge: Optional[float] = None
+    strategy_tte_seconds: Optional[float] = None
+    strategy_distance_to_break_pct: Optional[float] = None
+    strategy_distance_to_strike_bps: Optional[float] = None
+    strategy_model_version: str = ""
+    strategy_feature_status: str = ""
+    strategy_score_breakdown: Optional[dict] = None
+
     # ── Metadata ──────────────────────────────────────────────────────────────
     cycle_count: int = 0
     paper_trading: bool = True
