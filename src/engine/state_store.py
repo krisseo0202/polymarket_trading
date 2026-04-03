@@ -27,13 +27,23 @@ class BotState:
     strategy_zscore: Optional[float] = None     # btc_vol_reversion only
     strategy_momentum_pct: Optional[float] = None  # btc_updown only
     strategy_prob_yes: Optional[float] = None
+    strategy_prob_no: Optional[float] = None
     strategy_edge_yes: Optional[float] = None
     strategy_edge_no: Optional[float] = None
+    strategy_net_edge_yes: Optional[float] = None
+    strategy_net_edge_no: Optional[float] = None
+    strategy_expected_fill_yes: Optional[float] = None
+    strategy_expected_fill_no: Optional[float] = None
+    strategy_tte_seconds: Optional[float] = None
+    strategy_distance_to_break_pct: Optional[float] = None
+    strategy_distance_to_strike_bps: Optional[float] = None
     strategy_model_version: str = ""
     strategy_feature_status: str = ""
     strategy_last_signal: str = ""              # e.g. "BUY YES @ 0.6500 | momentum=2.3%"
     strategy_last_signal_ts: float = 0.0
     strategy_status: str = ""                   # "WATCHING" | "POSITION_OPEN" | "EXITED"
+    strategy_score_breakdown: Optional[dict] = None  # sigmoid model feature contributions
+    strategy_required_edge: Optional[float] = None   # dynamic TTE-scaled entry threshold
 
     # Chainlink reference price (slot-open "price to beat")
     chainlink_ref_price: Optional[float] = None
@@ -84,13 +94,23 @@ class StateStore:
                 strategy_zscore=data.get("strategy_zscore"),
                 strategy_momentum_pct=data.get("strategy_momentum_pct"),
                 strategy_prob_yes=data.get("strategy_prob_yes"),
+                strategy_prob_no=data.get("strategy_prob_no"),
                 strategy_edge_yes=data.get("strategy_edge_yes"),
                 strategy_edge_no=data.get("strategy_edge_no"),
+                strategy_net_edge_yes=data.get("strategy_net_edge_yes"),
+                strategy_net_edge_no=data.get("strategy_net_edge_no"),
+                strategy_expected_fill_yes=data.get("strategy_expected_fill_yes"),
+                strategy_expected_fill_no=data.get("strategy_expected_fill_no"),
+                strategy_tte_seconds=data.get("strategy_tte_seconds"),
+                strategy_distance_to_break_pct=data.get("strategy_distance_to_break_pct"),
+                strategy_distance_to_strike_bps=data.get("strategy_distance_to_strike_bps"),
                 strategy_model_version=data.get("strategy_model_version", ""),
                 strategy_feature_status=data.get("strategy_feature_status", ""),
                 strategy_last_signal=data.get("strategy_last_signal", ""),
                 strategy_last_signal_ts=float(data.get("strategy_last_signal_ts", 0.0)),
                 strategy_status=data.get("strategy_status", ""),
+                strategy_score_breakdown=data.get("strategy_score_breakdown"),
+                strategy_required_edge=data.get("strategy_required_edge"),
                 chainlink_ref_price=data.get("chainlink_ref_price"),
                 chainlink_ref_slot_ts=data.get("chainlink_ref_slot_ts"),
                 chainlink_healthy=data.get("chainlink_healthy", False),

@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 from datetime import datetime, timezone
 from typing import Dict, Tuple
@@ -40,6 +39,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--eta", type=float, default=0.05, help="Learning rate")
     parser.add_argument("--max-depth", type=int, default=4, help="Tree depth")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--bet-size", type=float, default=20.0, help="Simulated holdout bet size in USDC when fill columns exist")
     return parser.parse_args()
 
 
@@ -131,6 +131,34 @@ def _brier(y_true: np.ndarray, y_prob: np.ndarray) -> float:
     return float(np.mean((y_prob - y_true) ** 2))
 
 
+def _simulate_holdout_pnl(valid_meta: pd.DataFrame, probs_yes: np.ndarray, y_valid: np.ndarray, bet_size: float) -> Dict[str, float]:
+    if "sim_yes_ask" not in valid_meta.columns or "sim_no_ask" not in valid_meta.columns:
+        return {}
+
+    pnl_list = []
+    pred_yes = probs_yes >= 0.5
+    actual_yes = y_valid == 1
+
+    for idx in range(len(probs_yes)):
+        if pred_yes[idx]:
+            entry = float(valid_meta.iloc[idx]["sim_yes_ask"])
+            payout = 1.0 if actual_yes[idx] else 0.0
+        else:
+            entry = float(valid_meta.iloc[idx]["sim_no_ask"])
+            payout = 1.0 if not actual_yes[idx] else 0.0
+        entry = max(entry, 0.01)
+        shares = bet_size / entry
+        pnl_list.append(shares * (payout - entry))
+
+    pnl_arr = np.asarray(pnl_list, dtype=float)
+    return {
+        "holdout_accuracy": float(np.mean(pred_yes == actual_yes)) if len(pred_yes) else 0.0,
+        "holdout_total_pnl": float(np.sum(pnl_arr)) if len(pnl_arr) else 0.0,
+        "holdout_pnl_per_trade": float(np.mean(pnl_arr)) if len(pnl_arr) else 0.0,
+        "holdout_trades": int(len(pnl_arr)),
+    }
+
+
 def main() -> None:
     args = _parse_args()
     df = _load_frame(args.input)
@@ -138,9 +166,9 @@ def main() -> None:
         raise SystemExit("Input dataset is empty")
 
     y = _coerce_label(df, args.label_col)
-    X = coerce_training_frame(df)
-
-    train_X, valid_X, y_train, y_valid = _walk_forward_split(X, y, args.time_col, args.valid_fraction)
+    train_df, valid_df, y_train, y_valid = _walk_forward_split(df, y, args.time_col, args.valid_fraction)
+    train_X = coerce_training_frame(train_df)
+    valid_X = coerce_training_frame(valid_df)
     dtrain = xgb.DMatrix(train_X.to_numpy(dtype=float), label=y_train.to_numpy(dtype=float), feature_names=FEATURE_COLUMNS)
     dvalid = xgb.DMatrix(valid_X.to_numpy(dtype=float), label=y_valid.to_numpy(dtype=float), feature_names=FEATURE_COLUMNS)
 
@@ -166,6 +194,7 @@ def main() -> None:
     raw_valid = booster.predict(dvalid)
     calibration = _build_calibration(raw_valid, y_valid.to_numpy(dtype=float))
     calibrated_valid = _apply_calibration(raw_valid, calibration)
+    backtest_metrics = _simulate_holdout_pnl(valid_df.reset_index(drop=True), calibrated_valid, y_valid.to_numpy(dtype=float), args.bet_size)
 
     os.makedirs(args.output_dir, exist_ok=True)
     model_path = os.path.join(args.output_dir, "btc_updown_xgb.json")
@@ -200,8 +229,11 @@ def main() -> None:
             "eta": args.eta,
             "max_depth": args.max_depth,
             "seed": args.seed,
+            "bet_size": args.bet_size,
         },
     }
+    if backtest_metrics:
+        metadata["backtest"] = backtest_metrics
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
 
@@ -214,6 +246,14 @@ def main() -> None:
         f"brier={metadata['metrics']['calibrated_brier']:.5f} "
         f"positive_rate={metadata['metrics']['positive_rate']:.3f}"
     )
+    if backtest_metrics:
+        print(
+            "Holdout backtest | "
+            f"accuracy={backtest_metrics['holdout_accuracy']:.3f} "
+            f"total_pnl={backtest_metrics['holdout_total_pnl']:+.2f} "
+            f"pnl_per_trade={backtest_metrics['holdout_pnl_per_trade']:+.4f} "
+            f"trades={backtest_metrics['holdout_trades']}"
+        )
 
 
 if __name__ == "__main__":

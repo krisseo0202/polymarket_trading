@@ -1,6 +1,6 @@
 {
   "model_name": "btc_updown_xgb",
-  "model_version": "btc_updown_xgb_20260323T050815Z",
+  "model_version": "btc_updown_xgb_20260330T031822Z",
   "feature_columns": [
     "btc_mid",
     "btc_ret_15s",
@@ -41,7 +41,8 @@
   "feature_groups": [
     "btc_core",
     "btc_vol",
-    "strike_time"
+    "strike_time",
+    "market_book"
   ],
   "thresholds": {
     "min_edge": 0.03,
@@ -55,28 +56,29 @@
   "calibration": {
     "bin_edges": [
       0.0,
-      0.46888574957847595,
+      0.4669646918773651,
       1.0
     ],
     "bin_values": [
-      0.5344827586206896,
-      0.5344827586206896
+      0.6470588235294118,
+      0.6470588235294118
     ]
   },
   "metrics": {
-    "train_rows": 229,
-    "valid_rows": 58,
-    "raw_log_loss": 0.6993843368415175,
-    "calibrated_log_loss": 0.6907671705264811,
-    "raw_brier": 0.25311390695319147,
-    "calibrated_brier": 0.24881093935790727,
-    "positive_rate": 0.4808362369337979
+    "train_rows": 66,
+    "valid_rows": 17,
+    "raw_log_loss": 0.7147955158177544,
+    "calibrated_log_loss": 0.649248354870898,
+    "raw_brier": 0.26080759867765,
+    "calibrated_brier": 0.22837370242214533,
+    "positive_rate": 0.5060240963855421
   },
   "training": {
     "feature_groups": [
       "btc_core",
       "btc_vol",
-      "strike_time"
+      "strike_time",
+      "market_book"
     ],
     "val_fraction": 0.2,
     "num_round": 200

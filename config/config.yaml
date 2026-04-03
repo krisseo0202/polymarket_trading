@@ -9,6 +9,7 @@ trading:
 btc_updown_bot:
   market_keywords: ["Bitcoin", "Up or Down"]  # title must contain all of these (case-insensitive)
   state_file: "bot_state.json"
+  perf_db_path: "perf.db"
   min_volume: 0  # 0 — don't filter by volume so brand-new markets are found immediately
 
 strategies:
@@ -40,7 +41,8 @@ strategies:
 
   btc_updown_xgb:
     enabled: true
-    btc_symbol: "btcusdt"
+    btc_symbol: "BTC-USD"      # Coinbase product ID (aligns with Chainlink oracle source)
+    btc_exchange: "coinbase"   # "coinbase" (default) | "binance_us"
     model_path: "models/btc_updown_xgb.json"
     feature_schema_path: "models/btc_updown_xgb_features.json"
     metadata_path: "models/btc_updown_xgb_meta.json"
@@ -57,6 +59,42 @@ strategies:
     exit_edge: -0.01
     min_seconds_to_expiry: 20
     max_seconds_to_expiry: 240
+
+  prob_edge:
+    # Probability-native edge strategy — production strategy path.
+    # Decision: BUY YES/NO only when model edge exceeds threshold.
+    # Model: BTCUpDownBaselineModel (GBM) by default; swap via model_service.
+    enabled: true
+    btc_symbol: "BTC-USD"        # BTC feed symbol
+    btc_exchange: "coinbase"     # BTC feed exchange
+
+    # Entry filters
+    min_edge: 0.04               # edge = p - ask must clear this (e.g. p=0.60, ask=0.55 → edge=0.05)
+    max_spread_pct: 0.06         # reject entry when spread > 6% of mid
+    min_seconds_to_expiry: 30    # don't enter with < 30s until resolution
+    max_seconds_to_expiry: 280   # don't enter at very start of slot (data warming up)
+
+    # Exit rules
+    stop_loss_pct: 0.15          # exit if position drops 15% from entry
+    max_hold_seconds: 270        # force-exit before the 5-min window closes
+    exit_edge: -0.02             # edge-reprice exit: close if model reprices edge < -0.02
+
+    # Kelly sizing
+    kelly_fraction: 0.15         # fractional Kelly multiplier (range 0.10–0.25)
+    position_size_usdc: 30.0     # hard cap on notional per trade
+    fee_enabled: true            # enable fee-aware net-edge filter for Polymarket fee-enabled crypto markets
+    taker_fee_rate: 0.072        # docs formula input for crypto category as of 2026-04-02
+    taker_fee_exponent: 1.0      # docs formula exponent for crypto category as of 2026-04-02
+
+    # Confidence gate
+    min_confidence: 0.51         # minimum model prob to allow trade
+
+    # Sequential re-entry within a slot
+    allow_reentry: true
+    max_trades_per_slot: 3       # hard cap on entries per 5-min market
+    re_entry_edge_mult: 1.5      # 2nd+ entry requires 1.5× the normal edge threshold
+    re_entry_size_mult: 0.5      # 2nd+ entry uses 50% Kelly size (correlation haircut)
+    slot_loss_limit_usdc: 15.0   # halt slot trading if cumulative loss exceeds this
 
   btc_vol_reversion:
     enabled: true
@@ -88,6 +126,9 @@ risk:
 chainlink_feed:
   enabled: true
   symbol: "btc/usd"
+
+vpn:
+  require_non_us: true   # abort startup if external IP is US-based; set false to skip check
 
 logging:
   level: "INFO"

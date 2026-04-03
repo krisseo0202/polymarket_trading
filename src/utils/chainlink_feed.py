@@ -38,8 +38,8 @@ class SlotOpenPrice:
     captured_at: float  # local time when captured
 
 
-_STALE_WARN_S = 10.0
-_RECONNECT_S = 30.0
+_STALE_WARN_S = 90.0   # Chainlink updates on 0.5% deviation; quiet periods can last minutes
+_RECONNECT_S = 120.0  # only reconnect if no messages (including PONGs) for 2 min
 _BUFFER_S = 600.0
 _BACKOFF_INIT = 1.0
 _BACKOFF_MAX = 60.0

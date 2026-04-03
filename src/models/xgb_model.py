@@ -22,12 +22,23 @@ from .schema import FEATURE_COLUMNS, build_default_metadata
 class PredictionResult:
     """Live prediction result consumed by the strategy."""
 
-    __slots__ = ("prob_yes", "model_version", "feature_status")
+    __slots__ = ("prob_yes", "model_version", "feature_status", "edge_yes", "edge_no")
 
-    def __init__(self, prob_yes: Optional[float], model_version: str, feature_status: str, prob_no: Optional[float] = None):
+    def __init__(
+        self,
+        prob_yes: Optional[float],
+        model_version: str,
+        feature_status: str,
+        edge_yes: Optional[float] = None,
+        edge_no: Optional[float] = None,
+    ):
+        # prob_no is always derived as 1 - prob_yes (see property below).
+        # There is no separate storage: the two probabilities sum to 1 by construction.
         self.prob_yes = prob_yes
         self.model_version = model_version
         self.feature_status = feature_status
+        self.edge_yes = edge_yes
+        self.edge_no = edge_no
 
     @property
     def prob_no(self) -> Optional[float]:
@@ -116,6 +127,16 @@ class BTCUpDownXGBModel:
                 feature_status=built.status,
             )
 
+        # Block predictions during indicator warmup: FVG/TDSeq features default to 0.0
+        # which is out-of-distribution for the trained model (it never saw all-zero indicators
+        # during training for a normal market regime).
+        if built.status == "ready_indicator_warmup":
+            return PredictionResult(
+                prob_yes=None,
+                model_version=self.model_version,
+                feature_status="indicator_warmup",
+            )
+
         prob_yes = self.predict_from_features(built.features)
         if prob_yes is None:
             return PredictionResult(
@@ -178,4 +199,3 @@ class BTCUpDownXGBModel:
         except Exception as exc:  # pragma: no cover - defensive
             self.logger.warning("Failed to load JSON from %s: %s", path, exc)
             return None
-

@@ -1,9 +1,10 @@
 """Base Strategy class for all trading strategies"""
 
+import collections
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List, Optional, Dict, Any, Tuple
+from typing import Deque, List, Optional, Dict, Any, Tuple
 
 from ..utils.market_utils import get_mid_price, round_to_tick
 
@@ -49,8 +50,9 @@ class Strategy(ABC):
         self._yes_token_id: str = ""
         self._no_token_id: str = ""
 
-        # Mid-price history: token_id → [(monotonic_ts, mid), ...]
-        self._price_history: Dict[str, List[Tuple[float, float]]] = {}
+        # Mid-price history: token_id → deque of (monotonic_ts, mid)
+        # deque allows O(1) front-trim vs O(n) list comprehension rebuild
+        self._price_history: Dict[str, Deque[Tuple[float, float]]] = {}
         self._history_max_age: float = 300.0
 
         # Pending exit info for PnL computation
@@ -111,10 +113,11 @@ class Strategy(ABC):
     def record_price(self, token_id: str, mid: float, ts: Optional[float] = None) -> None:
         """Feed a mid-price observation into the internal history buffer."""
         now = ts if ts is not None else time.monotonic()
-        buf = self._price_history.setdefault(token_id, [])
+        buf = self._price_history.setdefault(token_id, collections.deque())
         buf.append((now, mid))
         cutoff = now - self._history_max_age
-        self._price_history[token_id] = [(t, p) for t, p in buf if t >= cutoff]
+        while buf and buf[0][0] < cutoff:
+            buf.popleft()
 
     # ------------------------------------------------------------------
     # Shared position lifecycle helpers
@@ -192,6 +195,24 @@ class Strategy(ABC):
         self.entry_price     = None
         self.entry_timestamp = None
         self.entry_size      = None
+
+    def _auto_recover_position(self, by_token: Dict[str, Any], now_ts: float) -> None:
+        """Recover position state from live positions after a bot restart.
+
+        No-op when already tracking a position. Checks YES then NO token.
+        """
+        if self.active_token_id is not None:
+            return
+        for tid in (self._yes_token_id, self._no_token_id):
+            if not tid:
+                continue
+            pos = by_token.get(tid)
+            if pos and pos.size > 0:
+                self.active_token_id = tid
+                self.entry_price = pos.average_price
+                self.entry_timestamp = now_ts
+                self.entry_size = pos.size
+                break
 
     def sync_position_from_inventory(
         self,
