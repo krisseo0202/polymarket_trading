@@ -117,13 +117,19 @@ class TestSlotStateManagerUpdate:
 
 # ── SlotStateManager.update_from_chainlink ────────────────────────────────────
 
+_TEST_NOW = 1_700_000_100.0
+# slot_for(1_700_000_100) = 1_700_000_100 (it's exactly divisible by 300)
+_TEST_SLOT_TS = int(_TEST_NOW // 300 * 300)  # == 1_700_000_100
+
+
 class TestUpdateFromChainlink:
-    def _mock_feed(self, slot_open_price=None, latest_price=None):
+    def _mock_feed(self, slot_open_price=None, latest_price=None, slot_ts=_TEST_SLOT_TS):
         feed = MagicMock()
-        # SlotOpenPrice mock
+        # SlotOpenPrice mock — slot_ts must match the test clock's current slot
         if slot_open_price is not None:
             slot_open = MagicMock()
             slot_open.price = slot_open_price
+            slot_open.slot_ts = slot_ts
             feed.get_slot_open_price.return_value = slot_open
         else:
             feed.get_slot_open_price.return_value = None
@@ -138,14 +144,26 @@ class TestUpdateFromChainlink:
 
     def test_chainlink_slot_open_used_as_strike(self):
         feed = self._mock_feed(slot_open_price=84500.0, latest_price=84510.0)
-        mgr = SlotStateManager(clock_fn=lambda: 1_700_000_100.0)
+        mgr = SlotStateManager(clock_fn=lambda: _TEST_NOW)
         ctx = mgr.update_from_chainlink(feed, fallback_question="BTC above $84,000?")
         assert ctx.strike_price == 84500.0
         assert ctx.strike_source == "chainlink"
 
+    def test_stale_slot_open_falls_back_to_regex(self):
+        """slot_open from previous slot should not be used; regex fallback instead."""
+        stale_slot_ts = _TEST_SLOT_TS - 300  # one slot behind
+        feed = self._mock_feed(slot_open_price=84500.0, latest_price=84510.0, slot_ts=stale_slot_ts)
+        mgr = SlotStateManager(clock_fn=lambda: _TEST_NOW)
+        parse_fn = lambda q: 84100.0  # noqa: E731
+        ctx = mgr.update_from_chainlink(
+            feed, fallback_question="BTC above $84,100?", parse_strike_fn=parse_fn
+        )
+        assert ctx.strike_price == 84100.0
+        assert ctx.strike_source == "regex"
+
     def test_regex_fallback_when_no_slot_open(self):
         feed = self._mock_feed(slot_open_price=None, latest_price=84510.0)
-        mgr = SlotStateManager(clock_fn=lambda: 1_700_000_100.0)
+        mgr = SlotStateManager(clock_fn=lambda: _TEST_NOW)
         parse_fn = lambda q: 84000.0  # noqa: E731
         ctx = mgr.update_from_chainlink(
             feed, fallback_question="BTC above $84,000?", parse_strike_fn=parse_fn
@@ -155,14 +173,14 @@ class TestUpdateFromChainlink:
 
     def test_unknown_source_when_both_missing(self):
         feed = self._mock_feed(slot_open_price=None, latest_price=None)
-        mgr = SlotStateManager(clock_fn=lambda: 1_700_000_100.0)
+        mgr = SlotStateManager(clock_fn=lambda: _TEST_NOW)
         parse_fn = lambda q: None  # noqa: E731
         ctx = mgr.update_from_chainlink(feed, fallback_question="", parse_strike_fn=parse_fn)
         assert ctx.strike_price is None
         assert ctx.strike_source == "unknown"
 
     def test_none_feed_falls_back_to_regex(self):
-        mgr = SlotStateManager(clock_fn=lambda: 1_700_000_100.0)
+        mgr = SlotStateManager(clock_fn=lambda: _TEST_NOW)
         parse_fn = lambda q: 83000.0  # noqa: E731
         ctx = mgr.update_from_chainlink(
             None, fallback_question="BTC above $83,000?", parse_strike_fn=parse_fn
@@ -172,7 +190,7 @@ class TestUpdateFromChainlink:
 
     def test_btc_ref_price_from_latest_tick(self):
         feed = self._mock_feed(slot_open_price=84500.0, latest_price=84510.0)
-        mgr = SlotStateManager(clock_fn=lambda: 1_700_000_100.0)
+        mgr = SlotStateManager(clock_fn=lambda: _TEST_NOW)
         ctx = mgr.update_from_chainlink(feed)
         assert ctx.btc_ref_price == 84510.0
 

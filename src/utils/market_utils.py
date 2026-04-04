@@ -1,10 +1,23 @@
 """Market utility functions for trading"""
 
-from typing import List, Optional, Dict
-import requests
+import email.utils
 import json
+import math
+import time
+from typing import List, Optional, Dict
+
+import requests
+
 from ..api.client import PolymarketClient
 from ..api.types import OrderBook
+
+# Corrected clock offset: server_time - local_time, updated on each slug lookup.
+_server_offset: float = 0.0
+
+
+def get_server_time() -> float:
+    """Return local time corrected by the last-observed Polymarket server offset."""
+    return time.time() + _server_offset
 
 def _contains_all(text: str, keywords: List[str]) -> bool:
     t = (text or "").lower()
@@ -144,6 +157,128 @@ def spread_pct(bid: float, ask: float) -> float:
     """Spread as a fraction of mid price. Returns inf when mid is zero."""
     mid = (bid + ask) / 2.0
     return (ask - bid) / mid if mid > 0 else float("inf")
+
+
+def parse_event_market(event: dict) -> Optional[Dict]:
+    """Extract market_id / yes_token_id / no_token_id from a gamma-api event dict."""
+    for m in event.get("markets", []):
+        tids = json.loads(m.get("clobTokenIds", "[]"))
+        yes_id = tids[0] if len(tids) > 0 else m.get("yes_token_id")
+        no_id  = tids[1] if len(tids) > 1 else m.get("no_token_id")
+        if yes_id and no_id:
+            return {
+                "market_id": m.get("id") or m.get("market_id", ""),
+                "yes_token_id": yes_id,
+                "no_token_id": no_id,
+                "question": m.get("question", event.get("title", "")),
+            }
+    return None
+
+
+def find_btc_updown_market(
+    keywords: List[str],
+    min_volume: int,
+    logger,
+) -> Optional[Dict]:
+    """
+    Discover the current BTC Up/Down 5-minute market.
+
+    Discovery order:
+      1. Slug-based lookup: gamma-api /events?slug=btc-updown-5m-{slot}
+      2. Keyword search across gamma-api events (min_volume filter).
+      3. Keyword search across gamma-api /markets endpoint.
+
+    Returns dict {market_id, yes_token_id, no_token_id, question} or None.
+    """
+    global _server_offset
+    lower_kws = [k.lower() for k in keywords]
+
+    # 1. Slug-based lookup (fastest, most precise)
+    slot = int(math.floor(get_server_time() / 300) * 300)
+    slug = f"btc-updown-5m-{slot}"
+    try:
+        resp = requests.get(
+            "https://gamma-api.polymarket.com/events",
+            params={"slug": slug},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        date_hdr = resp.headers.get("Date")
+        if date_hdr:
+            try:
+                _server_offset = (
+                    email.utils.parsedate_to_datetime(date_hdr).timestamp() - time.time()
+                )
+            except Exception:
+                pass
+        data = resp.json()
+        events = data if isinstance(data, list) else [data]
+        for event in events:
+            result = parse_event_market(event)
+            if result:
+                logger.info(
+                    f"Found market via slug '{slug}': "
+                    f"yes={result['yes_token_id'][:12]}..."
+                )
+                return result
+    except Exception as e:
+        logger.warning(f"Slug lookup failed ({slug}): {e}")
+
+    # 2. Keyword search across events
+    try:
+        resp = requests.get(
+            "https://gamma-api.polymarket.com/events",
+            params={"active": "true", "closed": "false", "limit": 100, "offset": 0},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        for event in resp.json():
+            title = event.get("title", "").lower()
+            total_vol = sum(
+                float(m.get("volume", 0) or 0) for m in event.get("markets", [])
+            )
+            if total_vol < min_volume:
+                continue
+            if all(kw in title for kw in lower_kws):
+                result = parse_event_market(event)
+                if result:
+                    logger.info(
+                        f"Found market via keyword search '{event['title']}': "
+                        f"yes={result['yes_token_id'][:12]}..."
+                    )
+                    return result
+    except Exception as e:
+        logger.warning(f"Keyword/events search failed: {e}")
+
+    # 3. gamma-api /markets endpoint
+    try:
+        resp = requests.get(
+            "https://gamma-api.polymarket.com/markets",
+            params={"active": "true", "closed": "false", "limit": 100, "offset": 0},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        for m in resp.json():
+            question = m.get("question", "").lower()
+            if all(kw in question for kw in lower_kws):
+                tids = json.loads(m.get("clobTokenIds", "[]"))
+                yes_id = tids[0] if len(tids) > 0 else None
+                no_id  = tids[1] if len(tids) > 1 else None
+                if yes_id and no_id:
+                    logger.info(
+                        f"Found market via gamma-api/markets: '{m['question']}'"
+                    )
+                    return {
+                        "market_id": m.get("id", ""),
+                        "yes_token_id": yes_id,
+                        "no_token_id": no_id,
+                        "question": m.get("question", ""),
+                    }
+    except Exception as e:
+        logger.warning(f"gamma-api/markets search failed: {e}")
+
+    logger.warning("BTC Up/Down market not found this cycle")
+    return None
 
 
 def cancel_if_exists(client: PolymarketClient, order_id: Optional[str], dry_run: bool) -> None:

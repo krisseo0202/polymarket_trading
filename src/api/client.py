@@ -1,7 +1,8 @@
 """Polymarket API client wrapper"""
 
 import os
-from typing import List, Optional, Dict, Any
+from concurrent.futures import ThreadPoolExecutor
+from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime
 import logging
 import requests
@@ -534,4 +535,15 @@ class PolymarketClient:
                     size=order.size,
                     average_price=order.price
                 )
+
+    def fetch_market_data_parallel(
+        self, yes_tid: str, no_tid: str
+    ) -> Tuple[OrderBook, OrderBook, List[Position], float]:
+        """Fetch order books, positions, and balance in parallel."""
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            f_yes = pool.submit(self.get_order_book, yes_tid)
+            f_no = pool.submit(self.get_order_book, no_tid)
+            f_pos = pool.submit(self.get_positions)
+            f_bal = pool.submit(self.get_balance)
+            return f_yes.result(), f_no.result(), f_pos.result(), f_bal.result()
 

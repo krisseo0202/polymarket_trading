@@ -1,8 +1,14 @@
 """Inventory management for market making"""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Literal
+from typing import Dict, Tuple, TYPE_CHECKING
 from ..api.types import Side
+
+if TYPE_CHECKING:
+    from .state_store import BotState
+    from .risk_manager import RiskManager
 
 
 @dataclass
@@ -80,3 +86,43 @@ class InventoryState:
 
         self._normalize()
         return realized
+
+
+def apply_fill_to_state(
+    inv: InventoryState,
+    side: str,
+    price: float,
+    size: float,
+    state: "BotState",
+    risk_manager: "RiskManager",
+) -> float:
+    """Apply a fill to inventory + state PnL. Returns realized PnL."""
+    realized = inv.apply_fill(side, price, size)
+    state.daily_realized_pnl += realized
+    state.slot_realized_pnl += realized
+    if realized != 0.0:
+        risk_manager.record_trade(realized)
+    return realized
+
+
+def sync_inventories_to_state(
+    state: "BotState", inventories: Dict[str, InventoryState]
+) -> None:
+    """Serialize all inventory states into the bot state dict."""
+    for token_id, inv in inventories.items():
+        state.inventories[token_id] = {
+            "position": inv.position,
+            "avg_cost": inv.avg_cost,
+        }
+
+
+def sync_strategy_from_inventories(
+    strategy, inventories: Dict[str, InventoryState], token_ids: Tuple[str, str]
+) -> None:
+    """Sync strategy position state from authoritative inventory."""
+    for tid in token_ids:
+        inv = inventories.get(tid)
+        if inv and inv.position > 0:
+            strategy.sync_position_from_inventory(tid, inv.position, inv.avg_cost)
+            return
+    strategy.sync_position_from_inventory(None, 0.0, 0.0)

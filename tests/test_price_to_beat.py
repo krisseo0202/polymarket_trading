@@ -29,6 +29,18 @@ class _FakeChainlinkFeed:
     def is_healthy(self):
         return self._healthy
 
+    def get_latest(self):
+        return None
+
+    def is_connecting(self):
+        return False
+
+    def get_feed_age_ms(self):
+        return None
+
+    def get_earliest_slot_price(self, slot_ts):
+        return None
+
 
 def test_live_chainlink_current_slot_is_preferred():
     current_slot = 1_700_000_100

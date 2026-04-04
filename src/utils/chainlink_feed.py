@@ -38,12 +38,13 @@ class SlotOpenPrice:
     captured_at: float  # local time when captured
 
 
-_STALE_WARN_S = 90.0   # Chainlink updates on 0.5% deviation; quiet periods can last minutes
-_RECONNECT_S = 120.0  # only reconnect if no messages (including PONGs) for 2 min
+_STALE_WARN_S = 90.0    # Chainlink updates on 0.5% deviation; quiet periods can last minutes
+_RECONNECT_S = 120.0   # reconnect if no messages (including PONGs) for 2 min
 _BUFFER_S = 600.0
 _BACKOFF_INIT = 1.0
 _BACKOFF_MAX = 60.0
 _PING_INTERVAL_S = 5.0
+_RESUBSCRIBE_NO_DATA_S = 60.0  # resubscribe if connected but no price within 60s
 
 _RTDS_URL = "wss://ws-live-data.polymarket.com"
 _RTDS_TOPIC = "crypto_prices_chainlink"
@@ -75,6 +76,9 @@ class ChainlinkFeed:
         self._buffer: Deque[Tuple[float, float]] = collections.deque()
         self._stop_evt = threading.Event()
         self.reconnect_count: int = 0
+        # Monotonic timestamp of last actual price tick (0 = never received).
+        # Updated under _lock so watchdog can read it safely.
+        self._last_price_monotonic: float = 0.0
 
         self._ws_thread: Optional[threading.Thread] = None
         self._watchdog_thread: Optional[threading.Thread] = None
@@ -255,7 +259,10 @@ class ChainlinkFeed:
             local_ts=local_ts,
         )
         self._latest = snap
-        self._buffer.append((local_ts, price))
+        self._last_price_monotonic = time.monotonic()
+        # Use exchange_ts for the buffer so get_recent_prices() windows align to
+        # oracle time rather than local receipt time.
+        self._buffer.append((exchange_ts, price))
 
         cutoff = local_ts - self._buffer_s
         while self._buffer and self._buffer[0][0] < cutoff:
@@ -263,15 +270,23 @@ class ChainlinkFeed:
 
         interval = self._slot_interval_s
         current_slot = int(math.floor(exchange_ts / interval) * interval)
-        if self._slot_open is None or self._slot_open.slot_ts != current_slot:
+        existing_slot = self._slot_open.slot_ts if self._slot_open is not None else -1
+
+        if current_slot > existing_slot:
+            # Slot advanced — capture the first price of the new slot.
             self._slot_open = SlotOpenPrice(
                 slot_ts=current_slot,
                 price=price,
                 captured_at=local_ts,
             )
             self._logger.info(
-                f"New slot {current_slot}: Chainlink open price = "
-                f"${price:,.2f}"
+                f"New slot {current_slot}: Chainlink open price = ${price:,.2f}"
+            )
+        elif current_slot < existing_slot:
+            # Out-of-order tick from an old slot — ignore to prevent regression.
+            self._logger.debug(
+                f"Chainlink: ignoring out-of-order tick for old slot "
+                f"{current_slot} (current slot {existing_slot})"
             )
 
     # ── WebSocket loop ────────────────────────────────────────────────────
@@ -309,23 +324,22 @@ class ChainlinkFeed:
                     first_connect = False
                     backoff = _BACKOFF_INIT
                     last_message_at = time.monotonic()
+                    subscribe_sent_at = time.monotonic()
 
-                    # RTDS currently expects action/subscriptions and a
-                    # JSON-string filter for Chainlink symbols.
-                    subscribe_msg = json.dumps({
-                        "action": "subscribe",
-                        "subscriptions": [
-                            {
-                                "topic": _RTDS_TOPIC,
-                                "type": "*",
-                                "filters": json.dumps({"symbol": self._symbol}),
-                            }
-                        ],
-                    })
-                    await ws.send(subscribe_msg)
-                    self._logger.info(
-                        f"Subscribed to Chainlink {self._symbol}"
-                    )
+                    def _make_subscribe() -> str:
+                        return json.dumps({
+                            "action": "subscribe",
+                            "subscriptions": [
+                                {
+                                    "topic": _RTDS_TOPIC,
+                                    "type": "*",
+                                    "filters": json.dumps({"symbol": self._symbol}),
+                                }
+                            ],
+                        })
+
+                    await ws.send(_make_subscribe())
+                    self._logger.info(f"Subscribed to Chainlink {self._symbol}")
 
                     async def _ping_loop() -> None:
                         while not self._stop_evt.is_set():
@@ -339,11 +353,28 @@ class ChainlinkFeed:
                             last_message_at = time.monotonic()
                             self._handle_message(raw)
                         except asyncio.TimeoutError:
-                            if (time.monotonic() - last_message_at) > self._reconnect_s:
+                            now_mono = time.monotonic()
+                            # No message at all (not even a PONG) for reconnect_s → reconnect
+                            if (now_mono - last_message_at) > self._reconnect_s:
                                 self._logger.warning(
-                                    f"Chainlink feed quiet for {self._reconnect_s:.0f}s; reconnecting"
+                                    f"Chainlink: no messages for {self._reconnect_s:.0f}s "
+                                    f"(including PONGs) — reconnecting"
                                 )
                                 break
+                            # Connected but no price data yet — resubscribe in case the
+                            # server dropped our subscription silently.
+                            with self._lock:
+                                session_has_price = self._last_price_monotonic >= subscribe_sent_at
+                            if not session_has_price and (
+                                now_mono - subscribe_sent_at
+                            ) > _RESUBSCRIBE_NO_DATA_S:
+                                self._logger.warning(
+                                    f"Chainlink: no price data within "
+                                    f"{_RESUBSCRIBE_NO_DATA_S:.0f}s of subscribing "
+                                    f"— resubscribing"
+                                )
+                                await ws.send(_make_subscribe())
+                                subscribe_sent_at = now_mono
                             continue
                     ping_task.cancel()
                     try:
@@ -363,17 +394,33 @@ class ChainlinkFeed:
     # ── Watchdog ──────────────────────────────────────────────────────────
 
     def _watchdog_loop(self) -> None:
-        """Poll feed age and warn if stale."""
+        """Poll feed age and log health. Reconnect is handled by the recv loop and PONG timeout."""
+        last_health_log = 0.0
+        _HEALTH_LOG_INTERVAL_S = 60.0
         while not self._stop_evt.is_set():
             age_ms = self.get_feed_age_ms()
+            now = time.time()
             if age_ms is not None:
                 age_s = age_ms / 1000
                 if age_s > self._reconnect_s:
                     self._logger.warning(
-                        f"Chainlink feed stale ({age_s:.1f}s), will reconnect"
+                        f"Chainlink price data stale ({age_s:.1f}s); "
+                        f"WS may be alive (check PONG timeout)"
                     )
                 elif age_s > self._stale_warn_s:
                     self._logger.debug(
-                        f"Chainlink feed age {age_s:.1f}s (warn threshold)"
+                        f"Chainlink feed age {age_s:.1f}s (normal for deviation-based oracle)"
                     )
+            if now - last_health_log >= _HEALTH_LOG_INTERVAL_S:
+                with self._lock:
+                    slot_ts = self._slot_open.slot_ts if self._slot_open else None
+                    slot_price = self._slot_open.price if self._slot_open else None
+                self._logger.debug(
+                    f"Chainlink health: age={age_ms:.0f}ms "
+                    f"slot={slot_ts} open=${slot_price:,.2f} "
+                    f"reconnects={self.reconnect_count}"
+                    if age_ms is not None and slot_price is not None
+                    else f"Chainlink health: no data yet reconnects={self.reconnect_count}"
+                )
+                last_health_log = now
             self._stop_evt.wait(0.5)

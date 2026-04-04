@@ -38,6 +38,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from src.engine.slot_state import SLOT_INTERVAL_S, SlotContext
 from src.utils.btc_feed import BtcPriceFeed
 from src.utils.chainlink_feed import ChainlinkFeed
 
@@ -81,7 +82,7 @@ def _current_slot_ts(now: Optional[float] = None) -> int:
     """Return the active 5-minute slot timestamp."""
     if now is None:
         now = _server_now()
-    return int(math.floor(now / 300) * 300)
+    return SlotContext.slot_for(now)
 
 
 # ── Chart defaults ────────────────────────────────────────────────────────────
@@ -870,7 +871,7 @@ def _ensure_slot_outcomes(slot_tss: List[int]) -> None:
                 continue
             last = _slot_outcome_retry_ts.get(slot_ts, 0)
             # Recently-closed slot: retry every 10s until resolved
-            retry_s = 10.0 if slot_ts >= current_slot - 300 else _SLOT_OUTCOME_RETRY_S
+            retry_s = 10.0 if slot_ts >= current_slot - SLOT_INTERVAL_S else _SLOT_OUTCOME_RETRY_S
             if now - last < retry_s:
                 continue
             _slot_outcome_retry_ts[slot_ts] = now
@@ -932,10 +933,10 @@ def _build_market_cycle_panel(
     now = _server_now()
     current_slot = _current_slot_ts(now)
     end_ts = (market or {}).get("end_ts")
-    if isinstance(end_ts, (int, float)) and current_slot < end_ts <= current_slot + 300:
+    if isinstance(end_ts, (int, float)) and current_slot < end_ts <= current_slot + SLOT_INTERVAL_S:
         slot_end = float(end_ts)
     else:
-        slot_end = current_slot + 300
+        slot_end = current_slot + SLOT_INTERVAL_S
     remaining = max(0.0, slot_end - now)
 
     slot_str = datetime.fromtimestamp(current_slot, tz=timezone.utc).strftime("%H:%M UTC")
@@ -985,10 +986,6 @@ def _build_market_cycle_panel(
     source_style = "cyan" if price_to_beat is not None else "dim"
     tbl.add_row("Source", Text(price_source, style=source_style))
 
-    # Chainlink feed health
-    # is_connecting() = never received any data (startup or full disconnect)
-    # is_healthy()    = received data within _STALE_WARN_S (90s)
-    # otherwise       = connected & has data but oracle was quiet > 90s (normal during calm markets)
     if cl_healthy:
         tbl.add_row("Chainlink", Text("LIVE", style="bold green"))
     elif chainlink_feed is not None and chainlink_feed.is_connecting():
@@ -1215,7 +1212,7 @@ def _build_slot_history_panel(
     now = _server_now()
     current_slot = _current_slot_ts(now)
 
-    past_slots = [current_slot - 300 * i for i in range(n_slots - 1, -1, -1)]
+    past_slots = [current_slot - SLOT_INTERVAL_S * i for i in range(n_slots - 1, -1, -1)]
 
     # Trigger background fetches (non-blocking)
     _ensure_slot_outcomes(past_slots)
@@ -1238,7 +1235,7 @@ def _build_slot_history_panel(
     tbl = Table(show_header=True, box=None, padding=(0, 0), expand=True)
     tbl.add_column("", width=7, style="dim", no_wrap=True)
     for slot_ts in past_slots:
-        label = datetime.fromtimestamp(slot_ts + 300, tz=timezone.utc).strftime("%H:%M")
+        label = datetime.fromtimestamp(slot_ts + SLOT_INTERVAL_S, tz=timezone.utc).strftime("%H:%M")
         tbl.add_column(label, justify="center", min_width=5, no_wrap=True)
 
     # Build both rows in a single pass
