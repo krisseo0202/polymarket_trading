@@ -33,7 +33,7 @@ from typing import Dict, List, Optional
 sys.path.insert(0, os.path.dirname(__file__))
 
 from src.api.client import PolymarketClient
-from src.engine.cycle_snapshot import BotStatus, CycleSnapshot, SnapshotStore
+from src.engine.cycle_snapshot import BotStatus, CycleSnapshot, SnapshotStore, build_cycle_snapshot
 from src.engine.execution import ExecutionTracker
 from src.engine.inventory import InventoryState
 from src.engine.risk_manager import RiskLimits, RiskManager
@@ -128,115 +128,6 @@ def _compute_unrealized_pnl(
             return None
         total += (mid - inv.avg_cost) * inv.position
     return total if has_position else None
-
-
-def _build_and_save_snapshot(
-    snapshot_store: "SnapshotStore",
-    state: "BotState",
-    market_id: str,
-    question: str,
-    yes_token_id: str,
-    no_token_id: str,
-    strike: Optional[float],
-    btc_now: Optional[float],
-    yes_book,
-    no_book,
-    inventories: Dict[str, "InventoryState"],
-    execution_tracker: "ExecutionTracker",
-    risk_manager: "RiskManager",
-    paper_trading: bool,
-) -> None:
-    """Assemble CycleSnapshot from current cycle state and write atomically."""
-    now = time.time()
-    start_ts = int(math.floor(now / 300) * 300)
-    end_ts = start_ts + 300
-
-    yes_bid = yes_book.bids[0].price if yes_book and yes_book.bids else None
-    yes_ask = yes_book.asks[0].price if yes_book and yes_book.asks else None
-    no_bid  = no_book.bids[0].price  if no_book  and no_book.bids  else None
-    no_ask  = no_book.asks[0].price  if no_book  and no_book.asks  else None
-    yes_mid = (yes_bid + yes_ask) / 2 if yes_bid and yes_ask else (yes_bid or yes_ask)
-    no_mid  = (no_bid  + no_ask)  / 2 if no_bid  and no_ask  else (no_bid  or no_ask)
-
-    pos_dict = {
-        tid: {"size": inv.position, "avg_cost": inv.avg_cost}
-        for tid, inv in inventories.items()
-        if inv.position != 0
-    }
-
-    orders = [
-        {
-            "order_id": o.order_id,
-            "token_id": o.token_id,
-            "outcome": o.outcome,
-            "side": o.side,
-            "price": o.price,
-            "size": o.size,
-            "status": o.status,
-            "filled_qty": o.filled_qty,
-        }
-        for o in execution_tracker.active_orders.values()
-    ]
-
-    has_position = any(inv.position != 0 for inv in inventories.values())
-    cb_active = getattr(risk_manager, "circuit_breaker_active", False)
-    if cb_active:
-        status = BotStatus.COOLDOWN.value
-    elif has_position:
-        status = BotStatus.IN_POSITION.value
-    else:
-        status = BotStatus.EVALUATING.value
-
-    unrealized = _compute_unrealized_pnl(
-        inventories, yes_token_id, no_token_id, yes_book, no_book
-    )
-
-    snap = CycleSnapshot(
-        market_id=market_id,
-        question=question,
-        yes_token_id=yes_token_id,
-        no_token_id=no_token_id,
-        start_ts=start_ts,
-        end_ts=end_ts,
-        tte_seconds=max(0.0, end_ts - now),
-        strike=strike,
-        btc_now=btc_now,
-        yes_bid=yes_bid,
-        yes_ask=yes_ask,
-        yes_mid=yes_mid,
-        no_bid=no_bid,
-        no_ask=no_ask,
-        no_mid=no_mid,
-        positions=pos_dict,
-        active_orders=orders,
-        bot_status=status,
-        daily_realized_pnl=state.daily_realized_pnl,
-        slot_realized_pnl=state.slot_realized_pnl,
-        unrealized_pnl=unrealized,
-        strategy_name=state.strategy_name,
-        strategy_status=state.strategy_status,
-        strategy_prob_yes=state.strategy_prob_yes,
-        strategy_prob_no=state.strategy_prob_no,
-        strategy_edge_yes=state.strategy_edge_yes,
-        strategy_edge_no=state.strategy_edge_no,
-        strategy_net_edge_yes=state.strategy_net_edge_yes,
-        strategy_net_edge_no=state.strategy_net_edge_no,
-        strategy_expected_fill_yes=state.strategy_expected_fill_yes,
-        strategy_expected_fill_no=state.strategy_expected_fill_no,
-        strategy_required_edge=state.strategy_required_edge,
-        strategy_tte_seconds=state.strategy_tte_seconds,
-        strategy_distance_to_break_pct=state.strategy_distance_to_break_pct,
-        strategy_distance_to_strike_bps=state.strategy_distance_to_strike_bps,
-        strategy_model_version=state.strategy_model_version,
-        strategy_feature_status=state.strategy_feature_status,
-        strategy_score_breakdown=state.strategy_score_breakdown,
-        cycle_count=state.cycle_count,
-        paper_trading=paper_trading,
-    )
-    try:
-        snapshot_store.save(snap)
-    except Exception:
-        pass  # never let snapshot write crash the main loop
 
 
 _GAMMA_API = "https://gamma-api.polymarket.com"
@@ -891,16 +782,25 @@ def _make_intra_cycle_fn(
             yes_book, no_book, positions, balance = _fetch_market_data_parallel(
                 client, yes_tid, no_tid,
             )
-            market_data = {
-                "markets": [],
-                "order_books": {yes_tid: yes_book, no_tid: no_book},
-                "positions": positions,
-                "balance": balance,
-                "price_history": {},
-                "question": question,
-                "strike_price": effective_strike,
-                "slot_expiry_ts": slot_expiry_ts,
-            }
+            _btc_now_intra = None
+            if hasattr(strategy, "btc_feed") and strategy.btc_feed:
+                _btc_now_intra = strategy.btc_feed.get_latest_mid()
+            _intra_snap = build_cycle_snapshot(
+                market_id=market_id,
+                question=question,
+                yes_token_id=yes_tid,
+                no_token_id=no_tid,
+                slot_ctx=slot_mgr.get() if slot_mgr else None,
+                btc_now=_btc_now_intra,
+                yes_book=yes_book,
+                no_book=no_book,
+                inventories=inventories,
+                execution_tracker=execution_tracker,
+                risk_manager=risk_manager,
+                state=state,
+                paper_trading=paper_trading,
+            )
+            market_data = _intra_snap.to_market_data(yes_book, no_book, positions, balance)
             signals = strategy.analyze(market_data)
 
             if time_remaining < min_entry_window:
@@ -1704,19 +1604,26 @@ def main() -> None:
                     state_store.save(state)
                     positions = client.get_positions()  # refresh after cleanup
 
-            market_data = {
-                "markets": [],
-                "order_books": {
-                    yes_token_id: yes_book,
-                    no_token_id:  no_book,
-                },
-                "positions": positions,
-                "balance": balance,
-                "price_history": {},
-                "question": current_question,
-                "strike_price": current_strike_price,
-                "slot_expiry_ts": slot_mgr.get().slot_end_ts if slot_mgr.get() else SlotContext.slot_for(time.time()) + SLOT_INTERVAL_S,
-            }
+            # ── Build cycle snapshot — single assembly point ───────────────
+            # Both strategy (via to_market_data) and dashboard (via SnapshotStore)
+            # read from this one object, guaranteeing consistent numbers.
+            _btc_now = btc_feed.get_latest_mid() if btc_feed else None
+            cycle_snap = build_cycle_snapshot(
+                market_id=current_market_id,
+                question=current_question,
+                yes_token_id=yes_token_id,
+                no_token_id=no_token_id,
+                slot_ctx=slot_mgr.get(),
+                btc_now=_btc_now,
+                yes_book=yes_book,
+                no_book=no_book,
+                inventories=inventories,
+                execution_tracker=execution_tracker,
+                risk_manager=risk_manager,
+                state=state,
+                paper_trading=paper_trading,
+            )
+            market_data = cycle_snap.to_market_data(yes_book, no_book, positions, balance)
 
             # ------------------------------------------------------------------
             # Strategy → signals
@@ -1734,8 +1641,7 @@ def main() -> None:
             signals = strategy.analyze(market_data)
 
             # Guard: suppress BUY entries if insufficient time remains in market window
-            _slot_expiry = slot_mgr.get().slot_end_ts if slot_mgr.get() else SlotContext.slot_for(time.time()) + SLOT_INTERVAL_S
-            _time_remaining = _slot_expiry - time.time()
+            _time_remaining = (cycle_snap.slot_end_ts or 0) - time.time()
             _min_entry = getattr(strategy, 'max_hold_seconds', 240)
             if _time_remaining < _min_entry:
                 _original = len(signals)
@@ -1758,25 +1664,16 @@ def main() -> None:
 
             # ------------------------------------------------------------------
             state.cycle_count += 1
-            _snapshot_strategy_state(strategy, state)
+            # Populate strategy telemetry into the snapshot, then save.
+            cycle_snap.update_from_strategy(strategy)
+            cycle_snap.cycle_count = state.cycle_count
+            _snapshot_strategy_state(strategy, state)   # keep BotState in sync for persistence
             _snapshot_chainlink_state(state, chainlink_feed, slot_mgr=slot_mgr)
             state_store.save(state)
-
-            # Write cycle snapshot (single source of truth for dashboard)
-            _btc_now = None
-            if btc_feed is not None:
-                _bk = btc_feed.get_latest_book()
-                if _bk is not None:
-                    _btc_now = _bk.mid
-            _build_and_save_snapshot(
-                snapshot_store, state,
-                current_market_id, current_question,
-                yes_token_id, no_token_id,
-                current_strike_price, _btc_now,
-                yes_book, no_book,
-                inventories, execution_tracker,
-                risk_manager, paper_trading,
-            )
+            try:
+                snapshot_store.save(cycle_snap)
+            except Exception:
+                pass  # never let snapshot write crash the main loop
 
             elapsed = time.monotonic() - cycle_start
             logger.info(
