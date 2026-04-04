@@ -127,9 +127,12 @@ class BtcPriceFeed:
         """Thread-safe snapshot update and rolling buffer append."""
         now = time.time()
         snap = BookSnapshot(bid=bid, ask=ask, mid=mid, exchange_ts=exchange_ts, local_ts=now)
+        # Use exchange timestamp for the buffer when available so feature engineering
+        # windows are aligned to exchange time rather than local receipt time.
+        buf_ts = exchange_ts if exchange_ts is not None else now
         with self._lock:
             self._latest = snap
-            self._buffer.append((now, mid))
+            self._buffer.append((buf_ts, mid))
             cutoff = now - self._buffer_s
             while self._buffer and self._buffer[0][0] < cutoff:
                 self._buffer.popleft()
@@ -208,6 +211,16 @@ class BtcPriceFeed:
                 try:
                     raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
                 except asyncio.TimeoutError:
+                    # No message in this 1s window — check if price data has gone stale.
+                    # Covers the case where the WS connection stays alive (passing library
+                    # pings) but the exchange stops sending ticker updates.
+                    with self._lock:
+                        latest_ts = self._latest.local_ts if self._latest else None
+                    if latest_ts is not None and (time.time() - latest_ts) > self._reconnect_s:
+                        raise ConnectionError(
+                            f"[{self._exchange}] No price data for "
+                            f"{self._reconnect_s:.0f}s — reconnecting"
+                        )
                     continue
 
                 try:
@@ -264,6 +277,13 @@ class BtcPriceFeed:
                 try:
                     raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
                 except asyncio.TimeoutError:
+                    with self._lock:
+                        latest_ts = self._latest.local_ts if self._latest else None
+                    if latest_ts is not None and (time.time() - latest_ts) > self._reconnect_s:
+                        raise ConnectionError(
+                            f"[{self._exchange}] No price data for "
+                            f"{self._reconnect_s:.0f}s — reconnecting"
+                        )
                     continue
 
                 try:
@@ -280,17 +300,29 @@ class BtcPriceFeed:
     # ── Watchdog ──────────────────────────────────────────────────────────
 
     def _watchdog_loop(self) -> None:
-        """Poll feed age and warn/reconnect if stale."""
+        """Poll feed age; log health status. Forced reconnect is handled in the recv loop."""
+        last_health_log = 0.0
+        _HEALTH_LOG_INTERVAL_S = 60.0
         while not self._stop_evt.is_set():
             age_ms = self.get_feed_age_ms()
+            now = time.time()
             if age_ms is not None:
                 age_s = age_ms / 1000
                 if age_s > self._reconnect_s:
                     self._logger.warning(
-                        f"[{self._exchange}] Feed stale ({age_s:.1f}s), will reconnect"
+                        f"[{self._exchange}] Price data stale ({age_s:.1f}s) — "
+                        f"recv loop will reconnect"
                     )
                 elif age_s > self._stale_warn_s:
                     self._logger.debug(
                         f"[{self._exchange}] Feed age {age_s:.1f}s (warn threshold)"
                     )
+            if now - last_health_log >= _HEALTH_LOG_INTERVAL_S:
+                self._logger.debug(
+                    f"[{self._exchange}] health: age={age_ms:.0f}ms "
+                    f"reconnects={self.reconnect_count}"
+                    if age_ms is not None
+                    else f"[{self._exchange}] health: no data yet reconnects={self.reconnect_count}"
+                )
+                last_health_log = now
             self._stop_evt.wait(0.5)

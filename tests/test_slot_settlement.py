@@ -9,7 +9,10 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from bot import _settle_expiring_positions, _fetch_slot_outcome
+from src.engine.slot_state import (
+    settle_expiring_positions as _settle_expiring_positions,
+    fetch_slot_outcome as _fetch_slot_outcome,
+)
 from src.engine.inventory import InventoryState
 from src.engine.state_store import BotState
 

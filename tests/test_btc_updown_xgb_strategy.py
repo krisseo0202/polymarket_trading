@@ -1,7 +1,7 @@
 import logging
 import time
 
-from bot import _execute_signals
+from src.engine.cycle_runner import execute_signals as _execute_signals
 from src.api.client import PolymarketClient
 from src.api.types import OrderBook, OrderBookEntry, Position
 from src.engine.inventory import InventoryState

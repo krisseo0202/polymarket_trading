@@ -28,6 +28,7 @@ class ExecutionTracker:
         self.active_orders: Dict[str, Order] = {}
         self.closed_orders: Dict[str, Order] = {}
         self.inferred_fills: List[Fill] = []
+        self.realized_pnl_from_fills: float = 0.0  # computed before snapshot overwrite
         self._fills_by_order_id: Dict[str, List[Fill]] = {}
         self._last_positions_by_token: Dict[str, Tuple[float, float]] = {}
         self._orders_sync_interval_s = orders_sync_interval_s
@@ -146,6 +147,7 @@ class ExecutionTracker:
         token_list = list(token_ids)
         closed_orders: List[Order] = []
         self.inferred_fills = []
+        self.realized_pnl_from_fills = 0.0
 
         if not token_list:
             return closed_orders
@@ -199,6 +201,12 @@ class ExecutionTracker:
             if closed_orders:
                 self._resolve_closed_orders(closed_orders, deltas)
                 self.inferred_fills = self._build_inferred_fills(closed_orders)
+                # Compute PnL using pre-snapshot inventory (avg_cost is still correct here).
+                # Must run BEFORE _apply_positions_snapshot overwrites inv.avg_cost/position.
+                if inventories:
+                    self.realized_pnl_from_fills = self._compute_realized_pnl(
+                        self.inferred_fills, inventories
+                    )
 
             if inventories is not None and positions_ok:
                 self._apply_positions_snapshot(token_list, positions_by_token, inventories)
@@ -298,6 +306,27 @@ class ExecutionTracker:
 
             for order in orders:
                 self._finalize_order_state(order)
+
+    def _compute_realized_pnl(
+        self, fills: List[Fill], inventories: Dict[str, InventoryState]
+    ) -> float:
+        """Compute realized PnL from fills using the current (pre-snapshot) inventory.
+
+        Must be called BEFORE _apply_positions_snapshot() overwrites avg_cost/position.
+        Mirrors the avg-cost accounting in InventoryState.apply_fill() without mutating state.
+        """
+        realized = 0.0
+        for fill in fills:
+            inv = inventories.get(fill.token_id)
+            if inv is None or inv.position == 0:
+                continue
+            if fill.side == "SELL" and inv.position > 0:
+                closing = min(fill.size, inv.position)
+                realized += (fill.price - inv.avg_cost) * closing
+            elif fill.side == "BUY" and inv.position < 0:
+                closing = min(fill.size, abs(inv.position))
+                realized += (inv.avg_cost - fill.price) * closing
+        return realized
 
     def _build_inferred_fills(self, closed_orders: List[Order]) -> List[Fill]:
         inferred: List[Fill] = []

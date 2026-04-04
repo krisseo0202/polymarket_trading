@@ -69,6 +69,13 @@ class CycleSnapshot:
     no_ask: Optional[float] = None
     no_mid: Optional[float] = None
 
+    # ── Order book depth (top 5 levels) — for dashboard display ──────────────
+    # Each entry: {"price": float, "size": float}
+    yes_bids: List[Dict[str, float]] = field(default_factory=list)
+    yes_asks: List[Dict[str, float]] = field(default_factory=list)
+    no_bids: List[Dict[str, float]] = field(default_factory=list)
+    no_asks: List[Dict[str, float]] = field(default_factory=list)
+
     # ── Positions: token_id → {"size": float, "avg_cost": float} ─────────────
     positions: Dict[str, Dict[str, float]] = field(default_factory=dict)
 
@@ -77,6 +84,7 @@ class CycleSnapshot:
 
     # ── Bot operational status ────────────────────────────────────────────────
     bot_status: str = BotStatus.INIT.value
+    held_side: str = "FLAT"    # "YES" | "NO" | "FLAT"
 
     # ── PnL ───────────────────────────────────────────────────────────────────
     daily_realized_pnl: float = 0.0
@@ -232,12 +240,30 @@ def build_cycle_snapshot(
     yes_mid = (yes_bid + yes_ask) / 2 if yes_bid and yes_ask else (yes_bid or yes_ask)
     no_mid  = (no_bid  + no_ask)  / 2 if no_bid  and no_ask  else (no_bid  or no_ask)
 
+    # ── Order book depth (top 5 levels) ───────────────────────────────────────
+    _OB_DEPTH = 5
+
+    def _levels(book, side: str):
+        levels = getattr(book, side, []) if book else []
+        return [
+            {"price": float(lvl.price), "size": float(lvl.size)}
+            for lvl in levels[:_OB_DEPTH]
+        ]
+
+    yes_bids_depth = _levels(yes_book, "bids")
+    yes_asks_depth = _levels(yes_book, "asks")
+    no_bids_depth  = _levels(no_book,  "bids")
+    no_asks_depth  = _levels(no_book,  "asks")
+
     # ── Positions ──────────────────────────────────────────────────────────────
     pos_dict: Dict[str, Dict[str, float]] = {
         tid: {"size": inv.position, "avg_cost": inv.avg_cost}
         for tid, inv in inventories.items()
         if inv.position != 0
     }
+
+    # ── Resolved slot outcome (written at rollover) ───────────────────────────
+    slot_outcome: Optional[str] = None   # "Up" | "Down" | None (current slot unresolved)
 
     # ── Active orders ──────────────────────────────────────────────────────────
     orders = [
@@ -263,6 +289,16 @@ def build_cycle_snapshot(
         bot_status = BotStatus.IN_POSITION.value
     else:
         bot_status = BotStatus.EVALUATING.value
+
+    # ── Held side (YES / NO / FLAT) ────────────────────────────────────────────
+    yes_inv = inventories.get(yes_token_id)
+    no_inv = inventories.get(no_token_id)
+    if yes_inv and yes_inv.position > 0:
+        held_side = "YES"
+    elif no_inv and no_inv.position > 0:
+        held_side = "NO"
+    else:
+        held_side = "FLAT"
 
     # ── Unrealized PnL ────────────────────────────────────────────────────────
     from ..utils.market_utils import get_mid_price  # local import to avoid circular dep
@@ -299,9 +335,14 @@ def build_cycle_snapshot(
         no_bid=no_bid,
         no_ask=no_ask,
         no_mid=no_mid,
+        yes_bids=yes_bids_depth,
+        yes_asks=yes_asks_depth,
+        no_bids=no_bids_depth,
+        no_asks=no_asks_depth,
         positions=pos_dict,
         active_orders=orders,
         bot_status=bot_status,
+        held_side=held_side,
         daily_realized_pnl=state.daily_realized_pnl,
         slot_realized_pnl=state.slot_realized_pnl,
         unrealized_pnl=unrealized,

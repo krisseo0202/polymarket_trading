@@ -114,14 +114,10 @@ strategies:
     min_confidence: 0.55
 
 risk:
-  max_position_size: 200.0        # max shares per position
   max_position_pct: 0.05          # 5% of balance per position
-  max_total_exposure: 1.0         # allow full balance in open positions (guarded by session loss cap)
-  max_daily_loss: 0.05            # 5% of balance daily loss cap
-  max_exposure_per_market: 0.50   # 50% of balance on one market
-  circuit_breaker_enabled: true
-  circuit_breaker_threshold: 0.20
-  max_session_loss_usdc: 5.0   # absolute session loss cap; bot shuts down when reached
+  max_position_size: 200          # hard cap on shares per position
+  max_total_exposure: 1.0         # total open notional as fraction of balance
+  max_session_loss_usdc: 5.0      # absolute session loss cap; bot shuts down when reached
 
 chainlink_feed:
   enabled: true

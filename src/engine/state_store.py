@@ -2,6 +2,7 @@
 
 import json
 import os
+import time
 from dataclasses import dataclass, field, asdict
 from datetime import date
 from typing import Dict, List, Optional
@@ -56,6 +57,10 @@ class BotState:
     # Trade history — last 20 fills, newest last
     # Each entry: {"ts": float, "action": str, "outcome": str, "price": float, "size": float}
     trade_log: List[Dict] = field(default_factory=list)
+
+    # Resolved slot outcomes — keyed by slot_ts (int), value "Up" or "Down"
+    # Written at rollover so the dashboard never needs to call Gamma API.
+    slot_outcomes: Dict[int, str] = field(default_factory=dict)
 
     def __post_init__(self):
         if not self.daily_reset_date:
@@ -133,3 +138,76 @@ class StateStore:
             f.flush()
             os.fsync(f.fileno())
         os.replace(self._tmp_path, self.path)
+
+
+def snapshot_strategy_state(strategy, state: BotState) -> None:
+    """Write strategy internal state into BotState fields for dashboard visibility."""
+    state.strategy_name = getattr(strategy, "name", "")
+    active_tid = getattr(strategy, "active_token_id", None)
+    state.strategy_status = "POSITION_OPEN" if active_tid else "WATCHING"
+
+    bias_obj = getattr(strategy, "current_bias", None)
+    state.strategy_bias = bias_obj.value if bias_obj is not None else ""
+
+    yes_tid = getattr(strategy, "_yes_token_id", None)
+    lookback_fn = getattr(strategy, "_lookback_mid", None)
+    price_history = getattr(strategy, "_price_history", {})
+    if yes_tid and lookback_fn and yes_tid in price_history:
+        now_mono = time.monotonic()
+        window = getattr(strategy, "confirmation_window_seconds", 60)
+        hist = price_history.get(yes_tid, [])
+        mid_now = hist[-1][1] if hist else None
+        mid_prev = lookback_fn(yes_tid, now_mono, window)
+        if mid_now and mid_prev and mid_prev > 0:
+            state.strategy_momentum_pct = (mid_now - mid_prev) / mid_prev
+        else:
+            state.strategy_momentum_pct = None
+    else:
+        state.strategy_momentum_pct = None
+
+    compute_z = getattr(strategy, "_compute_zscore", None)
+    if compute_z and yes_tid:
+        try:
+            state.strategy_zscore = compute_z(yes_tid, time.monotonic())
+        except Exception:
+            state.strategy_zscore = None
+    else:
+        state.strategy_zscore = None
+
+    state.strategy_prob_yes = getattr(strategy, "last_prob_yes", None)
+    state.strategy_prob_no = getattr(strategy, "last_prob_no", None)
+    state.strategy_edge_yes = getattr(strategy, "last_edge_yes", None)
+    state.strategy_edge_no = getattr(strategy, "last_edge_no", None)
+    state.strategy_net_edge_yes = getattr(strategy, "last_net_edge_yes", None)
+    state.strategy_net_edge_no = getattr(strategy, "last_net_edge_no", None)
+    state.strategy_expected_fill_yes = getattr(strategy, "last_expected_fill_yes", None)
+    state.strategy_expected_fill_no = getattr(strategy, "last_expected_fill_no", None)
+    state.strategy_tte_seconds = getattr(strategy, "last_tte_seconds", None)
+    state.strategy_distance_to_break_pct = getattr(strategy, "last_distance_to_break_pct", None)
+    state.strategy_distance_to_strike_bps = getattr(strategy, "last_distance_to_strike_bps", None)
+    state.strategy_model_version = getattr(strategy, "last_model_version", "")
+    state.strategy_feature_status = getattr(strategy, "last_feature_status", "")
+    state.strategy_score_breakdown = getattr(strategy, "last_score_breakdown", None)
+    state.strategy_required_edge = getattr(strategy, "last_required_edge", None)
+
+
+def snapshot_chainlink_state(
+    state: BotState,
+    chainlink_feed,
+    slot_mgr=None,
+) -> None:
+    """Persist the latest Chainlink slot-open snapshot for dashboard recovery."""
+    if slot_mgr is not None:
+        slot_mgr.sync_to_bot_state(state)
+    elif chainlink_feed is not None:
+        slot_open = chainlink_feed.get_slot_open_price()
+        if slot_open is not None:
+            state.chainlink_ref_price = slot_open.price
+            state.chainlink_ref_slot_ts = slot_open.slot_ts
+        else:
+            state.chainlink_ref_price = None
+            state.chainlink_ref_slot_ts = None
+    else:
+        state.chainlink_ref_price = None
+        state.chainlink_ref_slot_ts = None
+    state.chainlink_healthy = chainlink_feed.is_healthy() if chainlink_feed else False

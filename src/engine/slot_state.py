@@ -2,11 +2,22 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import math
 import threading
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Dict, Optional, TYPE_CHECKING
+
+import requests
+
+if TYPE_CHECKING:
+    from .inventory import InventoryState
+    from .state_store import BotState
+    from .risk_manager import RiskManager
+
+_GAMMA_API = "https://gamma-api.polymarket.com"
 
 SLOT_INTERVAL_S: int = 300
 
@@ -45,8 +56,13 @@ class SlotStateManager:
     the class trivially testable with a fixed time substitute.
     """
 
-    def __init__(self, clock_fn=time.time):
+    def __init__(
+        self,
+        clock_fn=time.time,
+        logger: Optional[logging.Logger] = None,
+    ):
         self._clock = clock_fn
+        self._logger = logger or logging.getLogger("slot_state")
         self._lock = threading.Lock()
         self._ctx: Optional[SlotContext] = None
 
@@ -102,10 +118,16 @@ class SlotStateManager:
     ) -> SlotContext:
         """
         Pull strike and ref price from ChainlinkFeed; fall back to regex parse.
-        Replaces the bot.py:1157-1171 strike-resolution block.
+
+        Validates that the slot-open price belongs to the *current* slot before
+        using it. A slot mismatch (e.g. after a feed reconnect mid-slot) triggers
+        a fallback to regex parsing and a warning log.
         """
         if parse_strike_fn is None:
             from src.models import parse_strike_price as parse_strike_fn  # type: ignore[assignment]
+
+        t = now if now is not None else self._clock()
+        current_slot_ts = SlotContext.slot_for(t)
 
         strike: Optional[float] = None
         source = "unknown"
@@ -118,23 +140,38 @@ class SlotStateManager:
 
             slot_open = chainlink_feed.get_slot_open_price()
             if slot_open is not None:
-                strike = slot_open.price
-                source = "chainlink"
+                if slot_open.slot_ts == current_slot_ts:
+                    strike = slot_open.price
+                    source = "chainlink"
+                else:
+                    # Feed has a price but it's from a different slot — stale or reconnected.
+                    age_slots = (current_slot_ts - slot_open.slot_ts) // SLOT_INTERVAL_S
+                    self._logger.warning(
+                        f"Chainlink slot_open ({slot_open.slot_ts}) is {age_slots} slot(s) "
+                        f"behind current ({current_slot_ts}); falling back to regex"
+                    )
 
         if strike is None and fallback_question:
             parsed = parse_strike_fn(fallback_question)
             if parsed is not None:
                 strike = parsed
                 source = "regex"
+                self._logger.debug(
+                    f"Strike resolved via regex: ${strike:,.2f} "
+                    f"(Chainlink {'stale' if chainlink_feed else 'disabled'})"
+                )
+
+        if strike is None:
+            self._logger.debug("Strike price unavailable (no Chainlink and no regex match)")
 
         return self.update(
             strike_price=strike,
             strike_source=source,
             btc_ref_price=btc_ref,
-            now=now,
+            now=t,
         )
 
-    def sync_to_bot_state(self, state) -> None:
+    def sync_to_bot_state(self, state) -> None:  # type: ignore[override]
         """
         Write current slot's Chainlink fields into BotState for persistence.
         Replaces _snapshot_chainlink_state in bot.py (except chainlink_healthy,
@@ -151,3 +188,93 @@ class SlotStateManager:
         else:
             state.chainlink_ref_price = None
             state.chainlink_ref_slot_ts = None
+
+
+def fetch_slot_outcome(slot_ts: int, logger) -> Optional[str]:
+    """
+    Query Gamma API for the resolution outcome of a specific 5-min slot.
+    Returns "Up", "Down", or None (unresolved / API error).
+    """
+    slug = f"btc-updown-5m-{slot_ts}"
+    try:
+        resp = requests.get(
+            f"{_GAMMA_API}/events",
+            params={"slug": slug},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        events = resp.json()
+        if not events:
+            return None
+        market = (events[0].get("markets") or [{}])[0]
+        closed = market.get("closed", False)
+        raw = market.get("outcomePrices", "")
+        outcome_prices: list = json.loads(raw) if isinstance(raw, str) else (raw or [])
+        if not closed or len(outcome_prices) < 2:
+            return None
+        if float(outcome_prices[0]) > 0.9:
+            return "Up"
+        if float(outcome_prices[1]) > 0.9:
+            return "Down"
+        return None
+    except Exception as exc:
+        logger.warning(f"Gamma API error fetching outcome for slot {slot_ts}: {exc}")
+        return None
+
+
+def settle_expiring_positions(
+    yes_token_id: str,
+    no_token_id: str,
+    slot_ts: int,
+    inventories: "Dict[str, InventoryState]",
+    state: "BotState",
+    risk_manager: "RiskManager",
+    paper_trading: bool,
+    logger,
+) -> Optional[str]:
+    """
+    Apply synthetic settlement SELLs for open positions in an expired slot.
+
+    Called at market rollover BEFORE resetting slot_realized_pnl.
+    """
+    from .inventory import apply_fill_to_state  # local import avoids circular at module level
+
+    positions_to_settle = [(yes_token_id, "YES"), (no_token_id, "NO")]
+    has_open = any(
+        inventories.get(tid) is not None and inventories[tid].position > 0
+        for tid, _ in positions_to_settle
+    )
+    if not has_open:
+        return None
+
+    outcome = fetch_slot_outcome(slot_ts, logger)
+    if outcome is None:
+        logger.warning(
+            f"Cannot settle slot {slot_ts}: outcome not yet available "
+            "(market may still be resolving — positions left open)"
+        )
+        return None
+
+    settlement = {
+        "YES": 0.99 if outcome == "Up" else 0.01,
+        "NO":  0.99 if outcome == "Down" else 0.01,
+    }
+
+    for token_id, side in positions_to_settle:
+        inv = inventories.get(token_id)
+        if inv is None or inv.position <= 0:
+            continue
+        price = settlement[side]
+        size = inv.position
+        realized = apply_fill_to_state(inv, "SELL", price, size, state, risk_manager)
+        if realized > 0:
+            state.session_wins += 1
+        elif realized < 0:
+            state.session_losses += 1
+        label = "paper" if paper_trading else "live"
+        logger.info(
+            f"[{label}] Settlement SELL: {side} {token_id[:8]} "
+            f"{size:.2f}sh @ {price:.2f} → realized {realized:+.4f} "
+            f"(slot outcome: {outcome})"
+        )
+    return outcome
