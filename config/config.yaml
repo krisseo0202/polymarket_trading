@@ -5,6 +5,7 @@ api:
 trading:
   paper_trading: true   # flip to false for live trading
   interval: 300         # 5-minute cycles (seconds)
+  exit_rule: default    # "default" (strategy-defined) or "hold_to_expiry" (settle at resolution)
 
 btc_updown_bot:
   market_keywords: ["Bitcoin", "Up or Down"]  # title must contain all of these (case-insensitive)
@@ -95,6 +96,28 @@ strategies:
     re_entry_edge_mult: 1.5      # 2nd+ entry requires 1.5× the normal edge threshold
     re_entry_size_mult: 0.5      # 2nd+ entry uses 50% Kelly size (correlation haircut)
     slot_loss_limit_usdc: 15.0   # halt slot trading if cumulative loss exceeds this
+
+  logreg_edge:
+    # Logistic regression edge strategy — hold to expiry.
+    # Entry: buy when model disagrees with market by > delta + half-spread.
+    # Exit: hold to binary resolution.
+    enabled: true
+    btc_symbol: "BTC-USD"
+    btc_exchange: "coinbase"
+    model_dir: "models/logreg"   # directory with logreg_model.pkl, logreg_scaler.pkl
+
+    # Entry filters
+    delta: 0.05                  # minimum margin of safety beyond cost
+    max_spread_pct: 0.06         # reject if spread > 6% of mid
+    min_seconds_to_expiry: 20    # don't enter with < 20s left
+    max_seconds_to_expiry: 280   # don't enter at very start of slot
+
+    # Kelly sizing
+    kelly_fraction: 0.15         # fractional Kelly multiplier
+    position_size_usdc: 30.0     # hard cap per trade
+
+    # Confidence gate
+    min_confidence: 0.51
 
   btc_vol_reversion:
     enabled: true

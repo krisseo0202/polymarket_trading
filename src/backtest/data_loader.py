@@ -1,6 +1,7 @@
 """Historical data loading for backtesting"""
 
 import os
+import time
 from typing import List, Dict, Optional
 from datetime import datetime, timedelta
 import pandas as pd
@@ -9,38 +10,24 @@ from ..api.types import MarketData, OrderBook, OrderBookEntry
 
 
 EVENT_URL = "https://gamma-api.polymarket.com/events"
+COINBASE_URL = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
 
-# Default path relative to project root
-_DEFAULT_HISTORY_CSV = os.path.join(
-    os.path.dirname(__file__), "..", "..", "data", "btc_updown_5m.csv"
-)
+# Default paths relative to project root
+_DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "data")
+_DEFAULT_HISTORY_CSV = os.path.join(_DATA_DIR, "btc_updown_5m.csv")
+_DEFAULT_BTC_1M_CACHE = os.path.join(_DATA_DIR, "btc_1m_cache.csv")
 
 
 class DataLoader:
-    """
-    Load historical market data for backtesting
-    
-    In a real implementation, this would fetch data from:
-    - Polymarket API historical endpoints
-    - External data providers
-    - Local database/cache
-    """
-    
+    """Load historical market data for backtesting."""
+
     def __init__(self, data_source: str = "mock"):
         """
-        Initialize data loader
-        
         Args:
-            data_source: Source of data ("mock", "api", "file")
+            data_source: "mock" for synthetic data, "file" for CSV-based real data
         """
         self.data_source = data_source
-    
-    def filter_markets(self, tag: str) -> List[MarketData]:
-        """
-        Filter markets by tag
-        """
-        return self.client.get_markets(tag=tag)
-    
+
     def load_market_data(
         self,
         token_id: str,
@@ -49,34 +36,127 @@ class DataLoader:
         interval: str = "1h"
     ) -> pd.DataFrame:
         """
-        Load historical market data
-        
+        Load historical market data.
+
         Args:
             token_id: Event Token ID to load
             start_date: Start date ('YYYY-MM-DD')
             end_date: End date ('YYYY-MM-DD')
             interval: Data interval  ("1m", "1h", "6h", "1d", "1w", "max")
-            
+
         Returns:
             DataFrame with columns: timestamp, price_yes, price_no, volume
         """
         if self.data_source == "mock":
             return self._generate_mock_data(start_date, end_date, interval)
-        
-        params = {"market": token_id, 'interval': interval}
-        
-        url = "https://clob.polymarket.com/prices-history"
-        response = requests.get(url, params=params)
-        data = response.json()
-        if not data.get('history'):
-            return pd.DataFrame()
-        # data = response.json()
 
-        raise NotImplementedError("load_market_data: Only 'mock' data source is implemented.")
-        return data
-    
-   
-    
+        if self.data_source == "file":
+            return self._load_from_csv(start_date, end_date)
+
+        # Fallback: try CLOB prices-history (sparse, not useful for intra-window)
+        params = {"market": token_id, "interval": interval}
+        url = "https://clob.polymarket.com/prices-history"
+        response = requests.get(url, params=params, timeout=15)
+        data = response.json()
+        if not data.get("history"):
+            return pd.DataFrame()
+
+        history = data["history"]
+        df = pd.DataFrame(history)
+        df["timestamp"] = pd.to_datetime(df["t"].astype(int), unit="s", utc=True)
+        df["price_yes"] = df["p"].astype(float)
+        df["price_no"] = 1.0 - df["price_yes"]
+        df["volume"] = 0.0
+        return df[["timestamp", "price_yes", "price_no", "volume"]]
+
+    def _load_from_csv(self, start_date: str, end_date: str) -> pd.DataFrame:
+        """Load signal backtest data by joining slot outcomes with BTC 1m candles.
+
+        Returns one row per resolved slot with BTC OHLC context and outcome.
+        This is used by the backtester for signal-only evaluation.
+        """
+        slots = self.load_btc_updown_history()
+        slots = slots.dropna(subset=["outcome"])
+        slots = slots[slots["outcome"].isin(["Up", "Down"])].copy()
+
+        start = pd.Timestamp(start_date, tz="UTC")
+        end = pd.Timestamp(end_date, tz="UTC")
+        slots = slots[(slots["slot_utc"] >= start) & (slots["slot_utc"] <= end)]
+
+        if slots.empty:
+            return pd.DataFrame()
+
+        up_won = slots["outcome"] == "Up"
+        return pd.DataFrame({
+            "timestamp": slots["slot_utc"].values,
+            "slot_ts": slots["slot_ts"].astype(int).values,
+            "price_yes": up_won.astype(float).values,
+            "price_no": (~up_won).astype(float).values,
+            "volume": slots["volume"].fillna(0.0).values,
+            "outcome": slots["outcome"].values,
+        })
+
+    def load_btc_1m_candles(
+        self, start_ts: int, end_ts: int, use_cache: bool = True
+    ) -> pd.DataFrame:
+        """Load BTC 1-minute candles, fetching from Coinbase if not cached.
+
+        Args:
+            start_ts: Start unix timestamp
+            end_ts: End unix timestamp
+            use_cache: If True, try loading from btc_1m_cache.csv first
+
+        Returns:
+            DataFrame with DatetimeIndex (UTC) and columns: open, high, low, close
+        """
+        if use_cache and os.path.exists(_DEFAULT_BTC_1M_CACHE):
+            df = pd.read_csv(_DEFAULT_BTC_1M_CACHE, index_col=0, parse_dates=True)
+            df.index = pd.to_datetime(df.index, utc=True)
+            t_start = pd.Timestamp(start_ts, unit="s", tz="UTC")
+            t_end = pd.Timestamp(end_ts, unit="s", tz="UTC")
+            subset = df[(df.index >= t_start) & (df.index <= t_end)]
+            if not subset.empty:
+                return subset
+
+        return self._fetch_coinbase_1m(start_ts, end_ts)
+
+    @staticmethod
+    def _fetch_coinbase_1m(start_ts: int, end_ts: int) -> pd.DataFrame:
+        """Fetch 1-minute candles from Coinbase Exchange API."""
+        from datetime import timezone
+        CHUNK_SEC = 300 * 60  # 300 bars max per request
+        chunks = []
+        cursor = start_ts
+        while cursor < end_ts:
+            chunk_end = min(cursor + CHUNK_SEC, end_ts)
+            start_iso = datetime.fromtimestamp(cursor, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            end_iso = datetime.fromtimestamp(chunk_end, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            try:
+                r = requests.get(
+                    COINBASE_URL,
+                    params={"granularity": 60, "start": start_iso, "end": end_iso},
+                    timeout=15,
+                )
+                r.raise_for_status()
+                raw = r.json()
+                if raw:
+                    df = pd.DataFrame(raw, columns=["timestamp", "low", "high", "open", "close", "volume"])
+                    df.sort_values("timestamp", inplace=True)
+                    df.index = pd.to_datetime(df["timestamp"], unit="s", utc=True)
+                    for c in ("open", "high", "low", "close"):
+                        df[c] = df[c].astype(float)
+                    chunks.append(df[["open", "high", "low", "close"]])
+            except requests.RequestException:
+                pass
+            cursor = chunk_end
+            if cursor < end_ts:
+                time.sleep(0.35)
+
+        if not chunks:
+            return pd.DataFrame(columns=["open", "high", "low", "close"])
+        combined = pd.concat(chunks).sort_index()
+        return combined[~combined.index.duplicated(keep="last")]
+
     def load_btc_updown_history(
         self, csv_path: Optional[str] = None
     ) -> pd.DataFrame:

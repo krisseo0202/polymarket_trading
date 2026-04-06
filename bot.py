@@ -283,13 +283,16 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description="Polymarket trading bot")
     parser.add_argument("--strategy", choices=[
-        "btc_updown", "btc_updown_xgb", "btc_vol_reversion", "coin_toss", "prob_edge", "td_rsi"
+        "btc_updown", "btc_updown_xgb", "btc_vol_reversion", "coin_toss",
+        "logreg_edge", "prob_edge", "td_rsi",
     ], default=None)
     parser.add_argument("--paper", action="store_true", default=False)
     parser.add_argument("--live", action="store_true", default=False)
     parser.add_argument("--no-confirm", action="store_true", default=False)
     parser.add_argument("--clean", action="store_true", default=False,
                         help="Start a clean session: clear trade logs and reset bot state")
+    parser.add_argument("--exit-rule", choices=["default", "hold_to_expiry"],
+                        default=None, help="Exit strategy: default (strategy-defined) or hold_to_expiry")
     args = parser.parse_args()
 
     svc = init_services(args)
