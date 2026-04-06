@@ -1053,6 +1053,20 @@ def _build_strategy_panel(
         status_style = "dim"
     tbl.add_row("Status", Text(status, style=status_style))
 
+    skip_reason = _pick("strategy_skip_reason", "")
+    if skip_reason and status == "WATCHING":
+        if skip_reason.startswith("edge_low"):
+            skip_style = "yellow"
+        elif skip_reason.startswith("spread_wide"):
+            skip_style = "bold red"
+        elif skip_reason.startswith("tte"):
+            skip_style = "cyan"
+        elif skip_reason in ("in_position", "no_prediction", "model_not_ready"):
+            skip_style = "dim"
+        else:
+            skip_style = "cyan"
+        tbl.add_row("Skip", Text(skip_reason[:50], style=skip_style))
+
     bias = _pick("strategy_bias", "")
     if bias:
         bias_style = "bold green" if bias == "LONG" else ("bold red" if bias == "SHORT" else "dim")

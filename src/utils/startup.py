@@ -17,10 +17,12 @@ from ..engine.risk_manager import RiskLimits, RiskManager
 from ..engine.slot_state import SLOT_INTERVAL_S, SlotStateManager
 from ..engine.state_store import BotState, StateStore
 from ..models import BTCSigmoidModel
+from ..models.logreg_model import LogRegModel
 from ..strategies.btc_updown import BTCUpDownStrategy
 from ..strategies.btc_updown_xgb import BTCUpDownXGBStrategy
 from ..strategies.btc_vol_reversion import BTCVolatilityReversionStrategy
 from ..strategies.coin_toss import CoinTossStrategy
+from ..strategies.logreg_edge import LogRegEdgeStrategy
 from ..strategies.prob_edge import ProbEdgeStrategy
 from ..strategies.td_rsi import TDRSIStrategy
 from ..utils.btc_feed import BtcPriceFeed
@@ -29,7 +31,7 @@ from ..utils.config import load_config
 from ..utils.logger import setup_logger
 from ..utils.market_utils import get_server_time
 
-STRATEGIES = ["btc_updown", "btc_updown_xgb", "btc_vol_reversion", "coin_toss", "prob_edge", "td_rsi"]
+STRATEGIES = ["btc_updown", "btc_updown_xgb", "btc_vol_reversion", "coin_toss", "logreg_edge", "prob_edge", "td_rsi"]
 
 
 @dataclass
@@ -90,6 +92,11 @@ def init_services(args) -> Services:
         strategy_name = args.strategy or "btc_updown_xgb"
 
     strategy_cfg: dict = cfg.strategies.get(strategy_name, {})
+
+    # CLI --exit-rule overrides config
+    exit_rule = getattr(args, "exit_rule", None)
+    if exit_rule:
+        strategy_cfg["exit_rule"] = exit_rule
 
     if not getattr(args, "no_confirm", False) and sys.stdin.isatty():
         strategy_cfg = display_and_confirm_config(
@@ -169,6 +176,22 @@ def init_services(args) -> Services:
             logger=logger,
         ).start()
         strategy = BTCUpDownXGBStrategy(config=strategy_cfg, btc_feed=btc_feed, logger=logger)
+    elif strategy_name == "logreg_edge":
+        btc_feed = BtcPriceFeed(
+            symbol=str(strategy_cfg.get("btc_symbol", "BTC-USD")),
+            exchange=str(strategy_cfg.get("btc_exchange", "coinbase")),
+            logger=logger,
+        ).start()
+        model_dir = str(strategy_cfg.get("model_dir", "models/logreg"))
+        logreg_model = LogRegModel.load(model_dir, logger=logger)
+        if not logreg_model.ready:
+            logger.warning("LogReg model not found at %s — strategy will skip all trades until a model is trained", model_dir)
+        strategy = LogRegEdgeStrategy(
+            config=strategy_cfg,
+            btc_feed=btc_feed,
+            model_service=logreg_model,
+            logger=logger,
+        )
     elif strategy_name == "prob_edge":
         btc_feed = BtcPriceFeed(
             symbol=str(strategy_cfg.get("btc_symbol", "BTC-USD")),

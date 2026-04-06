@@ -216,6 +216,8 @@ class BTCUpDownXGBStrategy(Strategy):
         now_mono: float,
         prediction,
     ) -> Optional[Signal]:
+        if self.exit_rule == "hold_to_expiry":
+            return None
         if self.active_token_id is None or self.entry_price is None:
             return None
 

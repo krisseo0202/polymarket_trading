@@ -103,6 +103,7 @@ class ProbEdgeStrategy(Strategy):
         if not self._yes_token_id or not self._no_token_id:
             return []
 
+        self.last_skip_reason = ""
         order_books: Dict[str, OrderBook] = market_data.get("order_books", {})
         positions: List[Position] = market_data.get("positions", [])
         by_token: Dict[str, Position] = {p.token_id: p for p in positions}
@@ -136,6 +137,7 @@ class ProbEdgeStrategy(Strategy):
             return [exit_sig]
 
         if self.active_token_id is not None:
+            self.last_skip_reason = "in_position"
             return []
 
         return self._check_entry(
@@ -249,20 +251,24 @@ class ProbEdgeStrategy(Strategy):
         balance: float,
     ) -> List[Signal]:
         if prediction is None or prediction.prob_yes is None or prediction.prob_no is None:
+            self.last_skip_reason = "no_prediction"
             return []
 
         # ── Re-entry guards ────────────────────────────────────────────────────
         is_reentry = self._slot_trade_count > 0
         if is_reentry:
             if not self.allow_reentry:
+                self.last_skip_reason = "reentry_blocked"
                 return []
             if self._slot_trade_count >= self.max_trades_per_slot:
+                self.last_skip_reason = f"slot_trade_cap: {self._slot_trade_count}/{self.max_trades_per_slot}"
                 self.logger.debug(
                     "prob_edge: slot trade cap reached (%d/%d), skipping entry",
                     self._slot_trade_count, self.max_trades_per_slot,
                 )
                 return []
             if self._slot_realized_pnl < -self.slot_loss_limit_usdc:
+                self.last_skip_reason = f"slot_loss_cap: pnl=${self._slot_realized_pnl:.2f}"
                 self.logger.debug(
                     "prob_edge: slot loss cap hit (pnl=%.2f), skipping entry",
                     self._slot_realized_pnl,
@@ -273,11 +279,13 @@ class ProbEdgeStrategy(Strategy):
         tte = max(0.0, slot_expiry_ts - now_wall)
         self.last_tte_seconds = tte
         if tte < self.min_seconds_to_expiry or tte > self.max_seconds_to_expiry:
+            self.last_skip_reason = f"tte: {tte:.0f}s (range {self.min_seconds_to_expiry:.0f}-{self.max_seconds_to_expiry:.0f})"
             return []
 
         yes_book = order_books.get(self._yes_token_id)
         no_book = order_books.get(self._no_token_id)
         if yes_book is None or no_book is None:
+            self.last_skip_reason = "missing_orderbook"
             return []
 
         yes_bid = float(yes_book.bids[0].price) if yes_book.bids else 0.0
@@ -286,6 +294,7 @@ class ProbEdgeStrategy(Strategy):
         no_ask  = float(no_book.asks[0].price)  if no_book.asks  else 0.0
 
         if yes_ask <= 0 or no_ask <= 0:
+            self.last_skip_reason = "invalid_prices"
             return []
 
         # last_edge_yes/no already set in _predict(); raw edge not re-computed here
@@ -327,14 +336,27 @@ class ProbEdgeStrategy(Strategy):
         if self._slot_blocked_direction and candidates:
             candidates = [c for c in candidates if c[0] != self._slot_blocked_direction]
             if not candidates:
+                self.last_skip_reason = f"direction_blocked: {self._slot_blocked_direction}"
                 self.logger.debug(
                     "prob_edge: re-entry blocked on %s (stop-loss cooldown)",
                     self._slot_blocked_direction,
                 )
 
         if not candidates:
+            best_net = max(net_edge_yes, net_edge_no)
+            yes_sprd = spread_pct(yes_bid, yes_ask) if yes_bid > 0 else float("inf")
+            no_sprd = spread_pct(no_bid, no_ask) if no_bid > 0 else float("inf")
+            best_sprd = min(yes_sprd, no_sprd)
+            if not self.last_skip_reason:
+                if best_sprd > self.max_spread_pct:
+                    self.last_skip_reason = f"spread_wide: {best_sprd*100:.1f}% > {self.max_spread_pct*100:.0f}%"
+                elif best_net < required:
+                    self.last_skip_reason = f"edge_low: net={best_net:+.3f} < req={required:.3f}"
+                else:
+                    self.last_skip_reason = "price_out_of_range"
             return []
         if not self.is_flat(by_token):
+            self.last_skip_reason = "in_position"
             self.logger.debug("prob_edge: edge found but already in position, skipping entry")
             return []
 
@@ -346,6 +368,7 @@ class ProbEdgeStrategy(Strategy):
         size_mult = self.re_entry_size_mult if is_reentry else 1.0
         size_usdc = self._kelly_size(prob, best_ask, balance) * size_mult
         if size_usdc <= 0:
+            self.last_skip_reason = "kelly_size_zero"
             return []
 
         # Reuse VWAP already computed for this side above (same size_usdc)
@@ -353,9 +376,11 @@ class ProbEdgeStrategy(Strategy):
             self.last_expected_fill_yes if outcome == "YES" else self.last_expected_fill_no
         )
         if expected_fill is None:
+            self.last_skip_reason = "fill_estimate_failed"
             return []
         size = round(size_usdc / expected_fill, 2)
         if size <= 0:
+            self.last_skip_reason = "fill_estimate_failed"
             return []
 
         tick = book.tick_size or 0.001
@@ -391,6 +416,8 @@ class ProbEdgeStrategy(Strategy):
         now_mono: float,
         prediction,
     ) -> Optional[Signal]:
+        if self.exit_rule == "hold_to_expiry":
+            return None
         if self.active_token_id is None or self.entry_price is None:
             return None
 

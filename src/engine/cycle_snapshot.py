@@ -109,6 +109,7 @@ class CycleSnapshot:
     strategy_model_version: str = ""
     strategy_feature_status: str = ""
     strategy_score_breakdown: Optional[dict] = None
+    strategy_skip_reason: str = ""
 
     # ── Metadata ──────────────────────────────────────────────────────────────
     cycle_count: int = 0
@@ -191,6 +192,7 @@ class CycleSnapshot:
         self.strategy_model_version = getattr(strategy, "last_model_version", "")
         self.strategy_feature_status = getattr(strategy, "last_feature_status", "")
         self.strategy_score_breakdown = getattr(strategy, "last_score_breakdown", None)
+        self.strategy_skip_reason = getattr(strategy, "last_skip_reason", "")
 
 
 def build_cycle_snapshot(

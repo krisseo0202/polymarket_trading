@@ -45,6 +45,7 @@ class BotState:
     strategy_status: str = ""                   # "WATCHING" | "POSITION_OPEN" | "EXITED"
     strategy_score_breakdown: Optional[dict] = None  # sigmoid model feature contributions
     strategy_required_edge: Optional[float] = None   # dynamic TTE-scaled entry threshold
+    strategy_skip_reason: str = ""                   # why the strategy didn't trade this cycle
 
     # Chainlink reference price (slot-open "price to beat")
     chainlink_ref_price: Optional[float] = None
@@ -116,6 +117,7 @@ class StateStore:
                 strategy_status=data.get("strategy_status", ""),
                 strategy_score_breakdown=data.get("strategy_score_breakdown"),
                 strategy_required_edge=data.get("strategy_required_edge"),
+                strategy_skip_reason=data.get("strategy_skip_reason", ""),
                 chainlink_ref_price=data.get("chainlink_ref_price"),
                 chainlink_ref_slot_ts=data.get("chainlink_ref_slot_ts"),
                 chainlink_healthy=data.get("chainlink_healthy", False),
@@ -189,6 +191,7 @@ def snapshot_strategy_state(strategy, state: BotState) -> None:
     state.strategy_feature_status = getattr(strategy, "last_feature_status", "")
     state.strategy_score_breakdown = getattr(strategy, "last_score_breakdown", None)
     state.strategy_required_edge = getattr(strategy, "last_required_edge", None)
+    state.strategy_skip_reason = getattr(strategy, "last_skip_reason", "")
 
 
 def snapshot_chainlink_state(

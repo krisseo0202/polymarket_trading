@@ -212,6 +212,9 @@ class CycleRunner:
 
         signals = svc.strategy.analyze(market_data)
 
+        # Log the strategy's calculation breakdown
+        _log_strategy_calc(svc.strategy, signals, logger)
+
         # Suppress BUY entries if insufficient time remains
         time_remaining = (cycle_snap.slot_end_ts or 0) - time.time()
         min_entry = getattr(svc.strategy, "max_hold_seconds", 240)
@@ -636,6 +639,50 @@ def _check_daily_reset(state, risk_manager, logger) -> None:
         state.session_wins = 0
         state.session_losses = 0
         risk_manager.reset_daily()
+
+
+def _log_strategy_calc(strategy, signals, logger) -> None:
+    """Log the strategy's model output and edge calculations after analyze()."""
+    s = strategy
+    prob_yes = getattr(s, "last_prob_yes", None)
+    if prob_yes is None:
+        logger.info("  Calc: no model prediction this cycle")
+        return
+
+    prob_no = getattr(s, "last_prob_no", None) or (1.0 - prob_yes)
+    edge_yes = getattr(s, "last_edge_yes", None)
+    edge_no = getattr(s, "last_edge_no", None)
+    net_yes = getattr(s, "last_net_edge_yes", None)
+    net_no = getattr(s, "last_net_edge_no", None)
+    tte = getattr(s, "last_tte_seconds", None)
+    req_edge = getattr(s, "last_required_edge", None)
+    dist_bps = getattr(s, "last_distance_to_strike_bps", None)
+    feat = getattr(s, "last_feature_status", "")
+
+    def _f(v, fmt="+.3f"):
+        return f"{v:{fmt}}" if v is not None else "---"
+
+    parts = [
+        f"p_yes={prob_yes:.3f} p_no={prob_no:.3f}",
+        f"edge_yes={_f(edge_yes)} edge_no={_f(edge_no)}",
+        f"net_yes={_f(net_yes)} net_no={_f(net_no)}",
+    ]
+    if req_edge is not None:
+        parts.append(f"req_edge={req_edge:.3f}")
+    if tte is not None:
+        parts.append(f"tte={tte:.0f}s")
+    if dist_bps is not None:
+        parts.append(f"dist={dist_bps:+.0f}bps")
+    if feat:
+        parts.append(f"feat={feat}")
+
+    decision = "NO TRADE"
+    if signals:
+        sig = signals[0]
+        decision = f"{sig.action} {sig.outcome} {sig.size}sh @{sig.price}"
+
+    logger.info(f"  Calc: {' | '.join(parts)}")
+    logger.info(f"  Decision: {decision}")
 
 
 def _book_summary(yes_book, no_book) -> dict:

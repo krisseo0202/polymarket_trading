@@ -37,6 +37,8 @@ class Strategy(ABC):
         self.max_position_size = config.get("max_position_size", 1000.0)
         self.max_entry_price = config.get("max_entry_price", 0.95)
         self.min_entry_price = config.get("min_entry_price", 0.05)
+        self.exit_rule: str = config.get("exit_rule", "default")
+        self.last_skip_reason: str = ""
 
         # Position state — authoritative after sync_position_from_inventory()
         self.active_token_id: Optional[str] = None
@@ -137,6 +139,9 @@ class Strategy(ABC):
             profit_target_pct, stop_loss_pct, max_hold_seconds,
             _market_id, _outcome_map
         """
+        if self.exit_rule == "hold_to_expiry":
+            return None
+
         if self.active_token_id is None or self.entry_price is None:
             return None
 

@@ -40,6 +40,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-depth", type=int, default=4, help="Tree depth")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--bet-size", type=float, default=20.0, help="Simulated holdout bet size in USDC when fill columns exist")
+    parser.add_argument("--cost-per-share", type=float, default=0.0, help="Additional fee/cost per share for edge-aware labels (sim_yes_ask already includes spread)")
     return parser.parse_args()
 
 
@@ -151,12 +152,20 @@ def _simulate_holdout_pnl(valid_meta: pd.DataFrame, probs_yes: np.ndarray, y_val
         pnl_list.append(shares * (payout - entry))
 
     pnl_arr = np.asarray(pnl_list, dtype=float)
-    return {
+    result = {
         "holdout_accuracy": float(np.mean(pred_yes == actual_yes)) if len(pred_yes) else 0.0,
         "holdout_total_pnl": float(np.sum(pnl_arr)) if len(pnl_arr) else 0.0,
         "holdout_pnl_per_trade": float(np.mean(pnl_arr)) if len(pnl_arr) else 0.0,
         "holdout_trades": int(len(pnl_arr)),
     }
+
+    # Edge-aware metrics from pre-computed columns
+    if "edge_yes" in valid_meta.columns and "edge_no" in valid_meta.columns:
+        chosen_edge = np.where(pred_yes, valid_meta["edge_yes"].to_numpy(dtype=float), valid_meta["edge_no"].to_numpy(dtype=float))
+        result["holdout_mean_realized_edge"] = float(np.mean(chosen_edge)) if len(chosen_edge) else 0.0
+        result["holdout_profitable_frac"] = float(np.mean(chosen_edge > 0)) if len(chosen_edge) else 0.0
+
+    return result
 
 
 def main() -> None:
@@ -230,6 +239,7 @@ def main() -> None:
             "max_depth": args.max_depth,
             "seed": args.seed,
             "bet_size": args.bet_size,
+            "cost_per_share": args.cost_per_share,
         },
     }
     if backtest_metrics:
@@ -247,13 +257,17 @@ def main() -> None:
         f"positive_rate={metadata['metrics']['positive_rate']:.3f}"
     )
     if backtest_metrics:
-        print(
-            "Holdout backtest | "
-            f"accuracy={backtest_metrics['holdout_accuracy']:.3f} "
-            f"total_pnl={backtest_metrics['holdout_total_pnl']:+.2f} "
-            f"pnl_per_trade={backtest_metrics['holdout_pnl_per_trade']:+.4f} "
-            f"trades={backtest_metrics['holdout_trades']}"
-        )
+        parts = [
+            "Holdout backtest |",
+            f"accuracy={backtest_metrics['holdout_accuracy']:.3f}",
+            f"total_pnl={backtest_metrics['holdout_total_pnl']:+.2f}",
+            f"pnl_per_trade={backtest_metrics['holdout_pnl_per_trade']:+.4f}",
+            f"trades={backtest_metrics['holdout_trades']}",
+        ]
+        if "holdout_mean_realized_edge" in backtest_metrics:
+            parts.append(f"mean_edge={backtest_metrics['holdout_mean_realized_edge']:+.4f}")
+            parts.append(f"profitable_frac={backtest_metrics['holdout_profitable_frac']:.3f}")
+        print(" ".join(parts))
 
 
 if __name__ == "__main__":
