@@ -46,8 +46,8 @@ class LogRegEdgeStrategy(Strategy):
         # Entry filters
         self.delta: float = float(config.get("delta", 0.05))
         self.max_spread_pct: float = float(config.get("max_spread_pct", 0.06))
-        self.min_seconds_to_expiry: float = float(config.get("min_seconds_to_expiry", 20.0))
-        self.max_seconds_to_expiry: float = float(config.get("max_seconds_to_expiry", 280.0))
+        self.min_seconds_to_expiry: float = float(config.get("min_seconds_to_expiry", 10.0))
+        self.max_seconds_to_expiry: float = float(config.get("max_seconds_to_expiry", 295.0))
 
         # Exit: hold to expiry
         self.exit_rule = "hold_to_expiry"
@@ -253,17 +253,28 @@ class LogRegEdgeStrategy(Strategy):
         self.last_feature_status = ""
 
         btc_prices = []
-        if self.btc_feed is not None and getattr(self.btc_feed, "is_healthy", lambda: False)():
+        if self.btc_feed is not None:
             btc_prices = getattr(self.btc_feed, "get_recent_prices", lambda w=300: [])(300)
+            # Guard against trading on stale BTC data (feed dead >60s)
+            if btc_prices and (now_wall - btc_prices[-1][0]) > 60:
+                self.logger.warning("btc_feed stale (>60s), skipping prediction")
+                self.last_feature_status = "stale_btc"
+                return None
+
+        # Pass monotonic yes_history directly — _safe_return uses relative
+        # offsets so any consistent timestamp base works.
+        yes_history = list(self._price_history.get(self._yes_token_id) or [])
+        mono_now = time.monotonic() if yes_history else now_wall
 
         snapshot = {
             "btc_prices": btc_prices,
             "yes_book": order_books.get(self._yes_token_id),
             "no_book": order_books.get(self._no_token_id),
+            "yes_history": yes_history,
             "question": market_data.get("question", ""),
             "strike_price": market_data.get("strike_price"),
             "slot_expiry_ts": market_data.get("slot_expiry_ts"),
-            "now_ts": now_wall,
+            "now_ts": mono_now,
         }
 
         try:

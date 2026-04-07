@@ -109,8 +109,11 @@ strategies:
     # Entry filters
     delta: 0.05                  # minimum margin of safety beyond cost
     max_spread_pct: 0.06         # reject if spread > 6% of mid
-    min_seconds_to_expiry: 20    # don't enter with < 20s left
-    max_seconds_to_expiry: 280   # don't enter at very start of slot
+    min_seconds_to_expiry: 10    # don't enter with < 10s left (execution risk)
+    max_seconds_to_expiry: 295   # allow entry near slot open
+
+    # Hold-to-expiry: disable the cycle runner's time-remaining suppression
+    max_hold_seconds: 999
 
     # Kelly sizing
     kelly_fraction: 0.15         # fractional Kelly multiplier

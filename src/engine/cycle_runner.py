@@ -206,6 +206,10 @@ class CycleRunner:
 
         svc.strategy.set_tokens(self._market_id, self._yes_tid, self._no_tid)
 
+        # Seed price history from REST API so features like up_mid_ret_30s
+        # work immediately without waiting for 30s of ticker data.
+        _seed_price_history(svc.strategy, self._yes_tid, logger)
+
         # Store intra-cycle context before analyzing
         self._captured_slot = svc.slot_mgr.current_slot_ts()
         self._slot_expiry_ts = self._captured_slot + SLOT_INTERVAL_S
@@ -623,6 +627,41 @@ def execute_signals(
                     )
         except Exception as e:
             logger.error(f"Order placement failed: {e}")
+
+
+def _seed_price_history(strategy, yes_token_id: str, logger) -> None:
+    """Fetch recent price history from Polymarket REST API and seed the strategy.
+
+    This ensures features like up_mid_ret_30s have data from second 1,
+    without waiting for the ticker to accumulate 30s of observations.
+    """
+    if not yes_token_id or not hasattr(strategy, "seed_price_history"):
+        return
+    # Skip if strategy already has sufficient history
+    buf = strategy._price_history.get(yes_token_id)
+    if buf and len(buf) >= 5:
+        return
+    try:
+        import requests
+        resp = requests.get(
+            "https://clob.polymarket.com/prices-history",
+            params={"market": yes_token_id, "interval": "max"},
+            timeout=5,
+        )
+        resp.raise_for_status()
+        raw = resp.json().get("history", [])
+        if not raw:
+            return
+        history = [(int(entry["t"]), float(entry["p"])) for entry in raw]
+        history.sort()
+        # Keep only last 5 minutes
+        cutoff = time.time() - 300
+        history = [(t, p) for t, p in history if t >= cutoff]
+        if history:
+            strategy.seed_price_history(yes_token_id, history)
+            logger.debug(f"Seeded {len(history)} price ticks for YES token")
+    except Exception as e:
+        logger.debug(f"Price history seed failed: {e}")
 
 
 def _check_daily_reset(state, risk_manager, logger) -> None:

@@ -121,6 +121,32 @@ class Strategy(ABC):
         while buf and buf[0][0] < cutoff:
             buf.popleft()
 
+    def seed_price_history(self, token_id: str, history: List[Tuple[float, float]]) -> None:
+        """Seed price history from external data (e.g. REST API).
+
+        Args:
+            token_id: Token to seed history for.
+            history: List of (wall_clock_ts, mid_price) sorted ascending.
+                     Timestamps are converted to monotonic basis.
+        """
+        if not history:
+            return
+        buf = self._price_history.get(token_id)
+        if buf and len(buf) >= 5:
+            return  # already have enough data, don't overwrite
+
+        now_wall = time.time()
+        now_mono = time.monotonic()
+        new_buf: Deque[Tuple[float, float]] = collections.deque()
+        cutoff_wall = now_wall - self._history_max_age
+        for wall_ts, mid in history:
+            if wall_ts < cutoff_wall or mid <= 0:
+                continue
+            mono_ts = now_mono - (now_wall - wall_ts)
+            new_buf.append((mono_ts, mid))
+        if new_buf:
+            self._price_history[token_id] = new_buf
+
     # ------------------------------------------------------------------
     # Shared position lifecycle helpers
     # ------------------------------------------------------------------
