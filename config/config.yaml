@@ -112,6 +112,9 @@ strategies:
     min_seconds_to_expiry: 10    # don't enter with < 10s left (execution risk)
     max_seconds_to_expiry: 295   # allow entry near slot open
 
+    # Hold-to-expiry: disable the cycle runner's time-remaining suppression
+    max_hold_seconds: 999
+
     # Kelly sizing
     kelly_fraction: 0.15         # fractional Kelly multiplier
     position_size_usdc: 30.0     # hard cap per trade
