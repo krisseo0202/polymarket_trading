@@ -20,13 +20,19 @@ from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .feature_builder import parse_strike_price
+from src.api.types import OrderBook
+from .feature_builder import _safe_return, parse_strike_price
 from .xgb_model import PredictionResult
 
 
 LR_FEATURES = [
+    # BTC price features
     "ret_15s", "ret_30s", "ret_60s", "rolling_vol_60s",
     "rsi_14", "dist_to_strike", "ma_12_gap", "time_to_expiry_sec",
+    # Orderbook features
+    "up_mid", "up_spread", "down_spread",
+    "book_imbalance_up", "book_imbalance_down",
+    "up_mid_ret_30s", "depth_ratio",
 ]
 
 
@@ -58,8 +64,8 @@ class LogRegModel:
             "max_prob_yes_for_no": 0.46,
             "max_spread_pct": 0.06,
             "exit_edge": -0.01,
-            "min_seconds_to_expiry": 20.0,
-            "max_seconds_to_expiry": 280.0,
+            "min_seconds_to_expiry": 10.0,
+            "max_seconds_to_expiry": 295.0,
         }
 
     # ------------------------------------------------------------------
@@ -96,6 +102,11 @@ class LogRegModel:
         ts_arr = np.array([float(p[0]) for p in btc_prices])
         px_arr = np.array([float(p[1]) for p in btc_prices])
 
+        # Orderbook features
+        yes_book = snapshot.get("yes_book")
+        no_book = snapshot.get("no_book")
+        ob_features = _extract_orderbook_features(yes_book, no_book, snapshot)
+
         features = np.array([[
             _ts_return(ts_arr, px_arr, now_ts, 15),
             _ts_return(ts_arr, px_arr, now_ts, 30),
@@ -105,6 +116,13 @@ class LogRegModel:
             (btc_mid - strike_price) / strike_price,
             _ma_gap(ts_arr, px_arr, now_ts, 12, btc_mid),
             tte,
+            ob_features["up_mid"],
+            ob_features["up_spread"],
+            ob_features["down_spread"],
+            ob_features["book_imbalance_up"],
+            ob_features["book_imbalance_down"],
+            ob_features["up_mid_ret_30s"],
+            ob_features["depth_ratio"],
         ]], dtype=float)
 
         try:
@@ -234,3 +252,56 @@ def _ma_gap(ts_arr: np.ndarray, px_arr: np.ndarray, now: float, n: int, btc_mid:
     if ma <= 0:
         return 0.0
     return (btc_mid - ma) / ma
+
+
+_OB_DEFAULTS = {
+    "up_mid": 0.5, "up_spread": 0.01, "down_spread": 0.01,
+    "book_imbalance_up": 0.5, "book_imbalance_down": 0.5,
+    "up_mid_ret_30s": 0.0, "depth_ratio": 0.0,
+}
+
+
+def _book_stats(book: OrderBook) -> Tuple[float, float, float, float]:
+    """Extract (best_bid, best_ask, bid_depth_3, ask_depth_3) from an OrderBook."""
+    bid = float(book.bids[0].price) if book.bids else 0.0
+    ask = float(book.asks[0].price) if book.asks else 0.0
+    bid_depth = sum(float(e.size) for e in book.bids[:3]) if book.bids else 0.0
+    ask_depth = sum(float(e.size) for e in book.asks[:3]) if book.asks else 0.0
+    return bid, ask, bid_depth, ask_depth
+
+
+def _extract_orderbook_features(
+    yes_book, no_book, snapshot: Mapping[str, object]
+) -> Dict[str, float]:
+    """Extract orderbook features from live OrderBook objects."""
+    if not isinstance(yes_book, OrderBook) or not isinstance(no_book, OrderBook):
+        return dict(_OB_DEFAULTS)
+
+    y_bid, y_ask, y_bid_depth, y_ask_depth = _book_stats(yes_book)
+    n_bid, n_ask, n_bid_depth, n_ask_depth = _book_stats(no_book)
+
+    up_mid = (y_bid + y_ask) / 2.0 if y_bid > 0 and y_ask > 0 else 0.5
+    up_spread = max(0.0, y_ask - y_bid)
+    down_spread = max(0.0, n_ask - n_bid)
+
+    y_total = y_bid_depth + y_ask_depth
+    imb_up = y_bid_depth / y_total if y_total > 0 else 0.5
+    n_total = n_bid_depth + n_ask_depth
+    imb_down = n_bid_depth / n_total if n_total > 0 else 0.5
+
+    depth_ratio = math.log(y_bid_depth / n_bid_depth) if y_bid_depth > 0 and n_bid_depth > 0 else 0.0
+
+    # Reuse feature_builder's _safe_return for the 30s lookback
+    yes_history = list(snapshot.get("yes_history") or [])
+    now_ts = float(snapshot.get("now_ts") or 0)
+    up_mid_ret = _safe_return(yes_history, now_ts, 30) if len(yes_history) >= 2 else 0.0
+
+    return {
+        "up_mid": up_mid,
+        "up_spread": up_spread,
+        "down_spread": down_spread,
+        "book_imbalance_up": imb_up,
+        "book_imbalance_down": imb_down,
+        "up_mid_ret_30s": up_mid_ret,
+        "depth_ratio": depth_ratio,
+    }

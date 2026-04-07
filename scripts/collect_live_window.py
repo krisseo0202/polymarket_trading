@@ -249,8 +249,8 @@ def main():
     parser.add_argument(
         "--interval",
         type=float,
-        default=5.0,
-        help="Poll interval in seconds (default: 5)",
+        default=1.0,
+        help="Poll interval in seconds (default: 1)",
     )
     args = parser.parse_args()
     run(args.output, args.interval)
