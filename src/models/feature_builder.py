@@ -13,6 +13,7 @@ import pandas as pd
 from indicators.base import IndicatorConfig
 from indicators.fvg import FVGIndicator
 from indicators.td_sequential import TDSequentialIndicator
+from indicators.ut_bot import UTBotIndicator
 from src.api.types import OrderBook
 from .schema import DEFAULT_FEATURE_VALUES, FEATURE_COLUMNS
 
@@ -21,6 +22,7 @@ _STRIKE_RE = re.compile(r"\$([0-9,]+(?:\.[0-9]+)?)")
 
 _FVG = FVGIndicator(IndicatorConfig("FVG", {"threshold_percent": 0.0, "auto": False}))
 _TDS = TDSequentialIndicator(IndicatorConfig("TDSeq", {}))
+_UTB = UTBotIndicator(IndicatorConfig("UTBot", {"atr_period": 10, "key_value": 1.0}))
 
 
 @dataclass
@@ -74,11 +76,25 @@ def build_live_features(snapshot: Mapping[str, object]) -> FeatureBuildResult:
     features["moneyness"] = (btc_mid - strike_price) / strike_price
     features["distance_to_strike_bps"] = features["moneyness"] * 10_000.0
 
+    # Momentum at multiple horizons
+    features["btc_ret_5s"] = _safe_return(btc_prices, now_ts, 5)
     features["btc_ret_15s"] = _safe_return(btc_prices, now_ts, 15)
     features["btc_ret_30s"] = _safe_return(btc_prices, now_ts, 30)
     features["btc_ret_60s"] = _safe_return(btc_prices, now_ts, 60)
-    features["btc_vol_30s"] = _realized_vol(btc_prices, now_ts, 30)
-    features["btc_vol_60s"] = _realized_vol(btc_prices, now_ts, 60)
+    features["btc_ret_180s"] = _safe_return(btc_prices, now_ts, 180)
+
+    # Realized volatility at multiple horizons + ratio
+    vol_15 = _realized_vol(btc_prices, now_ts, 15)
+    vol_30 = _realized_vol(btc_prices, now_ts, 30)
+    vol_60 = _realized_vol(btc_prices, now_ts, 60)
+    features["btc_vol_15s"] = vol_15
+    features["btc_vol_30s"] = vol_30
+    features["btc_vol_60s"] = vol_60
+    features["vol_ratio_15_60"] = (vol_15 / vol_60) if vol_60 > 0 else 0.0
+
+    # Volume features — btc_prices may be 2-tuples (ts, price) or 3-tuples
+    # (ts, price, volume). Volume features are 0.0 when volume is unavailable.
+    _add_volume_features(features, btc_prices, now_ts)
 
     yes_history = list(snapshot.get("yes_history") or [])
     no_history = list(snapshot.get("no_history") or [])
@@ -90,7 +106,7 @@ def build_live_features(snapshot: Mapping[str, object]) -> FeatureBuildResult:
     return FeatureBuildResult(features=features, ready=True, status=status)
 
 
-def _safe_return(prices: Sequence[Tuple[float, float]], now_ts: float, lookback_s: int) -> float:
+def _safe_return(prices: Sequence, now_ts: float, lookback_s: int) -> float:
     current = _latest_value(prices)
     previous = _lookback_value(prices, now_ts, lookback_s)
     if current is None or previous is None or previous <= 0:
@@ -98,9 +114,9 @@ def _safe_return(prices: Sequence[Tuple[float, float]], now_ts: float, lookback_
     return (current - previous) / previous
 
 
-def _realized_vol(prices: Sequence[Tuple[float, float]], now_ts: float, window_s: int) -> float:
+def _realized_vol(prices: Sequence, now_ts: float, window_s: int) -> float:
     cutoff = now_ts - window_s
-    window = [float(price) for ts, price in prices if float(ts) >= cutoff]
+    window = [float(entry[1]) for entry in prices if float(entry[0]) >= cutoff]
     if len(window) < 3:
         return 0.0
     arr = np.asarray(window, dtype=float)
@@ -110,20 +126,88 @@ def _realized_vol(prices: Sequence[Tuple[float, float]], now_ts: float, window_s
     return float(np.std(returns, ddof=1))
 
 
-def _latest_value(prices: Sequence[Tuple[float, float]]) -> Optional[float]:
+def _has_volume(prices: Sequence) -> bool:
+    """Check if price tuples include volume as a third element."""
+    if not prices:
+        return False
+    return len(prices[0]) >= 3
+
+
+def _add_volume_features(
+    features: Dict[str, float],
+    btc_prices: Sequence,
+    now_ts: float,
+) -> None:
+    """Compute volume-derived features when volume data is available.
+
+    Volume is tick-count-per-second from Coinbase (not true trade volume),
+    but still a useful proxy for activity intensity.
+    """
+    if not _has_volume(btc_prices):
+        return  # features stay at default 0.0
+
+    # Extract (ts, price, volume) triples within windows
+    cutoff_15 = now_ts - 15
+    cutoff_60 = now_ts - 60
+    vol_15: List[float] = []
+    vol_60: List[float] = []
+    prices_60: List[Tuple[float, float, float]] = []  # (ts, price, vol)
+
+    for entry in btc_prices:
+        ts, price, vol = float(entry[0]), float(entry[1]), float(entry[2])
+        if ts >= cutoff_60:
+            vol_60.append(vol)
+            prices_60.append((ts, price, vol))
+            if ts >= cutoff_15:
+                vol_15.append(vol)
+
+    # volume_surge_ratio: avg vol/sec in 15s ÷ avg vol/sec in 60s
+    if vol_15 and vol_60:
+        avg_15 = sum(vol_15) / max(len(vol_15), 1)
+        avg_60 = sum(vol_60) / max(len(vol_60), 1)
+        features["volume_surge_ratio"] = (avg_15 / avg_60) if avg_60 > 0 else 0.0
+
+    # btc_vwap_deviation: (close - VWAP) / close over 60s
+    if prices_60:
+        sum_pv = sum(p * v for _, p, v in prices_60)
+        sum_v = sum(v for _, _, v in prices_60)
+        if sum_v > 0:
+            vwap = sum_pv / sum_v
+            close = prices_60[-1][1]
+            features["btc_vwap_deviation"] = (close - vwap) / close if close > 0 else 0.0
+
+    # cumulative_volume_delta_60s: Σ(vol where close>open) - Σ(vol where close<open)
+    # Using consecutive price changes as up/down proxy
+    if len(prices_60) >= 2:
+        buy_vol = 0.0
+        sell_vol = 0.0
+        for i in range(1, len(prices_60)):
+            _, p_now, v = prices_60[i]
+            _, p_prev, _ = prices_60[i - 1]
+            if p_now >= p_prev:
+                buy_vol += v
+            else:
+                sell_vol += v
+        total = buy_vol + sell_vol
+        features["cumulative_volume_delta_60s"] = (
+            (buy_vol - sell_vol) / total if total > 0 else 0.0
+        )
+
+
+def _latest_value(prices: Sequence) -> Optional[float]:
     if not prices:
         return None
     return float(prices[-1][1])
 
 
 def _lookback_value(
-    prices: Sequence[Tuple[float, float]], now_ts: float, lookback_s: int
+    prices: Sequence, now_ts: float, lookback_s: int
 ) -> Optional[float]:
     target = now_ts - lookback_s
     candidate = None
-    for ts, price in prices:
-        if float(ts) <= target:
-            candidate = float(price)
+    for entry in prices:
+        if float(entry[0]) <= target:
+            candidate = float(entry[1])
         else:
             break
     return candidate
@@ -167,6 +251,7 @@ def _add_indicator_features(
     try:
         fvg_result = _FVG.compute(ohlc, timeframe="5s")
         tds_result = _TDS.compute(ohlc, timeframe="5s")
+        utb_result = _UTB.compute(ohlc, timeframe="5s")
     except Exception:
         return "ready_indicator_error"
 
@@ -191,6 +276,22 @@ def _add_indicator_features(
     features["sell_9"] = float(bool(_last_scalar(vals.get("sell_9"))))
     features["buy_13"] = float(bool(_last_scalar(vals.get("buy_13"))))
     features["sell_13"] = float(bool(_last_scalar(vals.get("sell_13"))))
+
+    # UT Bot — ATR trailing stop trend filter
+    utb_vals = utb_result.values
+    trail = utb_vals.get("trail")
+    buy_sig = utb_vals.get("buy")
+    sell_sig = utb_vals.get("sell")
+
+    last_close = float(ohlc["close"].iloc[-1])
+    last_trail = float(_last_scalar(trail))
+    features["ut_bot_trend"] = 1.0 if last_close > last_trail else -1.0
+    features["ut_bot_distance_pct"] = (
+        (last_close - last_trail) / last_close if last_close > 0 else 0.0
+    )
+    features["ut_bot_buy_signal"] = float(bool(_last_scalar(buy_sig)))
+    features["ut_bot_sell_signal"] = float(bool(_last_scalar(sell_sig)))
+
     return "ready"
 
 
@@ -212,12 +313,14 @@ def _last_scalar(values: object) -> float:
 
 
 def _prices_to_ohlc(
-    prices: Sequence[Tuple[float, float]], bar_seconds: int
+    prices: Sequence, bar_seconds: int
 ) -> pd.DataFrame:
     if not prices:
         return pd.DataFrame(columns=["open", "high", "low", "close"])
 
-    df = pd.DataFrame(prices, columns=["timestamp", "price"])
+    # Accept both 2-tuples (ts, price) and 3-tuples (ts, price, volume)
+    ts_price = [(float(entry[0]), float(entry[1])) for entry in prices]
+    df = pd.DataFrame(ts_price, columns=["timestamp", "price"])
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s", utc=True)
     df["bucket"] = df["timestamp"].dt.floor(f"{bar_seconds}s")
 

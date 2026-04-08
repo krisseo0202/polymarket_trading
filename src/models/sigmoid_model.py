@@ -39,7 +39,7 @@ def _lookup_price_at(
     """Return the BTC price closest to (now_ts - lookback_seconds), or None."""
     target_ts = now_ts - lookback_seconds
     best: Optional[Tuple[float, float]] = None
-    for ts, price in btc_prices:
+    for ts, price, *_ in btc_prices:
         ts, price = float(ts), float(price)
         if price <= 0:
             continue

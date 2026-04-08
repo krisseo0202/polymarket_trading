@@ -342,7 +342,7 @@ class SnapshotCollector:
 
         btc_now  = self._btc_feed.get_latest_mid()
         btc_src  = "coinbase" if btc_now is not None else None
-        btc_prices: List[Tuple[float, float]] = self._btc_feed.get_recent_prices(300)
+        btc_prices = self._btc_feed.get_recent_prices(300)
 
         # If Coinbase unavailable, try Chainlink latest
         if btc_now is None:

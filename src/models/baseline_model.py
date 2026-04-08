@@ -110,7 +110,7 @@ class BTCUpDownBaselineModel:
         now_ts: float,
     ) -> Optional[Tuple[float, float]]:
         cutoff = now_ts - self.vol_window_seconds
-        window = [(float(ts), float(price)) for ts, price in btc_prices if float(ts) >= cutoff and float(price) > 0]
+        window = [(float(ts), float(price)) for ts, price, *_ in btc_prices if float(ts) >= cutoff and float(price) > 0]
         if len(window) < self.min_samples:
             return None
 

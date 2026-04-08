@@ -18,6 +18,7 @@ from ..engine.slot_state import SLOT_INTERVAL_S, SlotStateManager
 from ..engine.state_store import BotState, StateStore
 from ..models import BTCSigmoidModel
 from ..models.logreg_model import LogRegModel
+from ..models.logreg_v3_model import LogRegV3Model
 from ..strategies.btc_updown import BTCUpDownStrategy
 from ..strategies.btc_updown_xgb import BTCUpDownXGBStrategy
 from ..strategies.btc_vol_reversion import BTCVolatilityReversionStrategy
@@ -31,7 +32,7 @@ from ..utils.config import load_config
 from ..utils.logger import setup_logger
 from ..utils.market_utils import get_server_time
 
-STRATEGIES = ["btc_updown", "btc_updown_xgb", "btc_vol_reversion", "coin_toss", "logreg_edge", "prob_edge", "td_rsi"]
+STRATEGIES = ["btc_updown", "btc_updown_xgb", "btc_vol_reversion", "coin_toss", "logreg_edge", "logreg_v3", "prob_edge", "td_rsi"]
 
 
 @dataclass
@@ -190,6 +191,22 @@ def init_services(args) -> Services:
             config=strategy_cfg,
             btc_feed=btc_feed,
             model_service=logreg_model,
+            logger=logger,
+        )
+    elif strategy_name == "logreg_v3":
+        btc_feed = BtcPriceFeed(
+            symbol=str(strategy_cfg.get("btc_symbol", "BTC-USD")),
+            exchange=str(strategy_cfg.get("btc_exchange", "coinbase")),
+            logger=logger,
+        ).start()
+        model_dir = str(strategy_cfg.get("model_dir", "models/logreg_v3"))
+        v3_model = LogRegV3Model.load(model_dir, logger=logger)
+        if not v3_model.ready:
+            logger.warning("LogReg v3 model not found at %s — strategy will skip all trades until a model is trained", model_dir)
+        strategy = LogRegEdgeStrategy(
+            config=strategy_cfg,
+            btc_feed=btc_feed,
+            model_service=v3_model,
             logger=logger,
         )
     elif strategy_name == "prob_edge":

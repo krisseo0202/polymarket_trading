@@ -47,6 +47,7 @@ def _handle_sigint(sig, frame):
 
 
 signal.signal(signal.SIGINT, _handle_sigint)
+signal.signal(signal.SIGTERM, _handle_sigint)
 
 
 def current_slot_ts() -> int:

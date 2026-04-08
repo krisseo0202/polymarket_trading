@@ -73,7 +73,7 @@ class BtcPriceFeed:
 
         self._lock = threading.Lock()
         self._latest: Optional[BookSnapshot] = None
-        self._buffer: Deque[Tuple[float, float]] = collections.deque()
+        self._buffer: Deque[Tuple[float, float, float]] = collections.deque()
         self._stop_evt = threading.Event()
         self.reconnect_count: int = 0
 
@@ -115,11 +115,21 @@ class BtcPriceFeed:
             return False
         return age < self._stale_warn_s * 1000
 
-    def get_recent_prices(self, window_s: int = 300) -> List[Tuple[float, float]]:
-        """Return (timestamp, mid_price) pairs for the last N seconds."""
+    def get_recent_prices(self, window_s: int = 300) -> List[Tuple[float, float, float]]:
+        """Return (timestamp, mid_price, tick_count) triples for the last N seconds.
+
+        tick_count is 1 per WebSocket tick — downstream feature engineering
+        aggregates these into volume-proxy metrics (e.g. tick intensity).
+        """
+        import bisect
+
         cutoff = time.time() - window_s
         with self._lock:
-            return [(ts, mid) for ts, mid in self._buffer if ts >= cutoff]
+            # Buffer is sorted by timestamp; bisect to skip old entries.
+            if not self._buffer:
+                return []
+            idx = bisect.bisect_left(self._buffer, (cutoff,))
+            return list(self._buffer)[idx:]
 
     # ── Shared update helper ──────────────────────────────────────────────
 
@@ -132,7 +142,7 @@ class BtcPriceFeed:
         buf_ts = exchange_ts if exchange_ts is not None else now
         with self._lock:
             self._latest = snap
-            self._buffer.append((buf_ts, mid))
+            self._buffer.append((buf_ts, mid, 1.0))
             cutoff = now - self._buffer_s
             while self._buffer and self._buffer[0][0] < cutoff:
                 self._buffer.popleft()

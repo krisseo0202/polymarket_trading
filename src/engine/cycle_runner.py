@@ -49,6 +49,10 @@ class CycleRunner:
         self._captured_slot: int = 0
         self._slot_expiry_ts: float = 0.0
 
+        # Observability: detect stuck model predictions
+        self._no_prediction_streak: int = 0
+        self._degenerate_streak: int = 0
+
         # Seed slot history in background so dashboard shows outcomes immediately.
         threading.Thread(target=self._seed_slot_history, daemon=True).start()
 
@@ -92,7 +96,9 @@ class CycleRunner:
         self._question = market_info.get("question", "")
 
         slot_ctx = svc.slot_mgr.update_from_chainlink(
-            svc.chainlink_feed, fallback_question=self._question
+            svc.chainlink_feed,
+            fallback_question=self._question,
+            btc_feed=svc.btc_feed,
         )
         # Log strike source and feed health every cycle for observability.
         cl_age_s = (svc.chainlink_feed.get_feed_age_ms() or 0) / 1000 if svc.chainlink_feed else None
@@ -217,7 +223,7 @@ class CycleRunner:
         signals = svc.strategy.analyze(market_data)
 
         # Log the strategy's calculation breakdown
-        _log_strategy_calc(svc.strategy, signals, logger)
+        _log_strategy_calc(svc.strategy, signals, logger, self)
 
         # Suppress BUY entries if insufficient time remains
         time_remaining = (cycle_snap.slot_end_ts or 0) - time.time()
@@ -292,7 +298,9 @@ class CycleRunner:
 
             if svc.slot_mgr is not None:
                 svc.slot_mgr.update_from_chainlink(
-                    svc.chainlink_feed, fallback_question=self._question
+                    svc.chainlink_feed,
+                    fallback_question=self._question,
+                    btc_feed=svc.btc_feed,
                 )
 
             yes_book, no_book, positions, balance = svc.client.fetch_market_data_parallel(
@@ -680,13 +688,34 @@ def _check_daily_reset(state, risk_manager, logger) -> None:
         risk_manager.reset_daily()
 
 
-def _log_strategy_calc(strategy, signals, logger) -> None:
+def _log_strategy_calc(strategy, signals, logger, runner=None) -> None:
     """Log the strategy's model output and edge calculations after analyze()."""
     s = strategy
     prob_yes = getattr(s, "last_prob_yes", None)
+    skip_reason = getattr(s, "last_skip_reason", "")
     if prob_yes is None:
+        if runner is not None:
+            runner._no_prediction_streak += 1
+            if runner._no_prediction_streak >= 6:
+                logger.warning(
+                    f"  No model prediction for {runner._no_prediction_streak} consecutive "
+                    f"cycles (skip_reason={skip_reason})"
+                )
+                return
         logger.info("  Calc: no model prediction this cycle")
         return
+
+    if runner is not None:
+        runner._no_prediction_streak = 0
+        if prob_yes < 0.01 or prob_yes > 0.99:
+            runner._degenerate_streak += 1
+            if runner._degenerate_streak >= 3:
+                logger.warning(
+                    f"  Model prediction degenerate for {runner._degenerate_streak} "
+                    f"consecutive cycles (p_yes={prob_yes:.4f}) — possible feature issue"
+                )
+        else:
+            runner._degenerate_streak = 0
 
     prob_no = getattr(s, "last_prob_no", None) or (1.0 - prob_yes)
     edge_yes = getattr(s, "last_edge_yes", None)

@@ -114,10 +114,12 @@ class SlotStateManager:
         chainlink_feed,
         fallback_question: str = "",
         parse_strike_fn=None,
+        btc_feed=None,
         now: Optional[float] = None,
     ) -> SlotContext:
         """
-        Pull strike and ref price from ChainlinkFeed; fall back to regex parse.
+        Pull strike and ref price from ChainlinkFeed; fall back to regex parse,
+        then to BTC feed slot-boundary price.
 
         Validates that the slot-open price belongs to the *current* slot before
         using it. A slot mismatch (e.g. after a feed reconnect mid-slot) triggers
@@ -148,7 +150,7 @@ class SlotStateManager:
                     age_slots = (current_slot_ts - slot_open.slot_ts) // SLOT_INTERVAL_S
                     self._logger.warning(
                         f"Chainlink slot_open ({slot_open.slot_ts}) is {age_slots} slot(s) "
-                        f"behind current ({current_slot_ts}); falling back to regex"
+                        f"behind current ({current_slot_ts}); falling back"
                     )
 
         if strike is None and fallback_question:
@@ -161,8 +163,20 @@ class SlotStateManager:
                     f"(Chainlink {'stale' if chainlink_feed else 'disabled'})"
                 )
 
+        # Fallback: use the BTC feed's price closest to the slot boundary.
+        # Not perfect (Coinbase != Chainlink), but close enough to keep the
+        # model running rather than skipping every cycle.
+        if strike is None and btc_feed is not None:
+            strike = _btc_feed_slot_open(btc_feed, current_slot_ts)
+            if strike is not None:
+                source = "btc_feed"
+                self._logger.info(
+                    f"Strike resolved via BTC feed: ${strike:,.2f} "
+                    f"(Chainlink unavailable)"
+                )
+
         if strike is None:
-            self._logger.debug("Strike price unavailable (no Chainlink and no regex match)")
+            self._logger.debug("Strike price unavailable (no Chainlink, no regex, no BTC feed)")
 
         return self.update(
             strike_price=strike,
@@ -188,6 +202,36 @@ class SlotStateManager:
         else:
             state.chainlink_ref_price = None
             state.chainlink_ref_slot_ts = None
+
+
+def _btc_feed_slot_open(btc_feed, slot_ts: int) -> Optional[float]:
+    """Find the BTC feed price closest to a slot boundary.
+
+    Returns None if no buffered price is within 30s of the slot start.
+    Prices are sorted by timestamp so we use bisect for O(log n) lookup.
+    """
+    import bisect
+
+    prices = btc_feed.get_recent_prices(window_s=600)
+    if not prices:
+        return None
+
+    timestamps = [entry[0] for entry in prices]
+    idx = bisect.bisect_left(timestamps, slot_ts)
+
+    best: Optional[float] = None
+    best_dist = float("inf")
+    # Check the entry at and around the insertion point
+    for i in (idx - 1, idx):
+        if 0 <= i < len(prices):
+            dist = abs(timestamps[i] - slot_ts)
+            if dist < best_dist:
+                best_dist = dist
+                best = float(prices[i][1])
+
+    if best is not None and best_dist <= 30.0:
+        return best
+    return None
 
 
 def fetch_slot_outcome(slot_ts: int, logger) -> Optional[str]:

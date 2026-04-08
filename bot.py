@@ -284,7 +284,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Polymarket trading bot")
     parser.add_argument("--strategy", choices=[
         "btc_updown", "btc_updown_xgb", "btc_vol_reversion", "coin_toss",
-        "logreg_edge", "prob_edge", "td_rsi",
+        "logreg_edge", "logreg_v3", "prob_edge", "td_rsi",
     ], default=None)
     parser.add_argument("--paper", action="store_true", default=False)
     parser.add_argument("--live", action="store_true", default=False)

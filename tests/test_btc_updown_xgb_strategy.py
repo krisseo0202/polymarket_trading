@@ -15,14 +15,14 @@ class _FakeFeed:
     def __init__(self, healthy=True):
         now = time.time()
         self._healthy = healthy
-        self._prices = [(now - 120 + idx, 100_000.0 + idx * 1.5) for idx in range(121)]
+        self._prices = [(now - 120 + idx, 100_000.0 + idx * 1.5, 1.0) for idx in range(121)]
 
     def is_healthy(self):
         return self._healthy
 
     def get_recent_prices(self, window_s=300):
         cutoff = time.time() - window_s
-        return [(ts, price) for ts, price in self._prices if ts >= cutoff]
+        return [(ts, price, vol) for ts, price, vol in self._prices if ts >= cutoff]
 
 
 class _FakeModelService:

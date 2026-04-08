@@ -261,10 +261,11 @@ class LogRegEdgeStrategy(Strategy):
                 self.last_feature_status = "stale_btc"
                 return None
 
-        # Pass monotonic yes_history directly — _safe_return uses relative
-        # offsets so any consistent timestamp base works.
-        yes_history = list(self._price_history.get(self._yes_token_id) or [])
-        mono_now = time.monotonic() if yes_history else now_wall
+        # Convert monotonic yes_history to wall-clock so all snapshot
+        # timestamps share the same domain (btc_prices, slot_expiry_ts use wall clock).
+        mono_to_wall = now_wall - time.monotonic()
+        yes_history = [(ts + mono_to_wall, p)
+                       for ts, p in (self._price_history.get(self._yes_token_id) or [])]
 
         snapshot = {
             "btc_prices": btc_prices,
@@ -274,7 +275,7 @@ class LogRegEdgeStrategy(Strategy):
             "question": market_data.get("question", ""),
             "strike_price": market_data.get("strike_price"),
             "slot_expiry_ts": market_data.get("slot_expiry_ts"),
-            "now_ts": mono_now,
+            "now_ts": now_wall,
         }
 
         try:
