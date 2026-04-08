@@ -7,7 +7,9 @@ re-analysis doesn't need a 16-variable closure.
 
 from __future__ import annotations
 
+import json
 import math
+import os
 import sys
 import threading
 import time
@@ -48,6 +50,10 @@ class CycleRunner:
         self._question: str = ""
         self._captured_slot: int = 0
         self._slot_expiry_ts: float = 0.0
+
+        # Observability: detect stuck model predictions
+        self._no_prediction_streak: int = 0
+        self._degenerate_streak: int = 0
 
         # Seed slot history in background so dashboard shows outcomes immediately.
         threading.Thread(target=self._seed_slot_history, daemon=True).start()
@@ -92,7 +98,9 @@ class CycleRunner:
         self._question = market_info.get("question", "")
 
         slot_ctx = svc.slot_mgr.update_from_chainlink(
-            svc.chainlink_feed, fallback_question=self._question
+            svc.chainlink_feed,
+            fallback_question=self._question,
+            btc_feed=svc.btc_feed,
         )
         # Log strike source and feed health every cycle for observability.
         cl_age_s = (svc.chainlink_feed.get_feed_age_ms() or 0) / 1000 if svc.chainlink_feed else None
@@ -217,7 +225,8 @@ class CycleRunner:
         signals = svc.strategy.analyze(market_data)
 
         # Log the strategy's calculation breakdown
-        _log_strategy_calc(svc.strategy, signals, logger)
+        _log_strategy_calc(svc.strategy, signals, logger, self)
+        _log_decision(svc.strategy, signals, market_data, cycle_type="main")
 
         # Suppress BUY entries if insufficient time remains
         time_remaining = (cycle_snap.slot_end_ts or 0) - time.time()
@@ -292,7 +301,9 @@ class CycleRunner:
 
             if svc.slot_mgr is not None:
                 svc.slot_mgr.update_from_chainlink(
-                    svc.chainlink_feed, fallback_question=self._question
+                    svc.chainlink_feed,
+                    fallback_question=self._question,
+                    btc_feed=svc.btc_feed,
                 )
 
             yes_book, no_book, positions, balance = svc.client.fetch_market_data_parallel(
@@ -316,6 +327,7 @@ class CycleRunner:
             )
             market_data = intra_snap.to_market_data(yes_book, no_book, positions, balance)
             signals = svc.strategy.analyze(market_data)
+            _log_decision(svc.strategy, signals, market_data, cycle_type="intra")
 
             if time_remaining < min_entry_window:
                 buy_count = sum(1 for s in signals if s.action == "BUY")
@@ -680,13 +692,34 @@ def _check_daily_reset(state, risk_manager, logger) -> None:
         risk_manager.reset_daily()
 
 
-def _log_strategy_calc(strategy, signals, logger) -> None:
+def _log_strategy_calc(strategy, signals, logger, runner=None) -> None:
     """Log the strategy's model output and edge calculations after analyze()."""
     s = strategy
     prob_yes = getattr(s, "last_prob_yes", None)
+    skip_reason = getattr(s, "last_skip_reason", "")
     if prob_yes is None:
+        if runner is not None:
+            runner._no_prediction_streak += 1
+            if runner._no_prediction_streak >= 6:
+                logger.warning(
+                    f"  No model prediction for {runner._no_prediction_streak} consecutive "
+                    f"cycles (skip_reason={skip_reason})"
+                )
+                return
         logger.info("  Calc: no model prediction this cycle")
         return
+
+    if runner is not None:
+        runner._no_prediction_streak = 0
+        if prob_yes < 0.01 or prob_yes > 0.99:
+            runner._degenerate_streak += 1
+            if runner._degenerate_streak >= 3:
+                logger.warning(
+                    f"  Model prediction degenerate for {runner._degenerate_streak} "
+                    f"consecutive cycles (p_yes={prob_yes:.4f}) — possible feature issue"
+                )
+        else:
+            runner._degenerate_streak = 0
 
     prob_no = getattr(s, "last_prob_no", None) or (1.0 - prob_yes)
     edge_yes = getattr(s, "last_edge_yes", None)
@@ -719,9 +752,113 @@ def _log_strategy_calc(strategy, signals, logger) -> None:
     if signals:
         sig = signals[0]
         decision = f"{sig.action} {sig.outcome} {sig.size}sh @{sig.price}"
+    elif skip_reason:
+        decision = f"NO TRADE ({skip_reason})"
 
     logger.info(f"  Calc: {' | '.join(parts)}")
     logger.info(f"  Decision: {decision}")
+
+
+# ── Structured decision log ──────────────────────────────────────────────
+from datetime import datetime, timezone as _tz
+
+_DECISION_LOG_PATH = os.path.join(
+    "data",
+    f"decision_log_{datetime.now(_tz.utc).strftime('%Y%m%dT%H%M%SZ')}.jsonl",
+)
+
+
+def _log_decision(strategy, signals, market_data, cycle_type="main") -> None:
+    """Append a structured JSONL record for every prediction cycle.
+
+    Captures: timestamp, slot, model output, features, orderbook state,
+    edge, skip reason, and trade action — everything needed for post-hoc analysis.
+    """
+    now = time.time()
+    s = strategy
+
+    prob_yes = getattr(s, "last_prob_yes", None)
+    skip_reason = getattr(s, "last_skip_reason", "")
+
+    # Orderbook state
+    q_t = getattr(s, "last_q_t", None)
+    c_t = getattr(s, "last_c_t", None)
+
+    # Edges
+    edge_yes = getattr(s, "last_edge_yes", None)
+    edge_no = getattr(s, "last_edge_no", None)
+
+    # Model features (only available for logreg_v3)
+    model_svc = getattr(s, "model_service", None)
+    features = {}
+    if model_svc is not None:
+        features = getattr(model_svc, "last_features", {})
+
+    # Trade action
+    action = None
+    if signals:
+        sig = signals[0]
+        action = {
+            "side": sig.outcome,
+            "action": sig.action,
+            "price": sig.price,
+            "size": sig.size,
+            "confidence": sig.confidence,
+            "reason": sig.reason,
+        }
+
+    # Orderbook from market_data
+    order_books = market_data.get("order_books", {})
+    yes_tid = getattr(s, "_yes_token_id", None)
+    no_tid = getattr(s, "_no_token_id", None)
+    ob = {}
+    for tid, prefix in [(yes_tid, "yes"), (no_tid, "no")]:
+        book = order_books.get(tid)
+        if book:
+            bids = book.bids
+            asks = book.asks
+            ob[f"{prefix}_bid"] = float(bids[0].price) if bids else None
+            ob[f"{prefix}_ask"] = float(asks[0].price) if asks else None
+            ob[f"{prefix}_bid_size"] = float(bids[0].size) if bids else None
+            ob[f"{prefix}_ask_size"] = float(asks[0].size) if asks else None
+            bid_d3 = sum(float(e.size) for e in bids[:3]) if bids else 0
+            ask_d3 = sum(float(e.size) for e in asks[:3]) if asks else 0
+            ob[f"{prefix}_bid_depth_3"] = bid_d3
+            ob[f"{prefix}_ask_depth_3"] = ask_d3
+
+    record = {
+        "ts": now,
+        "slot_ts": market_data.get("slot_start_ts") or SlotContext.slot_for(now),
+        "tte": getattr(s, "last_tte_seconds", None),
+        "cycle_type": cycle_type,
+        # Model
+        "prob_yes": prob_yes,
+        "model_version": getattr(s, "last_model_version", ""),
+        "feature_status": getattr(s, "last_feature_status", ""),
+        # Edges
+        "q_t": q_t,
+        "c_t": c_t,
+        "edge_yes": edge_yes,
+        "edge_no": edge_no,
+        # Decision
+        "skip_reason": skip_reason,
+        "action": action,
+        # BTC
+        "btc_mid": features.get("delta", None),  # delta = (spot-strike)/strike
+        "strike": market_data.get("strike_price"),
+        # Features (flat dict for easy CSV conversion)
+        **{f"f_{k}": v for k, v in features.items()},
+        # Orderbook
+        **ob,
+    }
+
+    # Remove None values to keep lines compact
+    record = {k: v for k, v in record.items() if v is not None}
+
+    os.makedirs(os.path.dirname(_DECISION_LOG_PATH), exist_ok=True)
+    with open(_DECISION_LOG_PATH, "a") as f:
+        f.write(json.dumps(record, default=str) + "\n")
+        f.flush()
 
 
 def _book_summary(yes_book, no_book) -> dict:

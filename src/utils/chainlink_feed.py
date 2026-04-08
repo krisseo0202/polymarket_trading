@@ -39,10 +39,10 @@ class SlotOpenPrice:
 
 
 _STALE_WARN_S = 90.0    # Chainlink updates on 0.5% deviation; quiet periods can last minutes
-_RECONNECT_S = 120.0   # reconnect if no messages (including PONGs) for 2 min
+_RECONNECT_S = 30.0    # reconnect if no messages (including PONGs) for 30s
 _BUFFER_S = 600.0
 _BACKOFF_INIT = 1.0
-_BACKOFF_MAX = 60.0
+_BACKOFF_MAX = 15.0
 _PING_INTERVAL_S = 5.0
 _RESUBSCRIBE_NO_DATA_S = 60.0  # resubscribe if connected but no price within 60s
 

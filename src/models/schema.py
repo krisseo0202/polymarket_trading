@@ -10,15 +10,24 @@ MODEL_NAME = "btc_updown_xgb"
 
 FEATURE_COLUMNS: List[str] = [
     "btc_mid",
+    "btc_ret_5s",
     "btc_ret_15s",
     "btc_ret_30s",
     "btc_ret_60s",
+    "btc_ret_180s",
+    "btc_vol_15s",
     "btc_vol_30s",
     "btc_vol_60s",
+    "vol_ratio_15_60",
     "strike_price",
     "seconds_to_expiry",
     "moneyness",
     "distance_to_strike_bps",
+    # Volume features (tick count proxy; 0.0 when live feed lacks volume)
+    "volume_surge_ratio",
+    "btc_vwap_deviation",
+    "cumulative_volume_delta_60s",
+    # Orderbook features
     "yes_bid",
     "yes_ask",
     "yes_mid",
@@ -33,9 +42,11 @@ FEATURE_COLUMNS: List[str] = [
     "no_spread_pct",
     "no_book_imbalance",
     "no_ret_30s",
+    # FVG indicator
     "active_bull_gap",
     "active_bear_gap",
     "latest_gap_distance_pct",
+    # TD Sequential indicator
     "bull_setup",
     "bear_setup",
     "buy_cd",
@@ -44,6 +55,11 @@ FEATURE_COLUMNS: List[str] = [
     "sell_9",
     "buy_13",
     "sell_13",
+    # UT Bot indicator
+    "ut_bot_trend",
+    "ut_bot_distance_pct",
+    "ut_bot_buy_signal",
+    "ut_bot_sell_signal",
 ]
 
 DEFAULT_FEATURE_VALUES: Dict[str, float] = {name: 0.0 for name in FEATURE_COLUMNS}

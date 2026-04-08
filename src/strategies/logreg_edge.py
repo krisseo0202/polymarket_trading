@@ -47,12 +47,12 @@ class LogRegEdgeStrategy(Strategy):
         self.delta: float = float(config.get("delta", 0.05))
         self.max_spread_pct: float = float(config.get("max_spread_pct", 0.06))
         self.min_seconds_to_expiry: float = float(config.get("min_seconds_to_expiry", 10.0))
-        self.max_seconds_to_expiry: float = float(config.get("max_seconds_to_expiry", 295.0))
+        self.max_seconds_to_expiry: float = float(config.get("max_seconds_to_expiry", 300.0))
 
         # Exit: hold to expiry
         self.exit_rule = "hold_to_expiry"
         self.stop_loss_pct: float = float(config.get("stop_loss_pct", 999.0))
-        self.max_hold_seconds: int = int(config.get("max_hold_seconds", 300))
+        self.max_hold_seconds: int = int(config.get("max_hold_seconds", 240))
         self.profit_target_pct: float = float(config.get("profit_target_pct", 999.0))
 
         # Sizing
@@ -261,10 +261,11 @@ class LogRegEdgeStrategy(Strategy):
                 self.last_feature_status = "stale_btc"
                 return None
 
-        # Pass monotonic yes_history directly — _safe_return uses relative
-        # offsets so any consistent timestamp base works.
-        yes_history = list(self._price_history.get(self._yes_token_id) or [])
-        mono_now = time.monotonic() if yes_history else now_wall
+        # Convert monotonic yes_history to wall-clock so all snapshot
+        # timestamps share the same domain (btc_prices, slot_expiry_ts use wall clock).
+        mono_to_wall = now_wall - time.monotonic()
+        yes_history = [(ts + mono_to_wall, p)
+                       for ts, p in (self._price_history.get(self._yes_token_id) or [])]
 
         snapshot = {
             "btc_prices": btc_prices,
@@ -274,7 +275,7 @@ class LogRegEdgeStrategy(Strategy):
             "question": market_data.get("question", ""),
             "strike_price": market_data.get("strike_price"),
             "slot_expiry_ts": market_data.get("slot_expiry_ts"),
-            "now_ts": mono_now,
+            "now_ts": now_wall,
         }
 
         try:
@@ -286,6 +287,13 @@ class LogRegEdgeStrategy(Strategy):
 
         self.last_feature_status = prediction.feature_status
         self.last_model_version = prediction.model_version
+
+        if prediction.prob_yes is None:
+            self.logger.debug(
+                "logreg_edge: model returned no prediction (status=%s, btc_prices=%d)",
+                prediction.feature_status, len(btc_prices),
+            )
+
         return prediction
 
     # ------------------------------------------------------------------

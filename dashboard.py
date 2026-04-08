@@ -52,7 +52,7 @@ _POS_CACHE_TTL = 30.0  # seconds
 _market_cache: Optional[Dict[str, Any]] = None
 _market_cache_ts: float = 0.0
 _market_cache_slot: int = 0
-_MARKET_CACHE_TTL = 5.0  # re-discover every 5s for fresh outcomePrices
+_MARKET_CACHE_TTL = 15.0  # re-discover every 15s for fresh outcomePrices
 
 _book_cache: Optional[Dict[str, Any]] = None
 _book_cache_ts: float = 0.0
@@ -1649,7 +1649,7 @@ def main() -> None:
     parser.add_argument("--symbol",   default=None,            help="Exchange symbol (Coinbase: BTC-USD, Binance.US: btcusd). Defaults to exchange's canonical symbol.")
     parser.add_argument("--exchange", default="coinbase",     choices=["coinbase", "binance_us"],
                         help="WebSocket price feed backend: 'coinbase' (wss://ws-feed.exchange.coinbase.com) or 'binance_us' (wss://stream.binance.us:9443)")
-    parser.add_argument("--refresh", type=float, default=4,  help="Refresh rate in Hz")
+    parser.add_argument("--refresh", type=float, default=2,  help="Refresh rate in Hz")
     parser.add_argument("--window",  type=int, default=300,  help="Chart window (seconds)")
     parser.add_argument("--chart-w", type=int, default=_CHART_W, dest="chart_w",
                         help="Chart width in characters")

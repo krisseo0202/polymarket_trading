@@ -367,8 +367,8 @@ class TestObservableState:
         strat = _make_strategy(prob_yes=0.65, yes_ask=0.55, no_ask=0.48)
         now = time.time()
         strat.btc_feed = _MockBtcFeed([
-            (now - 60, 49_900.0),
-            (now, 50_100.0),
+            (now - 60, 49_900.0, 1.0),
+            (now, 50_100.0, 1.0),
         ])
         data = _market_data(yes_bid=0.54, yes_ask=0.55, no_bid=0.47, no_ask=0.48)
         strat.analyze(data)
