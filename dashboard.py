@@ -1681,7 +1681,7 @@ def main() -> None:
     console.print(f"\n[bold]BTC Feed Monitor[/bold] — connecting to [cyan]{symbol}[/cyan] via [cyan]{args.exchange}[/cyan]…")
     console.print("[dim]Starting WebSocket feed…[/dim]\n")
 
-    feed = BtcPriceFeed(symbol=symbol, exchange=args.exchange)
+    feed = BtcPriceFeed(symbol=symbol)
     feed.start()
     chainlink_feed = ChainlinkFeed(symbol="btc/usd")
     chainlink_feed.start()

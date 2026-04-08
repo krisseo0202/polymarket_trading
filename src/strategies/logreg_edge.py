@@ -59,6 +59,9 @@ class LogRegEdgeStrategy(Strategy):
         self.kelly_fraction: float = float(config.get("kelly_fraction", 0.15))
         self.position_size_usdc: float = float(config.get("position_size_usdc", 30.0))
 
+        # Price history for yes_mid_ret_30s feature
+        self._price_history: Dict[str, list] = {}
+
         # Observable state
         self.last_prob_yes: Optional[float] = None
         self.last_edge_yes: Optional[float] = None
@@ -70,6 +73,16 @@ class LogRegEdgeStrategy(Strategy):
         self.last_tte_seconds: Optional[float] = None
         self.last_feature_status: str = ""
         self.last_model_version: str = ""
+
+    def record_price(self, token_id: str, mid: float, ts: Optional[float] = None) -> None:
+        """Track mid-price history for feature computation."""
+        t = ts if ts is not None else time.monotonic()
+        hist = self._price_history.setdefault(token_id, [])
+        hist.append((t, mid))
+        # Keep last 5 minutes
+        cutoff = t - 300
+        while hist and hist[0][0] < cutoff:
+            hist.pop(0)
 
     # ------------------------------------------------------------------
     # Core interface

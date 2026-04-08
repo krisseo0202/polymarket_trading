@@ -1,9 +1,10 @@
 """Base Strategy class for all trading strategies"""
 
+import collections
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List, Optional, Dict, Any
+from typing import Deque, List, Optional, Dict, Any, Tuple
 
 from ..utils.market_utils import get_mid_price, round_to_tick
 
@@ -34,6 +35,10 @@ class Strategy(ABC):
         self.enabled = config.get("enabled", True)
         self.min_confidence = config.get("min_confidence", 0.5)
         self.max_position_size = config.get("max_position_size", 1000.0)
+        self.max_entry_price = config.get("max_entry_price", 0.95)
+        self.min_entry_price = config.get("min_entry_price", 0.05)
+        self.exit_rule: str = config.get("exit_rule", "default")
+        self.last_skip_reason: str = ""
 
         # Position state — authoritative after sync_position_from_inventory()
         self.active_token_id: Optional[str] = None
@@ -44,6 +49,13 @@ class Strategy(ABC):
         # Token context — subclasses populate via set_tokens()
         self._market_id: str = ""
         self._outcome_map: Dict[str, str] = {}
+        self._yes_token_id: str = ""
+        self._no_token_id: str = ""
+
+        # Mid-price history: token_id → deque of (monotonic_ts, mid)
+        # deque allows O(1) front-trim vs O(n) list comprehension rebuild
+        self._price_history: Dict[str, Deque[Tuple[float, float]]] = {}
+        self._history_max_age: float = 300.0
 
         # Pending exit info for PnL computation
         self._pending_exit_entry_price: Optional[float] = None
@@ -87,6 +99,55 @@ class Strategy(ABC):
         return True
 
     # ------------------------------------------------------------------
+    # Token context and price history
+    # ------------------------------------------------------------------
+
+    def set_tokens(self, market_id: str, yes_token_id: str, no_token_id: str) -> None:
+        """Register current market tokens. Resets position state on rollover."""
+        if (yes_token_id != self._yes_token_id or no_token_id != self._no_token_id) \
+                and self._yes_token_id:
+            self._reset_position_state()
+        self._market_id = market_id
+        self._yes_token_id = yes_token_id
+        self._no_token_id = no_token_id
+        self._outcome_map = {yes_token_id: "YES", no_token_id: "NO"}
+
+    def record_price(self, token_id: str, mid: float, ts: Optional[float] = None) -> None:
+        """Feed a mid-price observation into the internal history buffer."""
+        now = ts if ts is not None else time.monotonic()
+        buf = self._price_history.setdefault(token_id, collections.deque())
+        buf.append((now, mid))
+        cutoff = now - self._history_max_age
+        while buf and buf[0][0] < cutoff:
+            buf.popleft()
+
+    def seed_price_history(self, token_id: str, history: List[Tuple[float, float]]) -> None:
+        """Seed price history from external data (e.g. REST API).
+
+        Args:
+            token_id: Token to seed history for.
+            history: List of (wall_clock_ts, mid_price) sorted ascending.
+                     Timestamps are converted to monotonic basis.
+        """
+        if not history:
+            return
+        buf = self._price_history.get(token_id)
+        if buf and len(buf) >= 5:
+            return  # already have enough data, don't overwrite
+
+        now_wall = time.time()
+        now_mono = time.monotonic()
+        new_buf: Deque[Tuple[float, float]] = collections.deque()
+        cutoff_wall = now_wall - self._history_max_age
+        for wall_ts, mid in history:
+            if wall_ts < cutoff_wall or mid <= 0:
+                continue
+            mono_ts = now_mono - (now_wall - wall_ts)
+            new_buf.append((mono_ts, mid))
+        if new_buf:
+            self._price_history[token_id] = new_buf
+
+    # ------------------------------------------------------------------
     # Shared position lifecycle helpers
     # ------------------------------------------------------------------
 
@@ -104,6 +165,9 @@ class Strategy(ABC):
             profit_target_pct, stop_loss_pct, max_hold_seconds,
             _market_id, _outcome_map
         """
+        if self.exit_rule == "hold_to_expiry":
+            return None
+
         if self.active_token_id is None or self.entry_price is None:
             return None
 
@@ -117,10 +181,11 @@ class Strategy(ABC):
         if book is None:
             return None
         mid = get_mid_price(book)
-        if mid is None:
+        best_bid = book.bids[0].price if book.bids else mid
+        if not best_bid or best_bid <= 0:
             return None
 
-        profit_pct = (mid - self.entry_price) / self.entry_price
+        profit_pct = (best_bid - self.entry_price) / self.entry_price
         time_held  = now_ts - self.entry_timestamp if self.entry_timestamp else 0.0
 
         reason: Optional[str] = None
@@ -140,10 +205,20 @@ class Strategy(ABC):
             outcome=self._outcome_map.get(self.active_token_id, ""),
             action="SELL",
             confidence=1.0,
-            price=round_to_tick(mid, tick),
+            price=round_to_tick(best_bid, tick),
             size=held_size,
             reason=reason,
         )
+
+    def is_flat(self, by_token: Dict[str, Any]) -> bool:
+        """True if no position held on either side."""
+        for tid in (self._yes_token_id, self._no_token_id):
+            if not tid:
+                continue
+            pos = by_token.get(tid)
+            if pos and pos.size > 0:
+                return False
+        return True
 
     def _reset_position_state(self) -> None:
         """Reset open position tracking fields to None."""
@@ -151,6 +226,24 @@ class Strategy(ABC):
         self.entry_price     = None
         self.entry_timestamp = None
         self.entry_size      = None
+
+    def _auto_recover_position(self, by_token: Dict[str, Any], now_ts: float) -> None:
+        """Recover position state from live positions after a bot restart.
+
+        No-op when already tracking a position. Checks YES then NO token.
+        """
+        if self.active_token_id is not None:
+            return
+        for tid in (self._yes_token_id, self._no_token_id):
+            if not tid:
+                continue
+            pos = by_token.get(tid)
+            if pos and pos.size > 0:
+                self.active_token_id = tid
+                self.entry_price = pos.average_price
+                self.entry_timestamp = now_ts
+                self.entry_size = pos.size
+                break
 
     def sync_position_from_inventory(
         self,
