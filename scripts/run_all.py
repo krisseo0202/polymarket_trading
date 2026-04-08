@@ -44,9 +44,20 @@ def launch(
     ob_interval: float,
     bot_args: list[str],
 ) -> Dict[str, subprocess.Popen]:
-    """Start each subprocess, returning name→Popen mapping."""
+    """Start each subprocess, returning name→Popen mapping.
+
+    Order: bot first (so it initializes feeds/strategy), then collectors.
+    """
     env = {**os.environ, "PYTHONUNBUFFERED": "1"}
     procs: Dict[str, subprocess.Popen] = {}
+
+    # Trading bot — start first so it can initialize before collectors add noise
+    if bot:
+        bot_cmd = [sys.executable, "bot.py"] + bot_args
+        procs["bot"] = subprocess.Popen(bot_cmd, cwd=_PROJECT_ROOT, env=env)
+        print(f"{_prefix('bot')} PID {procs['bot'].pid}")
+        print(f"{_prefix('bot')} Waiting 5s for bot to initialize...")
+        time.sleep(5)
 
     # BTC 1s recorder
     btc_cmd = [
@@ -65,12 +76,6 @@ def launch(
     ]
     procs["orderbook"] = subprocess.Popen(ob_cmd, cwd=_PROJECT_ROOT, env=env)
     print(f"{_prefix('orderbook')} PID {procs['orderbook'].pid}  →  {ob_output}")
-
-    # Trading bot
-    if bot:
-        bot_cmd = [sys.executable, "bot.py"] + bot_args
-        procs["bot"] = subprocess.Popen(bot_cmd, cwd=_PROJECT_ROOT, env=env)
-        print(f"{_prefix('bot')} PID {procs['bot'].pid}")
 
     return procs
 
@@ -148,7 +153,13 @@ def main() -> None:
     if not args.no_bot:
         components.append("bot")
     print(f"  Starting: {', '.join(components)}")
-    print(f"  Press Ctrl+C to stop all.\n")
+    print(f"\n  Session outputs:")
+    print(f"    BTC data:   {args.btc_output}")
+    print(f"    OB data:    {args.ob_output}")
+    if not args.no_bot:
+        print(f"    Bot log:    logs/btc_updown_bot.log")
+        print(f"    Decisions:  data/decision_log_*.jsonl (timestamped at bot start)")
+    print(f"\n  Press Ctrl+C to stop all.\n")
 
     procs = launch(
         bot=not args.no_bot,

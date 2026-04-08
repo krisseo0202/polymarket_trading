@@ -47,12 +47,12 @@ class LogRegEdgeStrategy(Strategy):
         self.delta: float = float(config.get("delta", 0.05))
         self.max_spread_pct: float = float(config.get("max_spread_pct", 0.06))
         self.min_seconds_to_expiry: float = float(config.get("min_seconds_to_expiry", 10.0))
-        self.max_seconds_to_expiry: float = float(config.get("max_seconds_to_expiry", 295.0))
+        self.max_seconds_to_expiry: float = float(config.get("max_seconds_to_expiry", 300.0))
 
         # Exit: hold to expiry
         self.exit_rule = "hold_to_expiry"
         self.stop_loss_pct: float = float(config.get("stop_loss_pct", 999.0))
-        self.max_hold_seconds: int = int(config.get("max_hold_seconds", 300))
+        self.max_hold_seconds: int = int(config.get("max_hold_seconds", 240))
         self.profit_target_pct: float = float(config.get("profit_target_pct", 999.0))
 
         # Sizing
@@ -287,6 +287,13 @@ class LogRegEdgeStrategy(Strategy):
 
         self.last_feature_status = prediction.feature_status
         self.last_model_version = prediction.model_version
+
+        if prediction.prob_yes is None:
+            self.logger.debug(
+                "logreg_edge: model returned no prediction (status=%s, btc_prices=%d)",
+                prediction.feature_status, len(btc_prices),
+            )
+
         return prediction
 
     # ------------------------------------------------------------------
