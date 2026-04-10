@@ -24,6 +24,7 @@ import os
 import sys
 import threading
 import time
+import traceback
 import tty
 import termios
 from datetime import datetime, timezone
@@ -488,12 +489,24 @@ def _cached_midpoint(token_id: str) -> Optional[float]:
         return cached[0] if cached else None
 
 
-def _compute_total_unrealized(bot_state: dict) -> Optional[float]:
-    """Compute total unrealized PnL from active inventories + CLOB midpoints."""
+def _compute_total_unrealized(
+    bot_state: dict, market: Optional[Dict[str, Any]] = None
+) -> Optional[float]:
+    """Compute total unrealized PnL from active inventories + CLOB midpoints.
+
+    Restricts to the current market's tokens (if provided) to avoid hammering
+    the CLOB API for stale resolved-market positions.
+    """
     inventories = bot_state.get("inventories", {})
+    current_tokens: set = set()
+    if market:
+        if market.get("up_token"):
+            current_tokens.add(market["up_token"])
+        if market.get("down_token"):
+            current_tokens.add(market["down_token"])
     active = {
         tid: inv for tid, inv in inventories.items()
-        if inv.get("position", 0) != 0
+        if inv.get("position", 0) != 0 and (not current_tokens or tid in current_tokens)
     }
     if not active:
         return None
@@ -590,10 +603,17 @@ def _build_positions_panel(
         )
 
     inventories = bot_state.get("inventories", {})
-    # Filter to non-zero positions
+    # Filter to non-zero positions, limit to current market tokens to avoid
+    # hammering the CLOB API for 100+ stale resolved-market positions.
+    current_tokens: set = set()
+    if market:
+        if market.get("up_token"):
+            current_tokens.add(market["up_token"])
+        if market.get("down_token"):
+            current_tokens.add(market["down_token"])
     active = {
         tid: inv for tid, inv in inventories.items()
-        if inv.get("position", 0) != 0
+        if inv.get("position", 0) != 0 and (not current_tokens or tid in current_tokens)
     }
 
     if not active:
@@ -1500,7 +1520,7 @@ def _build_panel(
     # Use pre-computed unrealized PnL from snapshot (no extra CLOB API calls)
     snap_upnl = snapshot.get("unrealized_pnl") if snapshot else None
     total_upnl = snap_upnl if snap_upnl is not None else (
-        _compute_total_unrealized(bot_state) if bot_state else None
+        _compute_total_unrealized(bot_state, market=snap_market or market) if bot_state else None
     )
     pnl_panel = _build_pnl_panel(bot_state, total_upnl=total_upnl)
     bot_status_panel = _build_bot_status_panel(bot_state, file_mtime, snapshot=snapshot)
@@ -1706,17 +1726,21 @@ def main() -> None:
         ) as live:
             while True:
                 t0 = time.monotonic()
-                panel = _build_panel(
-                    feed,
-                    chainlink_feed,
-                    args.window,
-                    args.chart_w,
-                    args.chart_h,
-                    start_time,
-                    args.state_file,
-                    args.log_file,
-                    args.config,
-                )
+                try:
+                    panel = _build_panel(
+                        feed,
+                        chainlink_feed,
+                        args.window,
+                        args.chart_w,
+                        args.chart_h,
+                        start_time,
+                        args.state_file,
+                        args.log_file,
+                        args.config,
+                    )
+                except Exception:
+                    err_text = Text(traceback.format_exc(), style="bold red")
+                    panel = Panel(err_text, title="[bold red]Dashboard Error[/bold red]", border_style="red")
                 live.update(panel)
                 elapsed = time.monotonic() - t0
                 time.sleep(max(0, interval - elapsed))

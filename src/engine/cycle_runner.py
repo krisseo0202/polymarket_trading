@@ -23,13 +23,22 @@ from ..engine.inventory import (
     sync_inventories_to_state,
     sync_strategy_from_inventories,
 )
-from ..engine.slot_state import SLOT_INTERVAL_S, SlotContext, settle_expiring_positions
+from ..engine.slot_state import (
+    SLOT_INTERVAL_S,
+    SlotContext,
+    apply_slot_settlement,
+    fetch_slot_market,
+    settle_expiring_positions,
+)
 from ..engine.state_store import snapshot_chainlink_state, snapshot_strategy_state
 from ..strategies.base import Signal
 from ..utils.market_utils import find_btc_updown_market
 
 if TYPE_CHECKING:
     from ..utils.startup import Services
+
+
+PENDING_SETTLEMENT_TTL_S = 3600  # drop pending settlements older than this
 
 
 class CycleResult(Enum):
@@ -57,6 +66,8 @@ class CycleRunner:
 
         # Seed slot history in background so dashboard shows outcomes immediately.
         threading.Thread(target=self._seed_slot_history, daemon=True).start()
+        # Sweep stale inventories from prior sessions (runs once, background).
+        threading.Thread(target=self._sweep_stale_inventories, daemon=True).start()
 
     # ── Public properties ────────────────────────────────────────────────────
 
@@ -91,6 +102,7 @@ class CycleRunner:
 
         new_market_id = market_info["market_id"]
         self._handle_rollover(new_market_id, market_info)
+        self._retry_pending_settlements()
 
         self._market_id = new_market_id
         self._yes_tid = market_info["yes_token_id"]
@@ -427,6 +439,24 @@ class CycleRunner:
             svc.state.slot_outcomes = {
                 k: v for k, v in svc.state.slot_outcomes.items() if k >= cutoff
             }
+        else:
+            # Outcome not available yet — queue for retry on next cycle.
+            # Only queue if there were actual open positions to settle.
+            has_open = any(
+                svc.inventories.get(tid) is not None
+                and svc.inventories[tid].position > 0
+                for tid in (self._yes_tid, self._no_tid)
+            )
+            if has_open:
+                svc.state.pending_settlements.append({
+                    "slot_ts": ended_slot_ts,
+                    "yes_token_id": self._yes_tid,
+                    "no_token_id": self._no_tid,
+                })
+                logger.info(
+                    f"Queued pending settlement for slot {ended_slot_ts} "
+                    f"(yes={self._yes_tid[:8]}, no={self._no_tid[:8]})"
+                )
         sync_inventories_to_state(svc.state, svc.inventories)
 
         logger.info(
@@ -445,6 +475,48 @@ class CycleRunner:
                 if o.token_id != old_tid
             }
             svc.execution_tracker._last_positions_by_token.pop(old_tid, None)
+
+    def _retry_pending_settlements(self) -> None:
+        """Retry settling positions from slots where the outcome wasn't available at rollover."""
+        svc = self.svc
+        logger = svc.logger
+        if not svc.state.pending_settlements:
+            return
+
+        still_pending = []
+        for entry in svc.state.pending_settlements:
+            slot_ts = entry["slot_ts"]
+            yes_tid = entry["yes_token_id"]
+            no_tid = entry["no_token_id"]
+
+            # Drop entries past TTL — outcome will never arrive
+            if time.time() - slot_ts > PENDING_SETTLEMENT_TTL_S:
+                logger.warning(
+                    f"Dropping stale pending settlement for slot {slot_ts} (>1h old)"
+                )
+                continue
+
+            outcome = settle_expiring_positions(
+                yes_token_id=yes_tid,
+                no_token_id=no_tid,
+                slot_ts=slot_ts,
+                inventories=svc.inventories,
+                state=svc.state,
+                risk_manager=svc.risk_manager,
+                paper_trading=svc.paper_trading,
+                logger=logger,
+            )
+            if outcome is not None:
+                svc.state.slot_outcomes[slot_ts] = outcome
+                sync_inventories_to_state(svc.state, svc.inventories)
+                logger.info(
+                    f"Settled pending slot {slot_ts} → {outcome} "
+                    f"(daily_pnl={svc.state.daily_realized_pnl:+.4f})"
+                )
+            else:
+                still_pending.append(entry)
+
+        svc.state.pending_settlements = still_pending
 
     def _seed_slot_history(self, n_slots: int = 12) -> None:
         """Background: fetch outcomes for the last n_slots and seed state.slot_outcomes.
@@ -482,6 +554,83 @@ class CycleRunner:
                 f"Seeded {sum(1 for k in svc.state.slot_outcomes if k < current_slot)} "
                 "historical slot outcomes into state"
             )
+
+    def _sweep_stale_inventories(self) -> None:
+        """One-time startup sweep: settle stale inventory positions from resolved markets.
+
+        Scans recent slots via Gamma API, matches token IDs against inventory,
+        and applies synthetic settlement fills for any positions that were never settled
+        (e.g., because the outcome wasn't available at rollover time).
+        """
+        svc = self.svc
+        logger = svc.logger
+
+        # Find stale inventory tokens (non-zero position, not the current market).
+        # Hydrate svc.inventories from persisted state for any missing entries so
+        # the shared settlement helper can find them.
+        stale_tids: set = set()
+        for tid, inv_data in svc.state.inventories.items():
+            if not isinstance(inv_data, dict):
+                continue
+            pos = inv_data.get("position", 0)
+            if pos > 0 and tid not in (self._yes_tid, self._no_tid):
+                stale_tids.add(tid)
+                if svc.inventories.get(tid) is None:
+                    svc.inventories[tid] = InventoryState(
+                        position=pos, avg_cost=inv_data.get("avg_cost", 0),
+                    )
+
+        if not stale_tids:
+            return
+
+        logger.info(f"Startup sweep: {len(stale_tids)} stale inventory positions to settle")
+
+        current_slot = int(math.floor(time.time() / SLOT_INTERVAL_S) * SLOT_INTERVAL_S)
+        settled_count = 0
+
+        # Scan backwards through recent slots (up to 24h = 288 slots)
+        for i in range(1, 289):
+            if not stale_tids:
+                break
+            slot_ts = current_slot - i * SLOT_INTERVAL_S
+            info = fetch_slot_market(slot_ts, logger)
+            if info is None:
+                continue
+
+            outcome = info["outcome"]
+            yes_tid = info["yes_token_id"]
+            no_tid = info["no_token_id"]
+
+            # Cache outcome opportunistically for the dashboard slot history
+            svc.state.slot_outcomes.setdefault(slot_ts, outcome)
+
+            matched_tids = stale_tids & {yes_tid, no_tid}
+            if not matched_tids:
+                continue
+
+            settled_count += apply_slot_settlement(
+                yes_tid, no_tid, outcome,
+                svc.inventories, svc.state, svc.risk_manager,
+                svc.paper_trading, logger,
+                label_prefix=f"Sweep settled (slot {slot_ts})",
+            )
+            stale_tids -= matched_tids
+
+        # Zero out any remaining unmatched stale positions (too old to look up)
+        for tid in stale_tids:
+            inv = svc.inventories.get(tid)
+            if inv is not None:
+                inv.position = 0
+                inv.avg_cost = 0
+            svc.state.inventories[tid] = {"position": 0, "avg_cost": 0}
+
+        sync_inventories_to_state(svc.state, svc.inventories)
+        svc.state_store.save(svc.state)
+        logger.info(
+            f"Startup sweep complete: settled {settled_count} positions, "
+            f"{len(stale_tids)} zeroed (older than 24h or API miss), "
+            f"daily_pnl={svc.state.daily_realized_pnl:+.4f}"
+        )
 
     def _close_open_positions(self) -> None:
         """SELL any open positions at shutdown."""

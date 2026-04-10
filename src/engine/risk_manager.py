@@ -124,7 +124,7 @@ class RiskManager:
             return False, f"Position size {signal.size} exceeds limit {max_size}"
         
         # Check total exposure
-        total_exposure = sum(abs(pos.size * pos.current_price or pos.average_price) for pos in positions)
+        total_exposure = sum(abs(pos.size * (pos.current_price or pos.average_price or 0)) for pos in positions)
         total_exposure += sum(abs(order.size * order.price) for order in orders if order.status == "PENDING")
         total_exposure += signal.size * signal.price
         

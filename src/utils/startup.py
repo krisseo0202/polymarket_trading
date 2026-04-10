@@ -99,6 +99,17 @@ def init_services(args) -> Services:
     if exit_rule:
         strategy_cfg["exit_rule"] = exit_rule
 
+    # CLI overrides for strategy config
+    delta = getattr(args, "delta", None)
+    if delta is not None:
+        strategy_cfg["delta"] = delta
+    position_size = getattr(args, "position_size", None)
+    if position_size is not None:
+        strategy_cfg["position_size_usdc"] = position_size
+    kelly = getattr(args, "kelly", None)
+    if kelly is not None:
+        strategy_cfg["kelly_fraction"] = kelly
+
     if not getattr(args, "no_confirm", False) and sys.stdin.isatty():
         strategy_cfg = display_and_confirm_config(
             strategy_name=strategy_name,
@@ -142,12 +153,14 @@ def init_services(args) -> Services:
 
     perf_store = PerformanceStore(bot_cfg.get("perf_db_path", "perf.db"))
 
+    paper_balance = getattr(args, "balance", None) or 10000.0
     client = PolymarketClient(
         private_key=cfg.private_key,
         funder_address=cfg.funder_address,
         host=cfg.api_host,
         chain_id=cfg.chain_id,
         paper_trading=paper_trading,
+        paper_balance=paper_balance,
     )
 
     risk_limits = RiskLimits(

@@ -63,6 +63,11 @@ class BotState:
     # Written at rollover so the dashboard never needs to call Gamma API.
     slot_outcomes: Dict[int, str] = field(default_factory=dict)
 
+    # Pending settlements — slots where outcome wasn't available at rollover time.
+    # Each entry: {"slot_ts": int, "yes_token_id": str, "no_token_id": str}
+    # Retried each cycle until resolved, then removed.
+    pending_settlements: List[Dict] = field(default_factory=list)
+
     def __post_init__(self):
         if not self.daily_reset_date:
             self.daily_reset_date = str(date.today())

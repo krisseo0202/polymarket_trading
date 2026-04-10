@@ -23,19 +23,22 @@ class PolymarketClient:
         host: str = "https://clob.polymarket.com",
         chain_id: int = 137,
         signature_type: int = 1,
-        paper_trading: bool = False
+        paper_trading: bool = False,
+        paper_balance: float = 10000.0,
     ):
         """
         Initialize Polymarket client
-        
+
         Args:
             private_key: Private key for signing transactions
             funder_address: Address to fund orders
             host: API host URL
             chain_id: Blockchain chain ID (137 for Polygon)
             paper_trading: If True, simulate trades without executing
+            paper_balance: Starting balance for paper trading (default $10,000)
         """
         self.paper_trading = paper_trading
+        self._paper_balance = paper_balance
         self.host = host
         self.chain_id = chain_id
         
@@ -433,7 +436,7 @@ class PolymarketClient:
     def get_balance(self) -> float:
         """Get account balance"""
         if self.paper_trading:
-            return 10000.0  # Mock balance
+            return self._paper_balance
         
         try:
             balance = self.client.get_balance_allowance(

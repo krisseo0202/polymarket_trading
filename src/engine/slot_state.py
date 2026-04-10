@@ -234,10 +234,11 @@ def _btc_feed_slot_open(btc_feed, slot_ts: int) -> Optional[float]:
     return None
 
 
-def fetch_slot_outcome(slot_ts: int, logger) -> Optional[str]:
-    """
-    Query Gamma API for the resolution outcome of a specific 5-min slot.
-    Returns "Up", "Down", or None (unresolved / API error).
+def fetch_slot_market(slot_ts: int, logger) -> Optional[dict]:
+    """Fetch the full market info for a slot from Gamma API.
+
+    Returns dict with keys: outcome ("Up"/"Down"), yes_token_id, no_token_id.
+    Returns None if the market is not yet resolved or on API error.
     """
     slug = f"btc-updown-5m-{slot_ts}"
     try:
@@ -256,14 +257,83 @@ def fetch_slot_outcome(slot_ts: int, logger) -> Optional[str]:
         outcome_prices: list = json.loads(raw) if isinstance(raw, str) else (raw or [])
         if not closed or len(outcome_prices) < 2:
             return None
+
+        outcome: Optional[str] = None
         if float(outcome_prices[0]) > 0.9:
-            return "Up"
-        if float(outcome_prices[1]) > 0.9:
-            return "Down"
-        return None
+            outcome = "Up"
+        elif float(outcome_prices[1]) > 0.9:
+            outcome = "Down"
+        if outcome is None:
+            return None
+
+        raw_tokens = market.get("clobTokenIds", "")
+        if isinstance(raw_tokens, str) and raw_tokens:
+            token_ids: list = json.loads(raw_tokens)
+        elif isinstance(raw_tokens, list):
+            token_ids = raw_tokens
+        else:
+            token_ids = []
+
+        return {
+            "outcome": outcome,
+            "yes_token_id": token_ids[0] if len(token_ids) > 0 else "",
+            "no_token_id": token_ids[1] if len(token_ids) > 1 else "",
+        }
     except Exception as exc:
-        logger.warning(f"Gamma API error fetching outcome for slot {slot_ts}: {exc}")
+        logger.warning(f"Gamma API error fetching market for slot {slot_ts}: {exc}")
         return None
+
+
+def fetch_slot_outcome(slot_ts: int, logger) -> Optional[str]:
+    """
+    Query Gamma API for the resolution outcome of a specific 5-min slot.
+    Returns "Up", "Down", or None (unresolved / API error).
+    """
+    info = fetch_slot_market(slot_ts, logger)
+    return info["outcome"] if info else None
+
+
+def apply_slot_settlement(
+    yes_token_id: str,
+    no_token_id: str,
+    outcome: str,
+    inventories: "Dict[str, InventoryState]",
+    state: "BotState",
+    risk_manager: "RiskManager",
+    paper_trading: bool,
+    logger,
+    label_prefix: str = "Settlement",
+) -> int:
+    """Apply synthetic settlement SELLs for any open positions, given a known outcome.
+
+    Returns the number of positions settled.
+    """
+    from .inventory import apply_fill_to_state  # local import avoids circular at module level
+
+    settlement = {
+        "YES": 0.99 if outcome == "Up" else 0.01,
+        "NO":  0.99 if outcome == "Down" else 0.01,
+    }
+    settled = 0
+    for token_id, side in ((yes_token_id, "YES"), (no_token_id, "NO")):
+        inv = inventories.get(token_id)
+        if inv is None or inv.position <= 0:
+            continue
+        price = settlement[side]
+        size = inv.position
+        realized = apply_fill_to_state(inv, "SELL", price, size, state, risk_manager)
+        if realized > 0:
+            state.session_wins += 1
+        elif realized < 0:
+            state.session_losses += 1
+        label = "paper" if paper_trading else "live"
+        logger.info(
+            f"[{label}] {label_prefix}: {side} {token_id[:8]} "
+            f"{size:.2f}sh @ {price:.2f} → realized {realized:+.4f} "
+            f"(outcome: {outcome})"
+        )
+        settled += 1
+    return settled
 
 
 def settle_expiring_positions(
@@ -281,12 +351,9 @@ def settle_expiring_positions(
 
     Called at market rollover BEFORE resetting slot_realized_pnl.
     """
-    from .inventory import apply_fill_to_state  # local import avoids circular at module level
-
-    positions_to_settle = [(yes_token_id, "YES"), (no_token_id, "NO")]
     has_open = any(
         inventories.get(tid) is not None and inventories[tid].position > 0
-        for tid, _ in positions_to_settle
+        for tid in (yes_token_id, no_token_id)
     )
     if not has_open:
         return None
@@ -299,26 +366,9 @@ def settle_expiring_positions(
         )
         return None
 
-    settlement = {
-        "YES": 0.99 if outcome == "Up" else 0.01,
-        "NO":  0.99 if outcome == "Down" else 0.01,
-    }
-
-    for token_id, side in positions_to_settle:
-        inv = inventories.get(token_id)
-        if inv is None or inv.position <= 0:
-            continue
-        price = settlement[side]
-        size = inv.position
-        realized = apply_fill_to_state(inv, "SELL", price, size, state, risk_manager)
-        if realized > 0:
-            state.session_wins += 1
-        elif realized < 0:
-            state.session_losses += 1
-        label = "paper" if paper_trading else "live"
-        logger.info(
-            f"[{label}] Settlement SELL: {side} {token_id[:8]} "
-            f"{size:.2f}sh @ {price:.2f} → realized {realized:+.4f} "
-            f"(slot outcome: {outcome})"
-        )
+    apply_slot_settlement(
+        yes_token_id, no_token_id, outcome,
+        inventories, state, risk_manager, paper_trading, logger,
+        label_prefix="Settlement SELL",
+    )
     return outcome

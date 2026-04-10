@@ -104,23 +104,25 @@ strategies:
     enabled: true
     btc_symbol: "BTC-USD"
     btc_exchange: "coinbase"
-    model_dir: "models/logreg"   # directory with logreg_model.pkl, logreg_scaler.pkl
+    model_dir: "models/logreg_v4"  # v4: no delta, +OB imbalance, isotonic calibration
 
     # Entry filters
-    delta: 0.05                  # minimum margin of safety beyond cost
+    delta: 0.08                  # minimum margin of safety beyond cost (raised from 0.05; calibration error is 8.5%)
     max_spread_pct: 0.06         # reject if spread > 6% of mid
     min_seconds_to_expiry: 10    # don't enter with < 10s left (execution risk)
     max_seconds_to_expiry: 295   # allow entry near slot open
+    min_entry_price: 0.35        # skip cheap contracts (data: <0.35 loses money)
+    max_entry_price: 0.65        # skip expensive contracts (data: >0.65 loses money)
 
     # Hold-to-expiry: disable the cycle runner's time-remaining suppression
     max_hold_seconds: 999
 
     # Kelly sizing
-    kelly_fraction: 0.15         # fractional Kelly multiplier
+    kelly_fraction: 0.10         # fractional Kelly multiplier (reduced from 0.15; break-even performance)
     position_size_usdc: 30.0     # hard cap per trade
 
     # Confidence gate
-    min_confidence: 0.51
+    min_confidence: 0.55         # minimum model prob to allow trade (raised from 0.51; 0.5 conf = 40% WR)
 
   btc_vol_reversion:
     enabled: true

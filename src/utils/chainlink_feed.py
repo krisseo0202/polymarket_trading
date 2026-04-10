@@ -396,17 +396,21 @@ class ChainlinkFeed:
     def _watchdog_loop(self) -> None:
         """Poll feed age and log health. Reconnect is handled by the recv loop and PONG timeout."""
         last_health_log = 0.0
+        last_stale_warn = 0.0
         _HEALTH_LOG_INTERVAL_S = 60.0
+        _STALE_WARN_INTERVAL_S = 30.0  # throttle stale warnings to once per 30s
         while not self._stop_evt.is_set():
             age_ms = self.get_feed_age_ms()
             now = time.time()
             if age_ms is not None:
                 age_s = age_ms / 1000
                 if age_s > self._reconnect_s:
-                    self._logger.warning(
-                        f"Chainlink price data stale ({age_s:.1f}s); "
-                        f"WS may be alive (check PONG timeout)"
-                    )
+                    if now - last_stale_warn >= _STALE_WARN_INTERVAL_S:
+                        self._logger.warning(
+                            f"Chainlink price data stale ({age_s:.1f}s); "
+                            f"WS may be alive (check PONG timeout)"
+                        )
+                        last_stale_warn = now
                 elif age_s > self._stale_warn_s:
                     self._logger.debug(
                         f"Chainlink feed age {age_s:.1f}s (normal for deviation-based oracle)"
