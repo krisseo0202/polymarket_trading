@@ -44,7 +44,7 @@ class LogRegEdgeStrategy(Strategy):
         self.model_service = model_service
 
         # Entry filters
-        self.delta: float = float(config.get("delta", 0.05))
+        self.delta: float = float(config.get("delta", 0.025))
         self.max_spread_pct: float = float(config.get("max_spread_pct", 0.06))
         self.min_seconds_to_expiry: float = float(config.get("min_seconds_to_expiry", 10.0))
         self.max_seconds_to_expiry: float = float(config.get("max_seconds_to_expiry", 300.0))
@@ -171,14 +171,18 @@ class LogRegEdgeStrategy(Strategy):
         self.last_net_edge_yes = edge_yes
         self.last_net_edge_no = edge_no
 
+        # Tighten delta as expiry approaches: market is better calibrated and
+        # execution risk is higher near close, so demand more edge.
+        effective_delta = self.delta * (1.0 + 0.5 * max(0.0, 1.0 - tte / 120.0))
+
         # Entry decision: pick the side with higher edge, but must exceed delta
-        if edge_yes >= edge_no and edge_yes >= self.delta:
+        if edge_yes >= edge_no and edge_yes >= effective_delta:
             side = "YES"
             edge = edge_yes
             entry_ask = yes_ask
             book = yes_book
             prob = p_hat
-        elif edge_no > edge_yes and edge_no >= self.delta:
+        elif edge_no > edge_yes and edge_no >= effective_delta:
             side = "NO"
             edge = edge_no
             entry_ask = no_ask
@@ -186,7 +190,7 @@ class LogRegEdgeStrategy(Strategy):
             prob = 1.0 - p_hat
         else:
             best = max(edge_yes, edge_no)
-            self.last_skip_reason = f"edge_low: best={best:+.3f} < delta={self.delta}"
+            self.last_skip_reason = f"edge_low: best={best:+.3f} < delta={effective_delta:.3f} (tte={tte:.0f}s)"
             return []
 
         # Spread filter

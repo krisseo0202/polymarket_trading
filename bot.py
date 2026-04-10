@@ -291,6 +291,14 @@ def main() -> None:
     parser.add_argument("--no-confirm", action="store_true", default=False)
     parser.add_argument("--clean", action="store_true", default=False,
                         help="Start a clean session: clear trade logs and reset bot state")
+    parser.add_argument("--delta", type=float, default=None,
+                        help="Minimum edge threshold for entry (default: 0.025)")
+    parser.add_argument("--balance", type=float, default=None,
+                        help="Paper trading balance in USD (default: 10000)")
+    parser.add_argument("--position-size", type=float, default=None,
+                        help="Max position size per trade in USD (default: 30)")
+    parser.add_argument("--kelly", type=float, default=None,
+                        help="Kelly fraction for position sizing (default: 0.15)")
     parser.add_argument("--exit-rule", choices=["default", "hold_to_expiry"],
                         default=None, help="Exit strategy: default (strategy-defined) or hold_to_expiry")
     args = parser.parse_args()
