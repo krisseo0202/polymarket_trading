@@ -128,33 +128,39 @@ class PolymarketClient:
         if self.paper_trading:
             return self._fetch_real_order_book(token_id)
 
-        try:
-            book = self.client.get_order_book(token_id)
+        import time as _time
+        last_err = None
+        for attempt in range(2):  # one retry on transient API errors
+            try:
+                book = self.client.get_order_book(token_id)
 
-            bids = sorted(
-                [OrderBookEntry(price=float(bid.price), size=float(bid.size))
-                 for bid in book.bids],
-                key=lambda e: e.price, reverse=True,
-            )
-            asks = sorted(
-                [OrderBookEntry(price=float(ask.price), size=float(ask.size))
-                 for ask in book.asks],
-                key=lambda e: e.price,
-            )
-            min_order_size = int(book.min_order_size)
-            tick_size = float(book.tick_size)
-            return OrderBook(
-                market_id="",
-                token_id=token_id,
-                bids=bids,
-                asks=asks,
-                min_order_size=min_order_size,
-                tick_size=tick_size,
-                last_price=float(book.last_price) if hasattr(book, 'last_price') and book.last_price else None,
-                timestamp=datetime.now()
-            )
-        except Exception as e:
-            raise Exception(f"Error fetching order book: {e}")
+                bids = sorted(
+                    [OrderBookEntry(price=float(bid.price), size=float(bid.size))
+                     for bid in book.bids],
+                    key=lambda e: e.price, reverse=True,
+                )
+                asks = sorted(
+                    [OrderBookEntry(price=float(ask.price), size=float(ask.size))
+                     for ask in book.asks],
+                    key=lambda e: e.price,
+                )
+                min_order_size = int(book.min_order_size)
+                tick_size = float(book.tick_size)
+                return OrderBook(
+                    market_id="",
+                    token_id=token_id,
+                    bids=bids,
+                    asks=asks,
+                    min_order_size=min_order_size,
+                    tick_size=tick_size,
+                    last_price=float(book.last_price) if hasattr(book, 'last_price') and book.last_price else None,
+                    timestamp=datetime.now()
+                )
+            except Exception as e:
+                last_err = e
+                if attempt == 0:
+                    _time.sleep(1.0)  # brief backoff before retry
+        raise Exception(f"Error fetching order book: {last_err}")
 
     def _fetch_real_order_book(self, token_id: str) -> OrderBook:
         """Fetch real order book from CLOB REST API (no auth required).

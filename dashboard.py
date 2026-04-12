@@ -713,11 +713,20 @@ def _build_pnl_panel(
 
     slot_pnl = bot_state.get("slot_realized_pnl", 0.0)
     slot_style = "green" if slot_pnl >= 0 else "red"
+    last_slot_pnl = bot_state.get("last_slot_pnl", 0.0)
+    last_slot_outcome = bot_state.get("last_slot_outcome", "")
 
     tbl = Table(show_header=False, box=None, padding=(0, 1), expand=True)
-    tbl.add_column(style="dim", width=8)
+    tbl.add_column(style="dim", width=10)
     tbl.add_column(justify="right")
     tbl.add_row("Slot PnL", Text(f"{slot_pnl:+.4f}", style=f"bold {slot_style}"))
+    # Show the just-settled slot's PnL so the user sees the result of a
+    # hold-to-expiry resolution immediately after rollover, when
+    # slot_realized_pnl has already been reset to 0.0 for the new slot.
+    if last_slot_pnl != 0.0 or last_slot_outcome:
+        ls_style = "green" if last_slot_pnl >= 0 else "red"
+        outcome_tag = f" ({last_slot_outcome})" if last_slot_outcome else ""
+        tbl.add_row("Last Slot", Text(f"{last_slot_pnl:+.4f}{outcome_tag}", style=ls_style))
     tbl.add_row("Daily", Text(f"{daily_pnl:+.4f}", style=f"bold {rpnl_style}"))
 
     if total_upnl is not None:

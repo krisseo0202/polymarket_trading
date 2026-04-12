@@ -56,8 +56,8 @@ class RetrainConfig:
     # would freeze the retraining data. A pattern with `*` picks up every
     # rotated file automatically; a plain path still works as a single
     # literal match.
-    ob_csv_glob: str = "data/live_orderbook_snapshots*.csv"
-    btc_csv_glob: str = "data/btc_live_1s*.csv"
+    ob_csv_glob: str = "data/**/live_orderbook_snapshots*.csv"
+    btc_csv_glob: str = "data/**/btc_live_1s*.csv"
     history_path: str = "data/retrain_history.jsonl"
     output_parent: str = "models"
     model_prefix: str = "logreg_v4"
@@ -67,8 +67,8 @@ class RetrainConfig:
         d = d or {}
         # Accept both new keys (`*_glob`) and legacy single-path keys
         # (`ob_csv`, `btc_csv`) so existing configs keep loading.
-        ob_glob = d.get("ob_csv_glob") or d.get("ob_csv") or "data/live_orderbook_snapshots*.csv"
-        btc_glob = d.get("btc_csv_glob") or d.get("btc_csv") or "data/btc_live_1s*.csv"
+        ob_glob = d.get("ob_csv_glob") or d.get("ob_csv") or "data/**/live_orderbook_snapshots*.csv"
+        btc_glob = d.get("btc_csv_glob") or d.get("btc_csv") or "data/**/btc_live_1s*.csv"
         return cls(
             enabled=bool(d.get("enabled", True)),
             interval_s=int(d.get("interval_s", 3600)),
@@ -331,7 +331,7 @@ class Retrainer:
         This is a soft guard; we still filter by the in-CSV timestamp
         column after concatenation, so it's safe to be imprecise here.
         """
-        files = glob.glob(pattern)
+        files = glob.glob(pattern, recursive=True)
         kept = [f for f in files if os.path.getmtime(f) >= since_ts]
         return sorted(kept)
 

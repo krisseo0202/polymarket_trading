@@ -333,9 +333,13 @@ class CycleRunner:
                     btc_feed=svc.btc_feed,
                 )
 
-            yes_book, no_book, positions, balance = svc.client.fetch_market_data_parallel(
-                self._yes_tid, self._no_tid
-            )
+            try:
+                yes_book, no_book, positions, balance = svc.client.fetch_market_data_parallel(
+                    self._yes_tid, self._no_tid
+                )
+            except Exception as fetch_err:
+                logger.warning(f"Intra-cycle: API fetch failed ({fetch_err!r}) — skipping")
+                return
             btc_now = svc.btc_feed.get_latest_mid() if svc.btc_feed else None
             intra_snap = build_cycle_snapshot(
                 market_id=self._market_id,
@@ -482,6 +486,13 @@ class CycleRunner:
                     f"(yes={self._yes_tid[:8]}, no={self._no_tid[:8]})"
                 )
         sync_inventories_to_state(svc.state, svc.inventories)
+
+        # Freeze the settled slot PnL + outcome for the dashboard before
+        # resetting the accumulator. Without this, the dashboard always
+        # sees slot_realized_pnl = 0.0 on the first cycle of a new slot
+        # because the reset happens before state_store.save().
+        svc.state.last_slot_pnl = svc.state.slot_realized_pnl
+        svc.state.last_slot_outcome = resolved_outcome or ""
 
         logger.info(
             f"Market rolled over: {self._market_id} → {new_market_id} | "
@@ -738,10 +749,25 @@ def execute_signals(
             if not strategy.should_enter(sig):
                 logger.debug(f"BUY rejected by strategy: {sig.reason}")
                 continue
-            ok, reason = risk_manager.validate_signal(sig, balance, positions, [])
-            if not ok:
-                logger.info(f"BUY rejected by risk manager: {reason}")
+            # Clip to risk limits instead of rejecting outright. The
+            # strategy's Kelly sizing is a suggestion; the risk manager
+            # caps it to the binding constraint (position size, total
+            # exposure, or per-market exposure).
+            clipped = risk_manager.calculate_position_size(
+                sig, balance, positions, sig.price,
+            )
+            if clipped <= 0:
+                logger.info(
+                    f"BUY rejected by risk manager: clipped size=0 "
+                    f"(original={sig.size:.2f})"
+                )
                 continue
+            if clipped < sig.size:
+                logger.info(
+                    f"BUY size clipped by risk manager: "
+                    f"{sig.size:.2f} → {clipped:.2f}"
+                )
+                sig.size = clipped
 
         token_id = yes_token_id if sig.outcome == "YES" else no_token_id
         existing_order_id = state.active_order_ids.get(token_id)
@@ -959,9 +985,12 @@ def _log_strategy_calc(strategy, signals, logger, runner=None) -> None:
 # ── Structured decision log ──────────────────────────────────────────────
 from datetime import datetime, timezone as _tz
 
+_now_utc = datetime.now(_tz.utc)
+_DECISION_LOG_DIR = os.path.join("data", _now_utc.strftime("%Y-%m-%d"))
+os.makedirs(_DECISION_LOG_DIR, exist_ok=True)
 _DECISION_LOG_PATH = os.path.join(
-    "data",
-    f"decision_log_{datetime.now(_tz.utc).strftime('%Y%m%dT%H%M%SZ')}.jsonl",
+    _DECISION_LOG_DIR,
+    f"decision_log_{_now_utc.strftime('%Y%m%dT%H%M%SZ')}.jsonl",
 )
 
 

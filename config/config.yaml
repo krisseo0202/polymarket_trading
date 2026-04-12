@@ -161,11 +161,11 @@ strategies:
       window_s: 172800           # use last 48h of live data
       tolerance_brier: 0.005     # accept new model iff new_brier ≤ prod_brier + this
       min_train_rows: 500        # skip the pass if the window has fewer rows than this
-      # Glob patterns — the bot rotates these CSVs per session, so a
-      # single frozen path would leave the retrainer training on stale
-      # data forever. `*` picks up every rotated file automatically.
-      ob_csv_glob:  "data/live_orderbook_snapshots*.csv"
-      btc_csv_glob: "data/btc_live_1s*.csv"
+      # Recursive glob patterns — the bot writes session CSVs into
+      # date-partitioned dirs (data/YYYY-MM-DD/). The `**/` prefix
+      # ensures both flat (legacy) and partitioned files are found.
+      ob_csv_glob:  "data/**/live_orderbook_snapshots*.csv"
+      btc_csv_glob: "data/**/btc_live_1s*.csv"
       history_path: "data/retrain_history.jsonl"
       output_parent: "models"
       model_prefix: "logreg_v4"
