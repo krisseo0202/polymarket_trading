@@ -54,6 +54,12 @@ class BotState:
 
     # Per-slot realized PnL — resets on each 5-min market rollover
     slot_realized_pnl: float = 0.0
+    # Frozen copy of slot_realized_pnl from the just-ended slot, set
+    # right before the reset in _handle_rollover(). The dashboard reads
+    # this to show "last slot PnL" across the boundary where
+    # slot_realized_pnl is already 0.0 for the new slot.
+    last_slot_pnl: float = 0.0
+    last_slot_outcome: str = ""  # "Up" or "Down" from the just-settled slot
 
     # Trade history — last 20 fills, newest last
     # Each entry: {"ts": float, "action": str, "outcome": str, "price": float, "size": float}
@@ -127,6 +133,8 @@ class StateStore:
                 chainlink_ref_slot_ts=data.get("chainlink_ref_slot_ts"),
                 chainlink_healthy=data.get("chainlink_healthy", False),
                 slot_realized_pnl=float(data.get("slot_realized_pnl", 0.0)),
+                last_slot_pnl=float(data.get("last_slot_pnl", 0.0)),
+                last_slot_outcome=data.get("last_slot_outcome", ""),
                 trade_log=data.get("trade_log", []),
             )
         except Exception:

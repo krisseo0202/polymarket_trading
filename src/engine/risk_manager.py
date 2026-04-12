@@ -97,31 +97,36 @@ class RiskManager:
     ) -> Tuple[bool, str]:
         """
         Validate if a signal can be executed based on risk limits
-        
+
         Args:
             signal: Trading signal to validate
             balance: Current account balance
             positions: Current positions
             orders: Pending orders
-            
+
         Returns:
             Tuple of (is_valid, reason)
         """
         # Check circuit breaker
         if self.circuit_breaker_active:
             return False, "Circuit breaker is active"
-        
+
         # Check daily loss limit
         if self.daily_pnl < -abs(self.limits.max_daily_loss * balance):
             return False, f"Daily loss limit reached: {self.daily_pnl:.2f}"
-        
-        # Check position size limit
+
+        # Check position size limit.
+        # max_position_size is a hard share cap; max_position_pct produces
+        # a USDC notional that must be converted to shares via signal.price
+        # so both terms in min() share the same unit.
+        notional_cap = balance * self.limits.max_position_pct
+        shares_from_notional = notional_cap / signal.price if signal.price > 0 else 0
         max_size = min(
             self.limits.max_position_size,
-            balance * self.limits.max_position_pct
+            shares_from_notional
         )
         if signal.size > max_size:
-            return False, f"Position size {signal.size} exceeds limit {max_size}"
+            return False, f"Position size {signal.size} exceeds limit {max_size:.1f} shares (notional cap ${notional_cap:.2f})"
         
         # Check total exposure
         total_exposure = sum(abs(pos.size * (pos.current_price or pos.average_price or 0)) for pos in positions)
@@ -152,24 +157,32 @@ class RiskManager:
         current_price: float
     ) -> float:
         """
-        Calculate safe position size based on risk limits
-        
+        Calculate safe position size based on risk limits.
+
+        All comparisons are in shares. The USDC-denominated limits
+        (max_position_pct, max_total_exposure, max_exposure_per_market)
+        are converted to share-equivalent via current_price before
+        clipping.
+
         Args:
             signal: Trading signal
             balance: Current balance
             positions: Current positions
             current_price: Current market price
-            
+
         Returns:
-            Safe position size
+            Safe position size (shares)
         """
         # Start with signal size
         size = signal.size
-        
-        # Apply position size limit
+
+        # Apply position size limit. Convert the notional cap to shares
+        # so both terms have the same unit.
+        notional_cap = balance * self.limits.max_position_pct
+        shares_from_notional = notional_cap / current_price if current_price > 0 else 0
         max_size = min(
             self.limits.max_position_size,
-            balance * self.limits.max_position_pct
+            shares_from_notional
         )
         size = min(size, max_size)
         

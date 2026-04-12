@@ -118,13 +118,22 @@ def _stop_all(procs: Dict[str, subprocess.Popen], exclude: Optional[str] = None)
 
 
 def _timestamped_path(base: str) -> str:
-    """Insert a UTC timestamp before the file extension.
+    """Insert a date partition directory and a UTC timestamp.
 
-    Example: data/btc_live_1s.csv → data/btc_live_1s_20260407T220300Z.csv
+    Example: data/btc_live_1s.csv → data/2026-04-07/btc_live_1s_20260407T220300Z.csv
+
+    The date partition keeps each calendar day in its own directory,
+    making it easy to browse and prune old data. The UTC timestamp in
+    the filename preserves per-session uniqueness.
     """
-    root, ext = os.path.splitext(base)
-    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    return f"{root}_{ts}{ext}"
+    now = datetime.now(timezone.utc)
+    date_dir = now.strftime("%Y-%m-%d")
+    ts = now.strftime("%Y%m%dT%H%M%SZ")
+    parent = os.path.dirname(base)
+    stem, ext = os.path.splitext(os.path.basename(base))
+    partitioned_dir = os.path.join(parent, date_dir)
+    os.makedirs(partitioned_dir, exist_ok=True)
+    return os.path.join(partitioned_dir, f"{stem}_{ts}{ext}")
 
 
 def main() -> None:

@@ -120,6 +120,11 @@ def init_services(args) -> Services:
     if kelly is not None:
         strategy_cfg["kelly_fraction"] = kelly
 
+    # Inject paper_balance into strategy_cfg so it appears in the
+    # pre-launch config panel and can be overridden interactively.
+    cli_balance = getattr(args, "balance", None)
+    strategy_cfg["paper_balance"] = cli_balance if cli_balance is not None else 10000.0
+
     if not getattr(args, "no_confirm", False) and sys.stdin.isatty():
         strategy_cfg = display_and_confirm_config(
             strategy_name=strategy_name,
@@ -163,7 +168,7 @@ def init_services(args) -> Services:
 
     perf_store = PerformanceStore(bot_cfg.get("perf_db_path", "perf.db"))
 
-    paper_balance = getattr(args, "balance", None) or 10000.0
+    paper_balance = float(strategy_cfg.pop("paper_balance", 10000.0))
     client = PolymarketClient(
         private_key=cfg.private_key,
         funder_address=cfg.funder_address,
