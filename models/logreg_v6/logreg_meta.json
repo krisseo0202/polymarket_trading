@@ -1,0 +1,60 @@
+{
+  "model_version": "logreg_v6",
+  "features": [
+    "ret_180s",
+    "mid_return_5s",
+    "acceleration",
+    "cvd_60s",
+    "vwap_deviation",
+    "vol_15s",
+    "range_30s",
+    "rolling_std_30s",
+    "depth_skew",
+    "wall_flag",
+    "td_setup_net"
+  ],
+  "n_train_rows": 8525,
+  "n_valid_rows": 2196,
+  "n_train_slots": 259,
+  "n_valid_slots": 65,
+  "valid_brier": 0.20960603819944668,
+  "valid_logloss": 0.6042280731347754,
+  "valid_row_accuracy": 0.650728597449909,
+  "slot_accuracy": 0.6923076923076923,
+  "coef": [
+    0.7037673697759825,
+    0.42061744433901654,
+    -0.22073344917566612,
+    0.2859369161116643,
+    -0.10080812582180047,
+    -0.0735732274907258,
+    0.35437414223307345,
+    -0.27351209397195825,
+    -0.110229486024534,
+    -0.14238736847994188,
+    -0.04349515398505091
+  ],
+  "intercept": -0.49136129224233915,
+  "calibrated": true,
+  "backtest": {
+    "starting_equity": 100.0,
+    "edge_threshold": 0.02,
+    "kelly_mult": 0.15,
+    "max_frac": 0.1,
+    "v4": {
+      "final_equity": 291.29724216624487,
+      "n_trades": 65,
+      "win_rate": 0.5692307692307692
+    },
+    "v5": {
+      "final_equity": 313.5652230881216,
+      "n_trades": 65,
+      "win_rate": 0.6
+    },
+    "v6": {
+      "final_equity": 289.97163225530767,
+      "n_trades": 65,
+      "win_rate": 0.6
+    }
+  }
+}

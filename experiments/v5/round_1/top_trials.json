@@ -1,0 +1,1471 @@
+{
+  "round": 1,
+  "n_trials": 100,
+  "feature_subset": [
+    "ret_30s",
+    "depth_ratio",
+    "imbalance",
+    "spread",
+    "wall_flag",
+    "depth_change",
+    "mid_return_5s",
+    "acceleration",
+    "rolling_std_30s",
+    "time_to_expiry",
+    "vol_ratio_15_60",
+    "cvd_60s"
+  ],
+  "search_space": {
+    "C": {
+      "type": "log_uniform",
+      "low": 0.001,
+      "high": 0.1
+    },
+    "row_interval": {
+      "type": "categorical",
+      "choices": [
+        15,
+        20,
+        25
+      ]
+    },
+    "edge_threshold": {
+      "type": "uniform",
+      "low": 0.01,
+      "high": 0.08
+    },
+    "kelly_mult": {
+      "type": "uniform",
+      "low": 0.15,
+      "high": 0.45
+    },
+    "max_frac": {
+      "type": "uniform",
+      "low": 0.1,
+      "high": 0.25
+    }
+  },
+  "pareto": [
+    {
+      "number": 86,
+      "brier": 0.21132587034162362,
+      "final_equity": 599.0875864113425,
+      "params": {
+        "C": 0.041380401125610165,
+        "row_interval": 25,
+        "edge_threshold": 0.04081067456177209,
+        "kelly_mult": 0.3393415877991789,
+        "max_frac": 0.17578785586717857
+      },
+      "row_acc": 0.6369047619047619,
+      "slot_acc": 0.6461538461538462,
+      "n_trades": 65,
+      "win_rate": 0.5538461538461539,
+      "valid_logloss": 0.6056592163064678
+    },
+    {
+      "number": 40,
+      "brier": 0.2114302576932043,
+      "final_equity": 636.7432866887033,
+      "params": {
+        "C": 0.06706271090367466,
+        "row_interval": 25,
+        "edge_threshold": 0.05549747515444357,
+        "kelly_mult": 0.360590063177311,
+        "max_frac": 0.21936890041541515
+      },
+      "row_acc": 0.6346726190476191,
+      "slot_acc": 0.6307692307692307,
+      "n_trades": 65,
+      "win_rate": 0.5692307692307692,
+      "valid_logloss": 0.6058216847099478
+    },
+    {
+      "number": 83,
+      "brier": 0.21143030176659408,
+      "final_equity": 904.2221344106717,
+      "params": {
+        "C": 0.09360540102485378,
+        "row_interval": 25,
+        "edge_threshold": 0.017218670818515282,
+        "kelly_mult": 0.36870215041229626,
+        "max_frac": 0.155167469907888
+      },
+      "row_acc": 0.6339285714285714,
+      "slot_acc": 0.6307692307692307,
+      "n_trades": 65,
+      "win_rate": 0.5538461538461539,
+      "valid_logloss": 0.6057914259556031
+    },
+    {
+      "number": 82,
+      "brier": 0.21690387188853213,
+      "final_equity": 1631.9177965766953,
+      "params": {
+        "C": 0.07269669235029615,
+        "row_interval": 20,
+        "edge_threshold": 0.014553611508969567,
+        "kelly_mult": 0.40752382555290356,
+        "max_frac": 0.2448448049611839
+      },
+      "row_acc": 0.6408629441624365,
+      "slot_acc": 0.6615384615384615,
+      "n_trades": 65,
+      "win_rate": 0.5692307692307692,
+      "valid_logloss": 0.6203157203212305
+    },
+    {
+      "number": 45,
+      "brier": 0.21699042792963727,
+      "final_equity": 1924.5243349185741,
+      "params": {
+        "C": 0.03893788781594571,
+        "row_interval": 20,
+        "edge_threshold": 0.011774552039082026,
+        "kelly_mult": 0.4387945244033775,
+        "max_frac": 0.22539701807683088
+      },
+      "row_acc": 0.6402284263959391,
+      "slot_acc": 0.6615384615384615,
+      "n_trades": 65,
+      "win_rate": 0.5846153846153846,
+      "valid_logloss": 0.6204823370564218
+    },
+    {
+      "number": 39,
+      "brier": 0.2171198761848242,
+      "final_equity": 2270.0478185000875,
+      "params": {
+        "C": 0.024776016523736937,
+        "row_interval": 15,
+        "edge_threshold": 0.06665528088349595,
+        "kelly_mult": 0.3930340184037543,
+        "max_frac": 0.23006084778701555
+      },
+      "row_acc": 0.6329690346083788,
+      "slot_acc": 0.6307692307692307,
+      "n_trades": 65,
+      "win_rate": 0.5846153846153846,
+      "valid_logloss": 0.6215809827186624
+    },
+    {
+      "number": 72,
+      "brier": 0.21922329229586826,
+      "final_equity": 2519.5863750824305,
+      "params": {
+        "C": 0.0023426581058204046,
+        "row_interval": 20,
+        "edge_threshold": 0.01827153793351594,
+        "kelly_mult": 0.4387945244033775,
+        "max_frac": 0.22539701807683088
+      },
+      "row_acc": 0.6370558375634517,
+      "slot_acc": 0.6461538461538462,
+      "n_trades": 65,
+      "win_rate": 0.6153846153846154,
+      "valid_logloss": 0.6261834939699281
+    }
+  ],
+  "all_trials": [
+    {
+      "number": 0,
+      "brier": 0.21765829748684928,
+      "final_equity": 1231.8955988823707,
+      "params": {
+        "C": 0.012,
+        "row_interval": 20,
+        "edge_threshold": 0.055,
+        "kelly_mult": 0.36,
+        "max_frac": 0.21
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 1,
+      "brier": 0.2172992217833865,
+      "final_equity": 537.9989130914857,
+      "params": {
+        "C": 0.005611516415334507,
+        "row_interval": 15,
+        "edge_threshold": 0.020921304830970558,
+        "kelly_mult": 0.1967983561008608,
+        "max_frac": 0.10871254182522992
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 2,
+      "brier": 0.2169923401459254,
+      "final_equity": 869.2741286888629,
+      "params": {
+        "C": 0.05399484409787434,
+        "row_interval": 20,
+        "edge_threshold": 0.07789368965133961,
+        "kelly_mult": 0.3997327922401266,
+        "max_frac": 0.13185086660174142
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 3,
+      "brier": 0.2143178994099533,
+      "final_equity": 408.0534501990306,
+      "params": {
+        "C": 0.0023102018878452934,
+        "row_interval": 25,
+        "edge_threshold": 0.040236151304948106,
+        "kelly_mult": 0.23736874205941258,
+        "max_frac": 0.19177793420835693
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 4,
+      "brier": 0.21462996187491024,
+      "final_equity": 310.1748553487741,
+      "params": {
+        "C": 0.0019010245319870357,
+        "row_interval": 25,
+        "edge_threshold": 0.06496231729751095,
+        "kelly_mult": 0.20990213464750793,
+        "max_frac": 0.17713516576204175
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 5,
+      "brier": 0.21751402896820385,
+      "final_equity": 1636.4724482571376,
+      "params": {
+        "C": 0.015304852121831466,
+        "row_interval": 20,
+        "edge_threshold": 0.014553611508969567,
+        "kelly_mult": 0.43466566117600003,
+        "max_frac": 0.2448448049611839
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 6,
+      "brier": 0.21132587034162362,
+      "final_equity": 309.56871831551524,
+      "params": {
+        "C": 0.041380401125610165,
+        "row_interval": 25,
+        "edge_threshold": 0.04081067456177209,
+        "kelly_mult": 0.18661147045343365,
+        "max_frac": 0.17427653651669053
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 7,
+      "brier": 0.21781745060980515,
+      "final_equity": 1191.6985471529063,
+      "params": {
+        "C": 0.001171593739230706,
+        "row_interval": 15,
+        "edge_threshold": 0.03181977532625877,
+        "kelly_mult": 0.30602040635334327,
+        "max_frac": 0.18200654190149196
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 8,
+      "brier": 0.21735968732912891,
+      "final_equity": 1535.6284802857406,
+      "params": {
+        "C": 0.0023426581058204046,
+        "row_interval": 15,
+        "edge_threshold": 0.07263791452993541,
+        "kelly_mult": 0.32936999364332553,
+        "max_frac": 0.23828113525346753
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 9,
+      "brier": 0.21477741296975594,
+      "final_equity": 450.82877014462485,
+      "params": {
+        "C": 0.0015030900645056826,
+        "row_interval": 25,
+        "edge_threshold": 0.03720741027826374,
+        "kelly_mult": 0.2314047095321688,
+        "max_frac": 0.2243106263727894
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 10,
+      "brier": 0.21795739091927074,
+      "final_equity": 325.76896522275945,
+      "params": {
+        "C": 0.005170191786366992,
+        "row_interval": 20,
+        "edge_threshold": 0.06615378865278278,
+        "kelly_mult": 0.17236519310393125,
+        "max_frac": 0.2480330404900776
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 11,
+      "brier": 0.21146934815929208,
+      "final_equity": 623.7551937410406,
+      "params": {
+        "C": 0.03503398491158688,
+        "row_interval": 25,
+        "edge_threshold": 0.059480014069333204,
+        "kelly_mult": 0.36870215041229626,
+        "max_frac": 0.21569055200289186
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 12,
+      "brier": 0.21496230786209342,
+      "final_equity": 423.09379982848543,
+      "params": {
+        "C": 0.001406336677771817,
+        "row_interval": 25,
+        "edge_threshold": 0.05363086887792906,
+        "kelly_mult": 0.24926940745579476,
+        "max_frac": 0.10953375254290355
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 13,
+      "brier": 0.21841535440812582,
+      "final_equity": 437.66136977581334,
+      "params": {
+        "C": 0.004187594718900628,
+        "row_interval": 20,
+        "edge_threshold": 0.07210489198034287,
+        "kelly_mult": 0.2916644775485848,
+        "max_frac": 0.11793913689074526
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 14,
+      "brier": 0.2116532752849789,
+      "final_equity": 506.56730683492367,
+      "params": {
+        "C": 0.026698666742744605,
+        "row_interval": 25,
+        "edge_threshold": 0.044565691745507355,
+        "kelly_mult": 0.30681984881459823,
+        "max_frac": 0.16413115275378243
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 15,
+      "brier": 0.21505902890201697,
+      "final_equity": 704.5272187550378,
+      "params": {
+        "C": 0.0011241862095793063,
+        "row_interval": 25,
+        "edge_threshold": 0.03200491867534287,
+        "kelly_mult": 0.30257120734941084,
+        "max_frac": 0.23613497108891396
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 16,
+      "brier": 0.21892249447883738,
+      "final_equity": 612.8007967014016,
+      "params": {
+        "C": 0.00315198729519389,
+        "row_interval": 20,
+        "edge_threshold": 0.01538859368801551,
+        "kelly_mult": 0.2369254358741304,
+        "max_frac": 0.12418319308810066
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 17,
+      "brier": 0.21142668456325725,
+      "final_equity": 302.14385804018286,
+      "params": {
+        "C": 0.0723427984566542,
+        "row_interval": 25,
+        "edge_threshold": 0.06625704538293802,
+        "kelly_mult": 0.20597101766581075,
+        "max_frac": 0.23388384977349666
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 18,
+      "brier": 0.21765829748684928,
+      "final_equity": 501.16440609962615,
+      "params": {
+        "C": 0.011986281799901188,
+        "row_interval": 20,
+        "edge_threshold": 0.017703634716937373,
+        "kelly_mult": 0.2183805487625825,
+        "max_frac": 0.16406616829393844
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 19,
+      "brier": 0.21721931133634184,
+      "final_equity": 605.6658510545966,
+      "params": {
+        "C": 0.04325432427964557,
+        "row_interval": 15,
+        "edge_threshold": 0.039218770220414534,
+        "kelly_mult": 0.2166323431412191,
+        "max_frac": 0.11797980510005243
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 20,
+      "brier": 0.21728971769381478,
+      "final_equity": 915.7361050840836,
+      "params": {
+        "C": 0.0047340227734041914,
+        "row_interval": 15,
+        "edge_threshold": 0.05921132712266246,
+        "kelly_mult": 0.2590888807137882,
+        "max_frac": 0.2457673124081441
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 21,
+      "brier": 0.2169060382459802,
+      "final_equity": 367.47267933586755,
+      "params": {
+        "C": 0.08411909465645724,
+        "row_interval": 20,
+        "edge_threshold": 0.029938834606422736,
+        "kelly_mult": 0.16106608420635984,
+        "max_frac": 0.19143465009698452
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 22,
+      "brier": 0.21207746508173894,
+      "final_equity": 330.0966920047401,
+      "params": {
+        "C": 0.010124137770478638,
+        "row_interval": 25,
+        "edge_threshold": 0.026769332346688074,
+        "kelly_mult": 0.19346846162736692,
+        "max_frac": 0.17341791404163445
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 23,
+      "brier": 0.21143030176659408,
+      "final_equity": 732.7617488738307,
+      "params": {
+        "C": 0.09360540102485378,
+        "row_interval": 25,
+        "edge_threshold": 0.02663462807946798,
+        "kelly_mult": 0.3684649045835579,
+        "max_frac": 0.155167469907888
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 24,
+      "brier": 0.21730764115812895,
+      "final_equity": 704.6835290200761,
+      "params": {
+        "C": 0.018391267498289014,
+        "row_interval": 15,
+        "edge_threshold": 0.06847117469124667,
+        "kelly_mult": 0.24623401949152074,
+        "max_frac": 0.12797777655997813
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 25,
+      "brier": 0.2197656514088941,
+      "final_equity": 527.7297434196721,
+      "params": {
+        "C": 0.0012065637774378937,
+        "row_interval": 20,
+        "edge_threshold": 0.045846514080949675,
+        "kelly_mult": 0.2179487325593814,
+        "max_frac": 0.19677591856141746
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 26,
+      "brier": 0.21438019823467377,
+      "final_equity": 479.9289816098931,
+      "params": {
+        "C": 0.0022321987366901576,
+        "row_interval": 25,
+        "edge_threshold": 0.01962646609021953,
+        "kelly_mult": 0.25231990531507753,
+        "max_frac": 0.11702102818608837
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 27,
+      "brier": 0.21710383683129522,
+      "final_equity": 1197.809897796237,
+      "params": {
+        "C": 0.0706947619721799,
+        "row_interval": 15,
+        "edge_threshold": 0.06720555401408511,
+        "kelly_mult": 0.3165602434798387,
+        "max_frac": 0.17944758675340097
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 28,
+      "brier": 0.21362931593191167,
+      "final_equity": 388.3608121569185,
+      "params": {
+        "C": 0.0030458224385894067,
+        "row_interval": 25,
+        "edge_threshold": 0.05431710200912876,
+        "kelly_mult": 0.2517089373146102,
+        "max_frac": 0.15238143619189914
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 29,
+      "brier": 0.21720353243413082,
+      "final_equity": 564.390571164859,
+      "params": {
+        "C": 0.02830814149699805,
+        "row_interval": 15,
+        "edge_threshold": 0.05494221523080015,
+        "kelly_mult": 0.17524198949851466,
+        "max_frac": 0.12424430711419207
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 30,
+      "brier": 0.2171096111756758,
+      "final_equity": 403.12984826840136,
+      "params": {
+        "C": 0.06267702540388488,
+        "row_interval": 15,
+        "edge_threshold": 0.056445123837563914,
+        "kelly_mult": 0.1515184751538656,
+        "max_frac": 0.1241212077126248
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 31,
+      "brier": 0.21721410294231402,
+      "final_equity": 729.3105024888289,
+      "params": {
+        "C": 0.012516058337570368,
+        "row_interval": 15,
+        "edge_threshold": 0.059852545494327516,
+        "kelly_mult": 0.22117472624904003,
+        "max_frac": 0.14880995472389016
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 32,
+      "brier": 0.21712564437607215,
+      "final_equity": 445.9015152010509,
+      "params": {
+        "C": 0.031115931750282644,
+        "row_interval": 20,
+        "edge_threshold": 0.04978160223348302,
+        "kelly_mult": 0.17810243034842774,
+        "max_frac": 0.15515737045891503
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 33,
+      "brier": 0.21877893507700574,
+      "final_equity": 1036.469845768282,
+      "params": {
+        "C": 0.0033916008494386156,
+        "row_interval": 20,
+        "edge_threshold": 0.07244325886239794,
+        "kelly_mult": 0.3393415877991789,
+        "max_frac": 0.21922169553124726
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 34,
+      "brier": 0.2172258985428492,
+      "final_equity": 571.6972067255505,
+      "params": {
+        "C": 0.010122183035228776,
+        "row_interval": 15,
+        "edge_threshold": 0.06057164806830538,
+        "kelly_mult": 0.23423170873225674,
+        "max_frac": 0.10364739496471809
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 35,
+      "brier": 0.21161874468307704,
+      "final_equity": 366.2397313181702,
+      "params": {
+        "C": 0.019540901330220083,
+        "row_interval": 25,
+        "edge_threshold": 0.0740405073154314,
+        "kelly_mult": 0.26104761007663335,
+        "max_frac": 0.10231849247933011
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 36,
+      "brier": 0.21692879567699944,
+      "final_equity": 755.9469162456776,
+      "params": {
+        "C": 0.07188480933634321,
+        "row_interval": 20,
+        "edge_threshold": 0.06971066188271521,
+        "kelly_mult": 0.2383346676208757,
+        "max_frac": 0.1577646592902888
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 37,
+      "brier": 0.211395414755281,
+      "final_equity": 509.3807777761969,
+      "params": {
+        "C": 0.05038176096019998,
+        "row_interval": 25,
+        "edge_threshold": 0.07553083419125467,
+        "kelly_mult": 0.3588089390024919,
+        "max_frac": 0.18550917551340473
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 38,
+      "brier": 0.21935931471964049,
+      "final_equity": 1665.8809014258845,
+      "params": {
+        "C": 0.0015644186602631924,
+        "row_interval": 20,
+        "edge_threshold": 0.046283075665461575,
+        "kelly_mult": 0.4132119215783867,
+        "max_frac": 0.21111529266313067
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 39,
+      "brier": 0.2171198761848242,
+      "final_equity": 2270.0478185000875,
+      "params": {
+        "C": 0.024776016523736937,
+        "row_interval": 15,
+        "edge_threshold": 0.06665528088349595,
+        "kelly_mult": 0.3930340184037543,
+        "max_frac": 0.23006084778701555
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 40,
+      "brier": 0.2114302576932043,
+      "final_equity": 636.7432866887033,
+      "params": {
+        "C": 0.06706271090367466,
+        "row_interval": 25,
+        "edge_threshold": 0.05549747515444357,
+        "kelly_mult": 0.360590063177311,
+        "max_frac": 0.21936890041541515
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 41,
+      "brier": 0.21700200912031226,
+      "final_equity": 431.1700101185096,
+      "params": {
+        "C": 0.06025744092098428,
+        "row_interval": 20,
+        "edge_threshold": 0.050479609869732184,
+        "kelly_mult": 0.1607826821390226,
+        "max_frac": 0.16983970271986903
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 42,
+      "brier": 0.21769053051136233,
+      "final_equity": 1150.0442858852607,
+      "params": {
+        "C": 0.012169963323841002,
+        "row_interval": 20,
+        "edge_threshold": 0.01261437321244501,
+        "kelly_mult": 0.3967801681978975,
+        "max_frac": 0.15402859621168943
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 43,
+      "brier": 0.21938881055882836,
+      "final_equity": 400.8875807102412,
+      "params": {
+        "C": 0.0017952338368491254,
+        "row_interval": 20,
+        "edge_threshold": 0.053602333307330025,
+        "kelly_mult": 0.1756042394981304,
+        "max_frac": 0.10775225817529116
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 44,
+      "brier": 0.21189358462509814,
+      "final_equity": 466.3851854089586,
+      "params": {
+        "C": 0.011553385460530911,
+        "row_interval": 25,
+        "edge_threshold": 0.07830964556237742,
+        "kelly_mult": 0.3048901044903586,
+        "max_frac": 0.1484434709411869
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 45,
+      "brier": 0.21699042792963727,
+      "final_equity": 1924.5243349185741,
+      "params": {
+        "C": 0.03893788781594571,
+        "row_interval": 20,
+        "edge_threshold": 0.011774552039082026,
+        "kelly_mult": 0.4387945244033775,
+        "max_frac": 0.22539701807683088
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 46,
+      "brier": 0.21714135924593855,
+      "final_equity": 1889.7880237019936,
+      "params": {
+        "C": 0.024657464253392724,
+        "row_interval": 15,
+        "edge_threshold": 0.027517002871521673,
+        "kelly_mult": 0.3147679994118362,
+        "max_frac": 0.20718938840500933
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 47,
+      "brier": 0.2173727356682573,
+      "final_equity": 1178.359052221245,
+      "params": {
+        "C": 0.02091196066971308,
+        "row_interval": 20,
+        "edge_threshold": 0.048804783675798054,
+        "kelly_mult": 0.33351622387030566,
+        "max_frac": 0.16294000936416847
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 48,
+      "brier": 0.21893628377018484,
+      "final_equity": 374.64310536048714,
+      "params": {
+        "C": 0.0031294064907273164,
+        "row_interval": 20,
+        "edge_threshold": 0.01812508483548414,
+        "kelly_mult": 0.16380079260652583,
+        "max_frac": 0.10610932034784552
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 49,
+      "brier": 0.21716382393236053,
+      "final_equity": 843.7096839336897,
+      "params": {
+        "C": 0.05139503522154863,
+        "row_interval": 15,
+        "edge_threshold": 0.04441311125817827,
+        "kelly_mult": 0.29204153123416976,
+        "max_frac": 0.12598028048650228
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 50,
+      "brier": 0.21222395734018468,
+      "final_equity": 609.7236256100833,
+      "params": {
+        "C": 0.007374002805073997,
+        "row_interval": 25,
+        "edge_threshold": 0.013171280684043118,
+        "kelly_mult": 0.2623837843879414,
+        "max_frac": 0.19387898735713546
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 51,
+      "brier": 0.21922329229586826,
+      "final_equity": 738.8277026607134,
+      "params": {
+        "C": 0.0023426581058204046,
+        "row_interval": 20,
+        "edge_threshold": 0.045219538100606145,
+        "kelly_mult": 0.32936999364332553,
+        "max_frac": 0.13185086660174142
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 52,
+      "brier": 0.21877893507700574,
+      "final_equity": 1036.469845768282,
+      "params": {
+        "C": 0.0033916008494386156,
+        "row_interval": 20,
+        "edge_threshold": 0.06995428888318256,
+        "kelly_mult": 0.3393415877991789,
+        "max_frac": 0.21922169553124726
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 53,
+      "brier": 0.2143178994099533,
+      "final_equity": 408.0534501990306,
+      "params": {
+        "C": 0.0023102018878452934,
+        "row_interval": 25,
+        "edge_threshold": 0.040236151304948106,
+        "kelly_mult": 0.23736874205941258,
+        "max_frac": 0.19880404474284175
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 54,
+      "brier": 0.21426594302347612,
+      "final_equity": 383.63260651069174,
+      "params": {
+        "C": 0.0021177215408860525,
+        "row_interval": 25,
+        "edge_threshold": 0.05921132712266246,
+        "kelly_mult": 0.2590888807137882,
+        "max_frac": 0.11702102818608837
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 55,
+      "brier": 0.2178019168909941,
+      "final_equity": 841.7473090474017,
+      "params": {
+        "C": 0.00138400447641062,
+        "row_interval": 15,
+        "edge_threshold": 0.011774552039082026,
+        "kelly_mult": 0.4387945244033775,
+        "max_frac": 0.12424430711419207
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 56,
+      "brier": 0.21690197282739881,
+      "final_equity": 637.352196542187,
+      "params": {
+        "C": 0.07593823221110978,
+        "row_interval": 20,
+        "edge_threshold": 0.050283192451311534,
+        "kelly_mult": 0.2179487325593814,
+        "max_frac": 0.19677591856141746
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 57,
+      "brier": 0.21362931593191167,
+      "final_equity": 495.76182357830044,
+      "params": {
+        "C": 0.0030458224385894067,
+        "row_interval": 25,
+        "edge_threshold": 0.06665528088349595,
+        "kelly_mult": 0.3930340184037543,
+        "max_frac": 0.23006084778701555
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 58,
+      "brier": 0.2172111218827325,
+      "final_equity": 1025.9478423842202,
+      "params": {
+        "C": 0.0059750267288990275,
+        "row_interval": 15,
+        "edge_threshold": 0.07590253661435677,
+        "kelly_mult": 0.43466566117600003,
+        "max_frac": 0.16413115275378243
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 59,
+      "brier": 0.21697627971979905,
+      "final_equity": 1342.2549249978358,
+      "params": {
+        "C": 0.06706271090367466,
+        "row_interval": 20,
+        "edge_threshold": 0.07553083419125467,
+        "kelly_mult": 0.3588089390024919,
+        "max_frac": 0.18550917551340473
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 60,
+      "brier": 0.2173772984394208,
+      "final_equity": 917.4960519589903,
+      "params": {
+        "C": 0.002463668493421494,
+        "row_interval": 15,
+        "edge_threshold": 0.05921132712266246,
+        "kelly_mult": 0.36870215041229626,
+        "max_frac": 0.11040419513127482
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 61,
+      "brier": 0.21728492583469916,
+      "final_equity": 1744.2087836478595,
+      "params": {
+        "C": 0.0033916008494386156,
+        "row_interval": 15,
+        "edge_threshold": 0.07244325886239794,
+        "kelly_mult": 0.4387945244033775,
+        "max_frac": 0.21922169553124726
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 62,
+      "brier": 0.21716382393236053,
+      "final_equity": 2085.8808892195507,
+      "params": {
+        "C": 0.05139503522154863,
+        "row_interval": 15,
+        "edge_threshold": 0.04441311125817827,
+        "kelly_mult": 0.3997327922401266,
+        "max_frac": 0.20245101601245352
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 63,
+      "brier": 0.21944948792538824,
+      "final_equity": 1789.3793911928522,
+      "params": {
+        "C": 0.0013879611079315793,
+        "row_interval": 20,
+        "edge_threshold": 0.032328294120563296,
+        "kelly_mult": 0.4132119215783867,
+        "max_frac": 0.2448448049611839
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 64,
+      "brier": 0.21728492583469916,
+      "final_equity": 2168.0166237631224,
+      "params": {
+        "C": 0.0033916008494386156,
+        "row_interval": 15,
+        "edge_threshold": 0.039218770220414534,
+        "kelly_mult": 0.3393415877991789,
+        "max_frac": 0.21922169553124726
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 65,
+      "brier": 0.21438019823467377,
+      "final_equity": 570.0495496340084,
+      "params": {
+        "C": 0.0022321987366901576,
+        "row_interval": 25,
+        "edge_threshold": 0.013171280684043118,
+        "kelly_mult": 0.2623837843879414,
+        "max_frac": 0.19387898735713546
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 66,
+      "brier": 0.21735968732912891,
+      "final_equity": 1995.8196787785787,
+      "params": {
+        "C": 0.0023426581058204046,
+        "row_interval": 15,
+        "edge_threshold": 0.07263791452993541,
+        "kelly_mult": 0.36870215041229626,
+        "max_frac": 0.23828113525346753
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 67,
+      "brier": 0.21692879567699944,
+      "final_equity": 755.9469162456776,
+      "params": {
+        "C": 0.07188480933634321,
+        "row_interval": 20,
+        "edge_threshold": 0.06971066188271521,
+        "kelly_mult": 0.2383346676208757,
+        "max_frac": 0.1577646592902888
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 68,
+      "brier": 0.21496230786209342,
+      "final_equity": 260.5875071294492,
+      "params": {
+        "C": 0.001406336677771817,
+        "row_interval": 25,
+        "edge_threshold": 0.07244325886239794,
+        "kelly_mult": 0.24926940745579476,
+        "max_frac": 0.10953375254290355
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 69,
+      "brier": 0.21728971769381478,
+      "final_equity": 947.8867831337241,
+      "params": {
+        "C": 0.0047340227734041914,
+        "row_interval": 15,
+        "edge_threshold": 0.014553611508969567,
+        "kelly_mult": 0.2590888807137882,
+        "max_frac": 0.2448448049611839
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 70,
+      "brier": 0.21161874468307704,
+      "final_equity": 428.15507941601913,
+      "params": {
+        "C": 0.019540901330220083,
+        "row_interval": 25,
+        "edge_threshold": 0.06914127176786182,
+        "kelly_mult": 0.26104761007663335,
+        "max_frac": 0.10231849247933011
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 71,
+      "brier": 0.21438019823467377,
+      "final_equity": 676.147219951665,
+      "params": {
+        "C": 0.0022321987366901576,
+        "row_interval": 25,
+        "edge_threshold": 0.01962646609021953,
+        "kelly_mult": 0.3165602434798387,
+        "max_frac": 0.17944758675340097
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 72,
+      "brier": 0.21922329229586826,
+      "final_equity": 2519.5863750824305,
+      "params": {
+        "C": 0.0023426581058204046,
+        "row_interval": 20,
+        "edge_threshold": 0.01827153793351594,
+        "kelly_mult": 0.4387945244033775,
+        "max_frac": 0.22539701807683088
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 73,
+      "brier": 0.21721697749616078,
+      "final_equity": 968.6302980990555,
+      "params": {
+        "C": 0.041380401125610165,
+        "row_interval": 15,
+        "edge_threshold": 0.04441311125817827,
+        "kelly_mult": 0.35902114960924525,
+        "max_frac": 0.12598028048650228
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 74,
+      "brier": 0.21841535440812582,
+      "final_equity": 776.8854726788313,
+      "params": {
+        "C": 0.004187594718900628,
+        "row_interval": 20,
+        "edge_threshold": 0.05549747515444357,
+        "kelly_mult": 0.360590063177311,
+        "max_frac": 0.21936890041541515
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 75,
+      "brier": 0.21712564437607215,
+      "final_equity": 1162.501436035685,
+      "params": {
+        "C": 0.031115931750282644,
+        "row_interval": 20,
+        "edge_threshold": 0.04978160223348302,
+        "kelly_mult": 0.33351622387030566,
+        "max_frac": 0.15515737045891503
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 76,
+      "brier": 0.21716924890988457,
+      "final_equity": 1001.0502521872779,
+      "params": {
+        "C": 0.05038176096019998,
+        "row_interval": 15,
+        "edge_threshold": 0.07553083419125467,
+        "kelly_mult": 0.30681984881459823,
+        "max_frac": 0.18550917551340473
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 77,
+      "brier": 0.21751402896820385,
+      "final_equity": 978.6444815906483,
+      "params": {
+        "C": 0.015304852121831466,
+        "row_interval": 20,
+        "edge_threshold": 0.07553083419125467,
+        "kelly_mult": 0.3588089390024919,
+        "max_frac": 0.18550917551340473
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 78,
+      "brier": 0.2180259633090275,
+      "final_equity": 998.7951679224615,
+      "params": {
+        "C": 0.0047340227734041914,
+        "row_interval": 20,
+        "edge_threshold": 0.06254303261486009,
+        "kelly_mult": 0.39205042178017924,
+        "max_frac": 0.248575771300101
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 79,
+      "brier": 0.21161874468307704,
+      "final_equity": 442.7759180977763,
+      "params": {
+        "C": 0.019540901330220083,
+        "row_interval": 25,
+        "edge_threshold": 0.06625704538293802,
+        "kelly_mult": 0.26104761007663335,
+        "max_frac": 0.16189265153671398
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 80,
+      "brier": 0.21477741296975594,
+      "final_equity": 465.28880224278015,
+      "params": {
+        "C": 0.0015030900645056826,
+        "row_interval": 25,
+        "edge_threshold": 0.03720741027826374,
+        "kelly_mult": 0.2383346676208757,
+        "max_frac": 0.1577646592902888
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 81,
+      "brier": 0.21700200912031226,
+      "final_equity": 431.1700101185096,
+      "params": {
+        "C": 0.06025744092098428,
+        "row_interval": 20,
+        "edge_threshold": 0.050479609869732184,
+        "kelly_mult": 0.1607826821390226,
+        "max_frac": 0.16983970271986903
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 82,
+      "brier": 0.21690387188853213,
+      "final_equity": 1631.9177965766953,
+      "params": {
+        "C": 0.07269669235029615,
+        "row_interval": 20,
+        "edge_threshold": 0.014553611508969567,
+        "kelly_mult": 0.40752382555290356,
+        "max_frac": 0.2448448049611839
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 83,
+      "brier": 0.21143030176659408,
+      "final_equity": 904.2221344106717,
+      "params": {
+        "C": 0.09360540102485378,
+        "row_interval": 25,
+        "edge_threshold": 0.017218670818515282,
+        "kelly_mult": 0.36870215041229626,
+        "max_frac": 0.155167469907888
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 84,
+      "brier": 0.21935931471964049,
+      "final_equity": 1007.1169714342291,
+      "params": {
+        "C": 0.0015644186602631924,
+        "row_interval": 20,
+        "edge_threshold": 0.07317870346756966,
+        "kelly_mult": 0.32936999364332553,
+        "max_frac": 0.23828113525346753
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 85,
+      "brier": 0.21721931133634184,
+      "final_equity": 1947.8067085953069,
+      "params": {
+        "C": 0.04325432427964557,
+        "row_interval": 15,
+        "edge_threshold": 0.05549747515444357,
+        "kelly_mult": 0.360590063177311,
+        "max_frac": 0.21936890041541515
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 86,
+      "brier": 0.21132587034162362,
+      "final_equity": 599.0875864113425,
+      "params": {
+        "C": 0.041380401125610165,
+        "row_interval": 25,
+        "edge_threshold": 0.04081067456177209,
+        "kelly_mult": 0.3393415877991789,
+        "max_frac": 0.17578785586717857
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 87,
+      "brier": 0.21695283055500594,
+      "final_equity": 669.425284981308,
+      "params": {
+        "C": 0.044969176252661835,
+        "row_interval": 20,
+        "edge_threshold": 0.044565691745507355,
+        "kelly_mult": 0.24601488030918353,
+        "max_frac": 0.15515737045891503
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 88,
+      "brier": 0.21160814721245402,
+      "final_equity": 557.5148856044191,
+      "params": {
+        "C": 0.02830814149699805,
+        "row_interval": 25,
+        "edge_threshold": 0.05494221523080015,
+        "kelly_mult": 0.41865696854886014,
+        "max_frac": 0.12424430711419207
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 89,
+      "brier": 0.21927585616328213,
+      "final_equity": 812.5456345311154,
+      "params": {
+        "C": 0.0022321987366901576,
+        "row_interval": 20,
+        "edge_threshold": 0.01962646609021953,
+        "kelly_mult": 0.26676050362024895,
+        "max_frac": 0.2448448049611839
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 90,
+      "brier": 0.21710383683129522,
+      "final_equity": 1197.809897796237,
+      "params": {
+        "C": 0.0706947619721799,
+        "row_interval": 15,
+        "edge_threshold": 0.06720555401408511,
+        "kelly_mult": 0.3165602434798387,
+        "max_frac": 0.17944758675340097
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 91,
+      "brier": 0.21795739091927074,
+      "final_equity": 408.31651247473025,
+      "params": {
+        "C": 0.005170191786366992,
+        "row_interval": 20,
+        "edge_threshold": 0.010758635603620885,
+        "kelly_mult": 0.17236519310393125,
+        "max_frac": 0.23580729646288956
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 92,
+      "brier": 0.2126333524188783,
+      "final_equity": 578.7575118772328,
+      "params": {
+        "C": 0.005611516415334507,
+        "row_interval": 25,
+        "edge_threshold": 0.020921304830970558,
+        "kelly_mult": 0.2623837843879414,
+        "max_frac": 0.19387898735713546
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 93,
+      "brier": 0.21935931471964049,
+      "final_equity": 498.02728315991595,
+      "params": {
+        "C": 0.0015644186602631924,
+        "row_interval": 20,
+        "edge_threshold": 0.06057164806830538,
+        "kelly_mult": 0.4132119215783867,
+        "max_frac": 0.10364739496471809
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 94,
+      "brier": 0.2169042195799244,
+      "final_equity": 1312.582465053908,
+      "params": {
+        "C": 0.07965522961695456,
+        "row_interval": 20,
+        "edge_threshold": 0.050140652168630034,
+        "kelly_mult": 0.3395511636509398,
+        "max_frac": 0.16726682829674797
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 95,
+      "brier": 0.2130889485479232,
+      "final_equity": 627.1201615796328,
+      "params": {
+        "C": 0.0038585269984779897,
+        "row_interval": 25,
+        "edge_threshold": 0.0654105330608094,
+        "kelly_mult": 0.43466566117600003,
+        "max_frac": 0.21844272141918308
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 96,
+      "brier": 0.21751402896820385,
+      "final_equity": 1389.557664388472,
+      "params": {
+        "C": 0.015304852121831466,
+        "row_interval": 20,
+        "edge_threshold": 0.016384427213408326,
+        "kelly_mult": 0.3967801681978975,
+        "max_frac": 0.2448448049611839
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 97,
+      "brier": 0.21710631235248032,
+      "final_equity": 640.7160588094939,
+      "params": {
+        "C": 0.07188480933634321,
+        "row_interval": 15,
+        "edge_threshold": 0.06971066188271521,
+        "kelly_mult": 0.2383346676208757,
+        "max_frac": 0.1741630457053872
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 98,
+      "brier": 0.21730764115812895,
+      "final_equity": 537.5770797920243,
+      "params": {
+        "C": 0.018391267498289014,
+        "row_interval": 15,
+        "edge_threshold": 0.040236151304948106,
+        "kelly_mult": 0.16726762800499329,
+        "max_frac": 0.12797777655997813
+      },
+      "state": "TrialState.COMPLETE"
+    },
+    {
+      "number": 99,
+      "brier": 0.21189358462509814,
+      "final_equity": 309.13043599240495,
+      "params": {
+        "C": 0.011553385460530911,
+        "row_interval": 25,
+        "edge_threshold": 0.07830964556237742,
+        "kelly_mult": 0.20597101766581075,
+        "max_frac": 0.1484434709411869
+      },
+      "state": "TrialState.COMPLETE"
+    }
+  ]
+}

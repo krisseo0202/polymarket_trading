@@ -1,0 +1,56 @@
+{
+  "rationale": "The Pareto front shows best Brier scores cluster around C=0.02-0.09 (higher end helps calibration), row_interval=15-25, and low edge_threshold drives higher equity. The worst trials all have very low C (<0.002), suggesting heavy regularization hurts calibration. I'll tighten C upward, keep row_interval choices, lower edge_threshold range to capture the high-equity region, and slightly raise kelly_mult/max_frac since the best equity trials use higher values. I'll also drop depth_skew/ob_imbalance aliases and add vwap_deviation and rsi_14 to potentially improve signal diversity without collinearity.",
+  "feature_subset": [
+    "ret_30s",
+    "ret_60s",
+    "depth_ratio",
+    "imbalance",
+    "spread",
+    "wall_flag",
+    "depth_change",
+    "mid_return_5s",
+    "acceleration",
+    "rolling_std_30s",
+    "time_to_expiry",
+    "vol_ratio_15_60",
+    "cvd_60s",
+    "vwap_deviation"
+  ],
+  "hparam_ranges": {
+    "C": {
+      "type": "log_uniform",
+      "low": 0.01,
+      "high": 0.15
+    },
+    "row_interval": {
+      "type": "categorical",
+      "choices": [
+        15,
+        20,
+        25
+      ]
+    },
+    "edge_threshold": {
+      "type": "uniform",
+      "low": 0.01,
+      "high": 0.07
+    },
+    "kelly_mult": {
+      "type": "uniform",
+      "low": 0.25,
+      "high": 0.5
+    },
+    "max_frac": {
+      "type": "uniform",
+      "low": 0.12,
+      "high": 0.28
+    }
+  },
+  "seed_trial": {
+    "C": 0.05,
+    "row_interval": 20,
+    "edge_threshold": 0.018,
+    "kelly_mult": 0.42,
+    "max_frac": 0.23
+  }
+}

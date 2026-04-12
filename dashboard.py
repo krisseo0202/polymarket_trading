@@ -1200,8 +1200,82 @@ def _build_strategy_panel(
     return Panel(tbl, title="[dim]Strategy[/dim]", border_style="dim")
 
 
-def _build_trade_log_panel(bot_state: Optional[dict]) -> Panel:
-    """Show recent BUY/SELL trades from bot_state.trade_log."""
+# ── Trades panel helpers ──────────────────────────────────────────────────────
+#
+# The Trades panel renders one row per fill from bot_state.trade_log (schema
+# enriched in src/engine/cycle_runner.py::execute_signals, ~line 767). All
+# three format helpers are pure functions of a single entry dict so they're
+# trivial to unit-test and tweak without touching the builder.
+
+# Narrow-mode breakpoint (panel width below which we drop low-priority cols).
+_TRADES_NARROW_WIDTH = 100
+
+
+def _trade_status(entry: dict, inventories: Optional[dict]) -> tuple[str, str]:
+    """Derive (label, style) for the STATUS cell of a trade row.
+
+    Priority:
+      1. OPEN      — row's token_id still has nonzero inventory position
+      2. SETTLED   — closing fill with a nonzero realized_pnl_delta
+      3. FILLED    — entry fill (BUY that opened or SELL that didn't realize)
+
+    CANCELED is a placeholder for a future extension (cycle_runner would need
+    to write canceled-order events into trade_log; it doesn't today).
+    """
+    token_id = entry.get("token_id")
+    if token_id and inventories:
+        inv = inventories.get(token_id)
+        position = 0.0
+        if isinstance(inv, dict):
+            position = float(inv.get("position", 0.0) or 0.0)
+        elif inv is not None:
+            position = float(getattr(inv, "position", 0.0) or 0.0)
+        if abs(position) > 1e-9:
+            return "OPEN", "bold cyan"
+
+    delta = entry.get("realized_pnl_delta")
+    if delta is not None and abs(float(delta)) > 1e-9:
+        return "SETTLED", "bold white"
+
+    return "FILLED", "dim white"
+
+
+def _fmt_pnl(delta: Optional[float]) -> Text:
+    """Render a realized-PnL delta as a signed dollar string with sign-based color."""
+    if delta is None or abs(float(delta)) < 1e-9:
+        return Text("—", style="dim")
+    d = float(delta)
+    sign = "+" if d >= 0 else "-"
+    return Text(f"{sign}${abs(d):.2f}", style="bold green" if d >= 0 else "bold red")
+
+
+def _fmt_tte(seconds: Optional[float]) -> str:
+    """Format a time-to-expiry value (seconds) like '73s' or '2m15s'."""
+    if seconds is None:
+        return "—"
+    s = int(max(0.0, float(seconds)))
+    return f"{s // 60}m{s % 60}s" if s >= 60 else f"{s}s"
+
+
+def _fmt_slot(slot_expiry_ts: Optional[float]) -> str:
+    """Render a slot expiry timestamp as a local HH:MM label."""
+    if not slot_expiry_ts:
+        return "—"
+    return datetime.fromtimestamp(float(slot_expiry_ts)).strftime("%H:%M")
+
+
+def _build_trade_log_panel(
+    bot_state: Optional[dict],
+    panel_width: Optional[int] = None,
+) -> Panel:
+    """Show recent fills from bot_state.trade_log as a single-row-per-trade table.
+
+    Columns (wide mode, panel width ≥ _TRADES_NARROW_WIDTH):
+        ▶  TIME  STRAT  SLOT  TTE  SIDE  OUT  PRICE  SHARES  NOTIONAL  EDGE  STATUS  PnL
+
+    Narrow mode drops TTE, NOTIONAL, and EDGE and shrinks STRAT to 8 chars.
+    Open rows (inventory still long in this token) get a leading ▶ marker.
+    """
     trades = (bot_state or {}).get("trade_log", [])
     if not trades:
         return Panel(
@@ -1210,30 +1284,82 @@ def _build_trade_log_panel(bot_state: Optional[dict]) -> Panel:
             border_style="dim",
         )
 
-    tbl = Table(show_header=True, box=None, padding=(0, 1), expand=True)
-    tbl.add_column("", width=4, no_wrap=True)       # BUY/SELL
-    tbl.add_column("", width=3, no_wrap=True)       # YES/NO
-    tbl.add_column("Price", justify="right", no_wrap=True, min_width=6)
-    tbl.add_column("Size", justify="right", no_wrap=True, min_width=6)
-    tbl.add_column("Age", justify="right", no_wrap=True, min_width=6)
+    # Width detection. Caller may pass an explicit width (tests); otherwise
+    # ask Rich for the terminal's current width. Fall back to wide mode if
+    # detection fails.
+    if panel_width is None:
+        try:
+            panel_width = Console().width
+        except Exception:
+            panel_width = 200
+    narrow = panel_width < _TRADES_NARROW_WIDTH
+    strat_width = 8 if narrow else 10
 
-    now = time.time()
+    inventories = (bot_state or {}).get("inventories") or {}
+
+    tbl = Table(show_header=True, box=None, padding=(0, 1), expand=True,
+                header_style="dim")
+    tbl.add_column("",         width=1, no_wrap=True)                   # ▶ marker
+    tbl.add_column("TIME",     width=8, no_wrap=True)
+    tbl.add_column("STRAT",    width=strat_width, no_wrap=True)
+    tbl.add_column("SLOT",     width=5, no_wrap=True)
+    if not narrow:
+        tbl.add_column("TTE",  width=6, justify="right", no_wrap=True)
+    tbl.add_column("SIDE",     width=4, no_wrap=True)
+    tbl.add_column("OUT",      width=3, no_wrap=True)
+    tbl.add_column("PRICE",    width=6, justify="right", no_wrap=True)
+    tbl.add_column("SHARES",   width=6, justify="right", no_wrap=True)
+    if not narrow:
+        tbl.add_column("NOTIONAL", width=8, justify="right", no_wrap=True)
+        tbl.add_column("EDGE",     width=7, justify="right", no_wrap=True)
+    tbl.add_column("STATUS",   width=9, no_wrap=True)
+    tbl.add_column("PnL",      width=8, justify="right", no_wrap=True)
+
     for entry in reversed(trades[-10:]):
-        action  = entry.get("action", "")
-        outcome = entry.get("outcome", "")
-        price   = entry.get("price", 0.0)
-        size    = entry.get("size", 0.0)
-        age_s   = int(now - entry.get("ts", now))
-        age_str = f"{age_s // 60}m{age_s % 60}s" if age_s >= 60 else f"{age_s}s"
+        action  = str(entry.get("action", ""))
+        outcome = str(entry.get("outcome", ""))
+        price   = float(entry.get("price", 0.0) or 0.0)
+        size    = float(entry.get("size", 0.0) or 0.0)
+        notional = price * size
 
-        act_style = "bold green" if action == "BUY" else "bold red"
-        tbl.add_row(
-            Text(action, style=act_style),
-            Text(outcome, style="white"),
-            Text(f"{price:.2f}", style="white"),
-            Text(f"{size:.1f}", style="dim"),
-            Text(age_str, style="dim"),
-        )
+        status_label, status_style = _trade_status(entry, inventories)
+        is_open = status_label == "OPEN"
+
+        side_style = "bold green" if action == "BUY" else "bold red"
+        out_style  = "green" if outcome == "YES" else "red"
+
+        edge_val = entry.get("edge")
+        edge_str = f"{edge_val:+.3f}" if isinstance(edge_val, (int, float)) else "—"
+
+        strat = str(entry.get("strategy_name") or "—")
+        if len(strat) > strat_width:
+            strat = strat[: strat_width - 1] + "…"
+
+        ts_val = entry.get("ts") or time.time()
+        time_str = datetime.fromtimestamp(float(ts_val)).strftime("%H:%M:%S")
+
+        row = [
+            Text("▶" if is_open else " ", style="bold cyan" if is_open else "dim"),
+            Text(time_str, style="white"),
+            Text(strat, style="white"),
+            Text(_fmt_slot(entry.get("slot_expiry_ts")), style="white"),
+        ]
+        if not narrow:
+            row.append(Text(_fmt_tte(entry.get("seconds_to_expiry")), style="dim"))
+        row += [
+            Text(action, style=side_style),
+            Text(outcome, style=out_style),
+            Text(f"${price:.2f}", style="white"),
+            Text(f"{size:.1f}", style="white"),
+        ]
+        if not narrow:
+            row.append(Text(f"${notional:.2f}", style="white"))
+            row.append(Text(edge_str, style="white"))
+        row += [
+            Text(status_label, style=status_style),
+            _fmt_pnl(entry.get("realized_pnl_delta")),
+        ]
+        tbl.add_row(*row)
 
     return Panel(tbl, title="[dim]Trades[/dim]", border_style="dim")
 
@@ -1383,10 +1509,14 @@ def _build_config_panel(config_path: str) -> Panel:
         if not isinstance(scfg, dict):
             continue
         enabled = scfg.get("enabled", True)
-        size    = scfg.get("position_size_usdc")
+        size_min = scfg.get("min_position_size_usdc")
+        size_flat = scfg.get("position_size_usdc")
         edge    = scfg.get("min_edge")
         parts   = []
-        if size  is not None: parts.append(f"${size}")
+        if size_min is not None:
+            parts.append(f"kelly≥${size_min:g}")
+        elif size_flat is not None:
+            parts.append(f"${size_flat:g}")
         if edge  is not None: parts.append(f"edge≥{edge}")
         val_str = "  ".join(parts) if parts else "–"
         style   = "white" if enabled else "dim"

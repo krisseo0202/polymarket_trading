@@ -38,6 +38,9 @@ class Strategy(ABC):
         self.max_entry_price = config.get("max_entry_price", 0.95)
         self.min_entry_price = config.get("min_entry_price", 0.05)
         self.exit_rule: str = config.get("exit_rule", "default")
+        # Minimum slot time-remaining required to open a new position.
+        # Independent of max_hold_seconds (which is the exit cap).
+        self.min_entry_window_s: int = int(config.get("min_entry_window_s", 10))
         self.last_skip_reason: str = ""
 
         # Position state — authoritative after sync_position_from_inventory()

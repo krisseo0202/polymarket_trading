@@ -1,0 +1,87 @@
+{
+  "model_version": "logreg_v5_tuned",
+  "source_study": "experiments/v5/round_2",
+  "source_trial": 40,
+  "features": [
+    "ret_30s",
+    "ret_60s",
+    "depth_ratio",
+    "imbalance",
+    "spread",
+    "wall_flag",
+    "depth_change",
+    "mid_return_5s",
+    "acceleration",
+    "rolling_std_30s",
+    "time_to_expiry",
+    "vol_ratio_15_60",
+    "cvd_60s",
+    "vwap_deviation"
+  ],
+  "hparams": {
+    "C": 0.1186,
+    "row_interval": 25,
+    "edge_threshold": 0.049,
+    "kelly_mult": 0.425,
+    "max_frac": 0.247
+  },
+  "n_train_rows": 5193,
+  "n_valid_rows": 1344,
+  "n_train_slots": 259,
+  "n_valid_slots": 65,
+  "coef": [
+    0.02703422731470685,
+    0.35952069662868213,
+    0.22106458426299047,
+    -0.12768195894354994,
+    0.047446941818945425,
+    -0.1427748068697083,
+    0.015275096153585308,
+    0.46046498685660375,
+    -0.38143219350628127,
+    0.17895395153176205,
+    -0.04370657343487084,
+    -0.02767037014759955,
+    0.22864209451758433,
+    -0.18147351134118817
+  ],
+  "intercept": -0.4450079528842495,
+  "calibrated": true,
+  "held_out_metrics": {
+    "v4": {
+      "brier": 0.207445984159694,
+      "logloss": 0.600638066318986,
+      "row_acc": 0.6644345238095238,
+      "slot_acc": 0.7076923076923077
+    },
+    "v5_tuned": {
+      "brier": 0.21056874344229842,
+      "logloss": 0.6041937874774894,
+      "row_acc": 0.6316964285714286,
+      "slot_acc": 0.6307692307692307
+    }
+  },
+  "backtest": {
+    "starting_equity": 100.0,
+    "C": 0.1186,
+    "row_interval": 25,
+    "edge_threshold": 0.049,
+    "kelly_mult": 0.425,
+    "max_frac": 0.247,
+    "v4_tuned_sizing": {
+      "final_equity": 695.7467314629148,
+      "trades": 65,
+      "win_rate": 0.5538461538461539
+    },
+    "v4_baseline_sizing": {
+      "final_equity": 281.7366610860753,
+      "trades": 65,
+      "win_rate": 0.5538461538461539
+    },
+    "v5_tuned": {
+      "final_equity": 2197.25871733063,
+      "trades": 65,
+      "win_rate": 0.5692307692307692
+    }
+  }
+}
