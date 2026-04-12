@@ -56,22 +56,26 @@ class LogRegEdgeStrategy(Strategy):
         self.max_hold_seconds: int = int(config.get("max_hold_seconds", 240))
         self.profit_target_pct: float = float(config.get("profit_target_pct", 999.0))
 
-        # Sizing: fractional Kelly on total balance, with a minimum floor.
-        # If raw Kelly output is below `min_position_size_usdc`, we bet the
-        # floor; otherwise we bet Kelly. No strategy-level ceiling — the
-        # account-level RiskManager caps (max_position_size,
-        # max_position_pct, max_total_exposure) are the hard safety net.
+        # Sizing: fractional Kelly clamped to a [min, max] USDC band.
+        #   - min_position_size_usdc: floor applied only when Kelly > 0, so
+        #     trades are operationally meaningful on small balances.
+        #   - max_position_size_usdc: hard ceiling on per-trade notional.
+        #     The strategy enforces this explicitly (do NOT rely on
+        #     RiskManager alone — its size check is share-denominated and
+        #     the units are load-dependent; see tasks/todo.md).
+        # Legacy `position_size_usdc` is read as a fallback for max so
+        # older configs keep working.
         self.kelly_fraction: float = float(config.get("kelly_fraction", 0.15))
+        _legacy_cap = float(config.get("position_size_usdc", 30.0))
+        self.max_position_size_usdc: float = float(
+            config.get("max_position_size_usdc", _legacy_cap)
+        )
         self.min_position_size_usdc: float = float(
             config.get("min_position_size_usdc", 0.0)
         )
-        # Legacy: older configs / other strategies still read
-        # `position_size_usdc` as a single number. Kept as an alias for the
-        # floor so telemetry/config panels that read it show something
-        # meaningful.
-        self.position_size_usdc: float = float(
-            config.get("position_size_usdc", self.min_position_size_usdc)
-        )
+        # Kept as an alias (= max) so dashboards / telemetry that still
+        # read the single `position_size_usdc` key show something useful.
+        self.position_size_usdc: float = self.max_position_size_usdc
 
         # Rolling YES orderbook history for v5 microstructure features:
         # (wall_ts, bid_depth_top3, ask_depth_top3). 30s is enough for the
@@ -120,7 +124,12 @@ class LogRegEdgeStrategy(Strategy):
                 if mid:
                     self.record_price(tid, mid, now_mono)
 
-        # Record YES orderbook depth history for v5 microstructure features
+        # Record YES orderbook depth history for v5 microstructure features.
+        # NOTE: this runs on every cycle, including while we're holding an
+        # open position (we short-circuit with "in_position" below). That's
+        # intentional — the 30s rolling window needs to be warm when the
+        # next slot opens and we start evaluating entries. Do NOT move this
+        # under the "not in position" branch.
         yes_book_for_ob = order_books.get(self._yes_token_id)
         if yes_book_for_ob and yes_book_for_ob.bids and yes_book_for_ob.asks:
             bid_d = sum(float(e.size) for e in yes_book_for_ob.bids[:3])
@@ -367,33 +376,37 @@ class LogRegEdgeStrategy(Strategy):
     # ------------------------------------------------------------------
 
     def _kelly_size(self, prob: float, price: float, balance: float) -> float:
-        """Fractional Kelly notional for a binary contract, floored at
-        `min_position_size_usdc`.
+        """Fractional Kelly notional for a binary contract, clamped to the
+        [min_position_size_usdc, max_position_size_usdc] band.
 
             f_kelly = (p - x) / (1 - x)
             f_used  = kelly_fraction * f_kelly
             usdc    = f_used * balance
-            return  = max(usdc, min_position_size_usdc)   if usdc > 0
-                      0                                    otherwise
+            return  = clip(usdc, min, max)   if usdc > 0
+                      0                       otherwise
 
         The floor is applied only when Kelly is positive — a zero-Kelly
         signal (no edge at the ask) returns 0 and no trade fires. By the
         time this runs, the entry gate (delta + min_confidence) has
-        already confirmed meaningful edge, so flooring the notional at a
-        minimum is safe: it just bumps operationally-too-small raw Kelly
-        outputs up to a placeable size. Downside-ceiling comes from the
-        account-level RiskManager (max_position_size / max_position_pct /
-        max_total_exposure), not from this strategy.
+        already confirmed meaningful edge, so floor-enforcement just
+        bumps operationally-too-small raw Kelly outputs up to a placeable
+        size. The max ceiling is enforced here (not trusted to the
+        RiskManager) because RiskManager's size check is share-
+        denominated and the units are load-dependent — see
+        tasks/todo.md for the refactor.
         """
         if price <= 0 or price >= 1 or prob <= price:
             return 0.0
         if balance <= 0:
-            return self.min_position_size_usdc
+            # Unknown/zero balance: fall back to the floor (or the legacy
+            # single-number cap for configs that don't set a floor).
+            return self.min_position_size_usdc or self.max_position_size_usdc
         f_full = (prob - price) / (1.0 - price)
         f_used = max(0.0, self.kelly_fraction * f_full)
         usdc = f_used * balance
         if usdc <= 0:
             return 0.0
+        usdc = min(usdc, self.max_position_size_usdc)
         if self.min_position_size_usdc > 0:
             usdc = max(usdc, self.min_position_size_usdc)
         return usdc

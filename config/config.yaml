@@ -138,13 +138,15 @@ strategies:
     # so that flipping exit_rule later doesn't silently disable the cap.
     max_hold_seconds: 300
 
-    # Kelly sizing. Notional = max(kelly_notional, min_position_size_usdc).
-    # Raw Kelly output on a small account is often <$5, so the floor makes
-    # each trade operationally meaningful. No strategy-level ceiling — the
-    # account-level RiskManager (max_position_size / max_position_pct /
-    # max_total_exposure in the `risk:` block) is the hard safety net.
+    # Kelly sizing. Notional = clip(kelly_notional, min, max).
+    #   min: operational floor — small balances produce sub-$5 raw Kelly,
+    #        which isn't meaningfully placeable. Floor only applies when
+    #        Kelly > 0 (no edge → no trade).
+    #   max: explicit USDC ceiling enforced by the strategy. Do NOT trust
+    #        RiskManager alone — see tasks/todo.md for the units fix.
     kelly_fraction: 0.10              # fractional Kelly multiplier
     min_position_size_usdc: 10.0      # floor — applied only when Kelly > 0
+    max_position_size_usdc: 50.0      # hard ceiling per trade
 
     # Confidence gate
     min_confidence: 0.52         # minimum model prob to allow trade (raised from 0.51)
@@ -159,8 +161,11 @@ strategies:
       window_s: 172800           # use last 48h of live data
       tolerance_brier: 0.005     # accept new model iff new_brier ≤ prod_brier + this
       min_train_rows: 500        # skip the pass if the window has fewer rows than this
-      ob_csv: "data/live_orderbook_snapshots.csv"
-      btc_csv: "data/btc_live_1s.csv"
+      # Glob patterns — the bot rotates these CSVs per session, so a
+      # single frozen path would leave the retrainer training on stale
+      # data forever. `*` picks up every rotated file automatically.
+      ob_csv_glob:  "data/live_orderbook_snapshots*.csv"
+      btc_csv_glob: "data/btc_live_1s*.csv"
       history_path: "data/retrain_history.jsonl"
       output_parent: "models"
       model_prefix: "logreg_v4"
