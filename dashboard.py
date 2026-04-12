@@ -1473,12 +1473,120 @@ def _build_log_panel(log_file: str, n: int = 18) -> Panel:
 
 
 # ── Config panel ──────────────────────────────────────────────────────────────
+#
+# Runtime config doesn't change mid-session — the bot process reads
+# config/config.yaml once at launch and never re-loads it. So the dashboard
+# does the same: yaml.safe_load runs exactly once per dashboard process and
+# the projected summary is cached in module state. Operator-visible edits
+# to the file require a dashboard restart (documented in panel footer).
 
-def _build_config_panel(config_path: str) -> Panel:
-    """Show key settings from config.yaml in a compact panel."""
+_runtime_config_cache: Optional[Dict[str, Any]] = None
+
+
+def _build_runtime_summary(raw: dict, active_strategy: Optional[str]) -> Dict[str, Any]:
+    """Project raw config.yaml into the fields the operator cares about during live trading.
+
+    Returns a flat dict; pure function of inputs so it's trivially unit-testable.
+    If active_strategy is None or not in cfg.strategies, falls back to the
+    first enabled strategy block (or the first strategy at all).
+    """
+    trading = raw.get("trading", {}) or {}
+    risk = raw.get("risk", {}) or {}
+    strategies = raw.get("strategies", {}) or {}
+
+    # Resolve the active strategy block.
+    strat_cfg: dict = {}
+    strat_name = active_strategy or ""
+    if strat_name and strat_name in strategies and isinstance(strategies[strat_name], dict):
+        strat_cfg = strategies[strat_name]
+    else:
+        for name, block in strategies.items():
+            if isinstance(block, dict) and block.get("enabled", True):
+                strat_name, strat_cfg = name, block
+                break
+        else:
+            if strategies:
+                strat_name = next(iter(strategies))
+                strat_cfg = strategies[strat_name] if isinstance(strategies[strat_name], dict) else {}
+
+    # Position sizing: prefer min-max range, fall back to single cap, then
+    # to a min-only floor ("≥$10") when only the floor is configured.
+    size_min = strat_cfg.get("min_position_size_usdc")
+    size_max = strat_cfg.get("max_position_size_usdc") or strat_cfg.get("position_size_usdc")
+    if size_min is not None and size_max is not None:
+        max_position: Optional[str] = f"${size_min:g}–${size_max:g}"
+    elif size_max is not None:
+        max_position = f"${size_max:g}"
+    elif size_min is not None:
+        max_position = f"≥${size_min:g}"
+    else:
+        max_position = None
+
+    def _pct(x: Any) -> Optional[str]:
+        if x is None:
+            return None
+        try:
+            return f"{float(x) * 100:.0f}%"
+        except (TypeError, ValueError):
+            return None
+
+    def _money(x: Any) -> Optional[str]:
+        if x is None:
+            return None
+        try:
+            return f"${float(x):g}"
+        except (TypeError, ValueError):
+            return None
+
+    def _fnum(x: Any, fmt: str) -> Optional[str]:
+        if x is None:
+            return None
+        try:
+            return format(float(x), fmt)
+        except (TypeError, ValueError):
+            return None
+
+    # Values of None mean "not configured" — _build_config_panel drops those
+    # rows entirely rather than rendering a meaningless "—".
+    return {
+        "mode": "PAPER" if trading.get("paper_trading", True) else "LIVE",
+        "interval": f"{int(trading.get('interval', 300))}s "
+                    f"({int(trading.get('interval', 300)) // 60}m)",
+        "strategy": strat_name or "—",
+        "model_dir": strat_cfg.get("model_dir") or None,
+        "max_position": max_position,
+        "kelly": _fnum(strat_cfg.get("kelly_fraction"), ".2f"),
+        "min_edge": _fnum(strat_cfg.get("delta") or strat_cfg.get("min_edge"), ".3f"),
+        "min_conf": _fnum(strat_cfg.get("min_confidence"), ".2f"),
+        "max_exposure": _pct(risk.get("max_total_exposure")),
+        "daily_loss": _pct(risk.get("max_daily_loss")),
+        "session_loss": _money(risk.get("max_session_loss_usdc")),
+    }
+
+
+def _load_runtime_config(config_path: str, active_strategy: Optional[str]) -> Dict[str, Any]:
+    """Load and project config.yaml exactly once per process, then cache."""
+    global _runtime_config_cache
+    if _runtime_config_cache is not None:
+        return _runtime_config_cache
+    with open(config_path) as f:
+        raw = yaml.safe_load(f) or {}
+    _runtime_config_cache = _build_runtime_summary(raw, active_strategy)
+    return _runtime_config_cache
+
+
+def _build_config_panel(
+    bot_state: Optional[dict],
+    config_path: str,
+) -> Panel:
+    """Render a concise runtime summary of the active process's config.
+
+    Reads config.yaml once per dashboard lifetime (see _load_runtime_config).
+    Operator edits require a dashboard restart to take effect.
+    """
+    active_strategy = (bot_state or {}).get("strategy_name") or None
     try:
-        with open(config_path) as f:
-            cfg = yaml.safe_load(f) or {}
+        summary = _load_runtime_config(config_path, active_strategy)
     except (OSError, yaml.YAMLError) as e:
         return Panel(
             Text(f"Cannot load {config_path}:\n{e}", style="bold red"),
@@ -1490,42 +1598,36 @@ def _build_config_panel(config_path: str) -> Panel:
     tbl.add_column(style="dim", no_wrap=True)
     tbl.add_column(justify="left", no_wrap=True)
 
-    trading = cfg.get("trading", {})
-    risk    = cfg.get("risk", {})
+    mode_style = "bold yellow" if summary["mode"] == "PAPER" else "bold green"
 
-    tbl.add_row("paper",        Text(str(trading.get("paper_trading", "?")),
-                                    style="bold yellow" if trading.get("paper_trading") else "bold green"))
-    tbl.add_row("interval",     Text(f"{trading.get('interval', '?')}s"))
+    def _add(label: str, key: str, style: str = "white") -> None:
+        """Append a row only if the summary has a real value for this key."""
+        val = summary.get(key)
+        if val is None:
+            return
+        tbl.add_row(label, Text(str(val), style=style))
+
+    tbl.add_row("mode",      Text(summary["mode"], style=mode_style))
+    _add("interval",  "interval")
     tbl.add_row("", "")
 
-    tbl.add_row("max_pos",      Text(f"${risk.get('max_position_size', '?')}"))
-    tbl.add_row("max_pos_pct",  Text(f"{risk.get('max_position_pct', 0)*100:.0f}%"))
-    tbl.add_row("daily_loss",   Text(f"{risk.get('max_daily_loss', 0)*100:.0f}%"))
-    tbl.add_row("sess_loss",    Text(f"${risk.get('max_session_loss_usdc', '?')}"))
+    _add("strategy",  "strategy",     style="bold white")
+    _add("model",     "model_dir")
+    _add("position",  "max_position")
+    _add("kelly",     "kelly")
+    _add("min edge",  "min_edge")
+    _add("min conf",  "min_conf")
     tbl.add_row("", "")
 
-    # Show enabled strategies and their position sizes
-    for name, scfg in cfg.get("strategies", {}).items():
-        if not isinstance(scfg, dict):
-            continue
-        enabled = scfg.get("enabled", True)
-        size_min = scfg.get("min_position_size_usdc")
-        size_flat = scfg.get("position_size_usdc")
-        edge    = scfg.get("min_edge")
-        parts   = []
-        if size_min is not None:
-            parts.append(f"kelly≥${size_min:g}")
-        elif size_flat is not None:
-            parts.append(f"${size_flat:g}")
-        if edge  is not None: parts.append(f"edge≥{edge}")
-        val_str = "  ".join(parts) if parts else "–"
-        style   = "white" if enabled else "dim"
-        tbl.add_row(
-            Text(name[:18], style=style),
-            Text(("✓ " if enabled else "✗ ") + val_str, style=style),
-        )
+    _add("exposure",  "max_exposure")
+    _add("daily cap", "daily_loss")
+    _add("session",   "session_loss")
 
-    return Panel(tbl, title=f"[dim]Config  {os.path.basename(config_path)}[/dim]", border_style="dim")
+    return Panel(
+        tbl,
+        title=f"[dim]Config  {os.path.basename(config_path)}[/dim]",
+        border_style="dim",
+    )
 
 
 # ── Dashboard builder ─────────────────────────────────────────────────────────
@@ -1671,7 +1773,9 @@ def _build_panel(
     # ── Slot history panel (full-width) ───────────────────────────────────
     slot_history_panel = _build_slot_history_panel(bot_state)
 
-    # ── Market Cycle + Strategy + Trade Log panels (bottom row) ──────────
+    # ── Market Cycle + Strategy + Config panels (bottom row, 3-col) ──────
+    # Trades is promoted to its own full-width row below slot history so it
+    # has room for strategy/slot/status/PnL without truncation.
     market_cycle_panel = _build_market_cycle_panel(
         feed,
         chainlink_feed,
@@ -1680,14 +1784,13 @@ def _build_panel(
     )
     strategy_panel = _build_strategy_panel(bot_state, snapshot=snapshot)
     trade_log_panel = _build_trade_log_panel(bot_state)
-    config_panel = _build_config_panel(config_path)
+    config_panel = _build_config_panel(bot_state, config_path)
 
     bottom_row = Table.grid(expand=True)
     bottom_row.add_column(ratio=1)
     bottom_row.add_column(ratio=1)
     bottom_row.add_column(ratio=1)
-    bottom_row.add_column(ratio=1)
-    bottom_row.add_row(market_cycle_panel, strategy_panel, trade_log_panel, config_panel)
+    bottom_row.add_row(market_cycle_panel, strategy_panel, config_panel)
 
     # ── Footer ────────────────────────────────────────────────────────────
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
@@ -1706,6 +1809,7 @@ def _build_panel(
     outer.add_row(body)
     outer.add_row(middle_row)
     outer.add_row(slot_history_panel)
+    outer.add_row(trade_log_panel)
     outer.add_row(bottom_row)
     outer.add_row(log_panel)
     outer.add_row(footer)

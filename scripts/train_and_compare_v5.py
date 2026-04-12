@@ -190,8 +190,8 @@ def build_dataset(ob_df: pd.DataFrame, btc_df: pd.DataFrame,
                 "rsi_14": v3._rsi(ts, close, t),
                 "td_setup_net": v3._td_setup_net(ts, close, t),
                 "spread": spread,
-                "ob_imbalance": depth_skew,       # v4 naming
-                "ob_cross_imbalance": imbalance,  # v4 naming
+                "ob_imbalance": depth_skew,
+                "ob_cross_imbalance": imbalance,
                 # v5 new
                 "depth_ratio": depth_ratio,
                 "depth_skew": depth_skew,
@@ -361,21 +361,35 @@ def run_experiment(df: pd.DataFrame, feature_list: list, hparams: dict,
         "final_equity": final_equity,
         "n_trades": n_trades,
         "win_rate": win_rate,
-        # also return the fitted objects so callers can reuse them if wanted
-        "_model": model,
-        "_scaler": scaler,
-        "_calibrator": cal,
+        "model": model,
+        "scaler": scaler,
+        "calibrator": cal,
     }
 
 
-# ── Main ──────────────────────────────────────────────────────────────────
+def score_v4(valid_df: pd.DataFrame, v4_dir: str) -> np.ndarray:
+    """Score logreg_v4 on the given valid rows using the saved scaler +
+    coef/intercept from meta (direct sigmoid), then apply the saved
+    calibrator. Sidesteps sklearn version drift in the pickled model.
+    """
+    with open(os.path.join(v4_dir, "logreg_scaler.pkl"), "rb") as f:
+        scaler = pickle.load(f)
+    with open(os.path.join(v4_dir, "logreg_calibrator.pkl"), "rb") as f:
+        cal = pickle.load(f)
+    meta = json.loads(open(os.path.join(v4_dir, "logreg_meta.json")).read())
+    coef = np.asarray(meta["coef"])
+    intercept = float(meta["intercept"])
+
+    X = valid_df[V4_FEATURES].values.astype(float)
+    p_raw = score_linear(X, scaler, coef, intercept)
+    if hasattr(cal, "predict"):
+        return cal.predict(p_raw)
+    if hasattr(cal, "transform"):
+        return cal.transform(p_raw)
+    return np.asarray(cal(p_raw))
+
 
 def main():
-    from sklearn.linear_model import LogisticRegression
-    from sklearn.preprocessing import StandardScaler
-    from sklearn.isotonic import IsotonicRegression
-    from sklearn.metrics import brier_score_loss, log_loss
-
     ob_path = os.path.join(REPO_ROOT, "data/live_orderbook_snapshots.csv")
     btc_path = os.path.join(REPO_ROOT, "data/btc_live_1s.csv")
     v4_dir = os.path.join(REPO_ROOT, "models/logreg_v4")
@@ -407,61 +421,31 @@ def main():
     print(f"Train: {len(train)} rows / {len(train_slots)} slots")
     print(f"Valid: {len(valid)} rows / {len(valid_slots)} slots")
 
-    # ── Train v5 ─────────────────────────────────────────────────────────
-    X_tr = train[V5_FEATURES].values.astype(float)
-    y_tr = train["y"].values.astype(int)
+    from sklearn.metrics import brier_score_loss, log_loss
+
+    result = run_experiment(df, V5_FEATURES, {"C": 0.1})
+    model5, scaler5, cal5 = result["model"], result["scaler"], result["calibrator"]
+
     X_va = valid[V5_FEATURES].values.astype(float)
     y_va = valid["y"].values.astype(int)
+    p_va5 = cal5.predict(model5.predict_proba(scaler5.transform(X_va))[:, 1])
+    p_va4 = score_v4(valid, v4_dir)
 
-    scaler5 = StandardScaler().fit(X_tr)
-    Xs_tr = scaler5.transform(X_tr)
-    Xs_va = scaler5.transform(X_va)
-
-    model5 = LogisticRegression(max_iter=1000, solver="lbfgs", C=0.1)
-    model5.fit(Xs_tr, y_tr)
-
-    p_va_raw5 = model5.predict_proba(Xs_va)[:, 1]
-    cal5 = IsotonicRegression(y_min=0.01, y_max=0.99, out_of_bounds="clip")
-    cal5.fit(p_va_raw5, y_va)
-    p_va5 = cal5.predict(p_va_raw5)
-
-    # ── Score v4 on same valid rows (direct sigmoid, pickle-safe) ────────
-    with open(os.path.join(v4_dir, "logreg_scaler.pkl"), "rb") as f:
-        scaler4 = pickle.load(f)
-    with open(os.path.join(v4_dir, "logreg_calibrator.pkl"), "rb") as f:
-        cal4 = pickle.load(f)
-    meta4 = json.loads(open(os.path.join(v4_dir, "logreg_meta.json")).read())
-    coef4 = np.asarray(meta4["coef"])
-    inter4 = float(meta4["intercept"])
-
-    X_va4 = valid[V4_FEATURES].values.astype(float)
-    p_va_raw4 = score_linear(X_va4, scaler4, coef4, inter4)
-    if hasattr(cal4, "predict"):
-        p_va4 = cal4.predict(p_va_raw4)
-    elif hasattr(cal4, "transform"):
-        p_va4 = cal4.transform(p_va_raw4)
-    else:
-        p_va4 = np.asarray(cal4(p_va_raw4))
-
-    # ── Metrics ──────────────────────────────────────────────────────────
     def slot_acc(df_v, p):
         tmp = df_v.assign(p=p)
         s = tmp.groupby("slot_ts").agg(y=("y", "first"), pm=("p", "mean"))
         return float(((s["pm"] > 0.5).astype(int) == s["y"]).mean())
 
+    def row_metrics(y, p):
+        return {
+            "brier": float(brier_score_loss(y, p)),
+            "logloss": float(log_loss(y, np.clip(p, 1e-6, 1 - 1e-6))),
+            "row_acc": float(((p > 0.5).astype(int) == y).mean()),
+        }
+
     metrics = {
-        "v4": {
-            "brier": float(brier_score_loss(y_va, p_va4)),
-            "logloss": float(log_loss(y_va, np.clip(p_va4, 1e-6, 1 - 1e-6))),
-            "row_acc": float(((p_va4 > 0.5).astype(int) == y_va).mean()),
-            "slot_acc": slot_acc(valid, p_va4),
-        },
-        "v5": {
-            "brier": float(brier_score_loss(y_va, p_va5)),
-            "logloss": float(log_loss(y_va, np.clip(p_va5, 1e-6, 1 - 1e-6))),
-            "row_acc": float(((p_va5 > 0.5).astype(int) == y_va).mean()),
-            "slot_acc": slot_acc(valid, p_va5),
-        },
+        "v4": {**row_metrics(y_va, p_va4), "slot_acc": slot_acc(valid, p_va4)},
+        "v5": {**row_metrics(y_va, p_va5), "slot_acc": slot_acc(valid, p_va5)},
     }
     print("\n" + "=" * 56)
     print(f"{'metric':<12} {'v4':>12} {'v5':>12}")
@@ -469,7 +453,6 @@ def main():
         print(f"{k:<12} {metrics['v4'][k]:>12.4f} {metrics['v5'][k]:>12.4f}")
     print("=" * 56)
 
-    # ── Backtest ─────────────────────────────────────────────────────────
     print("\nBacktesting on held-out slots ($100 start, edge>0.02, 0.15·Kelly, cap 10%)...")
     bt4 = backtest(valid, p_va4)
     bt5 = backtest(valid, p_va5)
@@ -487,7 +470,6 @@ def main():
     f4, n4, wr4 = summary("v4", bt4)
     f5, n5, wr5 = summary("v5", bt5)
 
-    # ── Plot ─────────────────────────────────────────────────────────────
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -516,7 +498,6 @@ def main():
     plt.savefig(out_png, dpi=120)
     print(f"\nSaved plot → {out_png}")
 
-    # ── Persist v5 model ─────────────────────────────────────────────────
     with open(os.path.join(v5_dir, "logreg_model.pkl"), "wb") as f:
         pickle.dump(model5, f)
     with open(os.path.join(v5_dir, "logreg_scaler.pkl"), "wb") as f:
@@ -526,8 +507,8 @@ def main():
     meta5 = {
         "model_version": "logreg_v5",
         "features": V5_FEATURES,
-        "n_train_rows": int(len(X_tr)),
-        "n_valid_rows": int(len(X_va)),
+        "n_train_rows": int(len(train)),
+        "n_valid_rows": int(len(valid)),
         "n_train_slots": int(len(train_slots)),
         "n_valid_slots": int(len(valid_slots)),
         "valid_brier": metrics["v5"]["brier"],

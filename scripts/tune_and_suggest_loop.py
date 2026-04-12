@@ -87,16 +87,13 @@ def main():
         os.makedirs(round_dir, exist_ok=True)
         print(f"\n{'=' * 60}\nROUND {r}\n{'=' * 60}")
 
-        # ── Optuna ─────────────────────────────────────────────────────
         tune_cmd = [py, tune, "--trials", str(args.trials_per_round),
                     "--round", str(r)]
         if r > 0:
             prev_sugg = os.path.join(
                 REPO_ROOT, f"experiments/v5/round_{r - 1}/suggestion.json"
             )
-            tune_cmd += ["--feature-subset-file", prev_sugg,
-                         "--search-space-file", prev_sugg,
-                         "--seed-trial-file", prev_sugg]
+            tune_cmd += ["--config", prev_sugg]
         if run(tune_cmd) != 0:
             print(f"ERROR: round {r} Optuna failed", file=sys.stderr); sys.exit(1)
 
@@ -117,15 +114,13 @@ def main():
             break
         prev_hv = hv
 
-        # ── LLM suggester (skip on final round) ─────────────────────────
         if r == args.rounds - 1:
-            break
+            break  # no suggestion needed after the final round
         sugg_cmd = [py, suggest, "--round", str(r)]
         if run(sugg_cmd) != 0:
             print(f"WARN: round {r} suggester failed, stopping loop")
             break
 
-    # ── Summary ──────────────────────────────────────────────────────────
     print(f"\n{'=' * 60}\nLOOP SUMMARY\n{'=' * 60}")
     print(f"{'round':<8}{'hv':>10}{'brier':>12}{'equity':>12}{'n_pareto':>12}")
     for h in history:

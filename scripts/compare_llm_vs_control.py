@@ -44,27 +44,16 @@ def pareto_filter(pts):
 
 
 def hv(pareto, ref_b=1.0, ref_e=100.0):
-    """2D hypervolume for (min brier, max equity) vs reference point."""
-    pts = [(float(p["brier"]), float(p["final_equity"])) for p in pareto
-           if float(p["brier"]) < ref_b and float(p["final_equity"]) > ref_e]
-    if not pts:
-        return 0.0
-    # Pareto-filter (defensive)
-    filt = []
-    for i, (b, e) in enumerate(pts):
-        dom = False
-        for j, (b2, e2) in enumerate(pts):
-            if i == j:
-                continue
-            if b2 <= b and e2 >= e and (b2 < b or e2 > e):
-                dom = True
-                break
-        if not dom:
-            filt.append((b, e))
-    filt.sort(key=lambda p: p[0])  # brier asc ⇒ equity also asc on a valid front
+    """2D hypervolume for (min brier, max equity) vs reference point.
+    `pareto` must already be Pareto-filtered (use pareto_filter first).
+    """
+    pts = sorted(
+        [(float(p["brier"]), float(p["final_equity"])) for p in pareto
+         if float(p["brier"]) < ref_b and float(p["final_equity"]) > ref_e]
+    )
     total = 0.0
-    for i, (b, e) in enumerate(filt):
-        next_b = filt[i + 1][0] if i + 1 < len(filt) else ref_b
+    for i, (b, e) in enumerate(pts):
+        next_b = pts[i + 1][0] if i + 1 < len(pts) else ref_b
         total += (next_b - b) * (e - ref_e)
     return total
 
@@ -82,12 +71,12 @@ def merged_pareto(round_pairs):
     return sorted(pareto_filter(pts), key=lambda r: r["brier"])
 
 
-# ── Load ────────────────────────────────────────────────────────────────
 llm_rounds = [load_top(d) for d in LLM_DIRS]
 ctrl = load_top(CTRL_DIR)
 
 llm_global = merged_pareto(llm_rounds)
-ctrl_global = ctrl.get("pareto", [])
+ctrl_global = sorted(pareto_filter(ctrl.get("pareto", [])),
+                     key=lambda r: float(r["brier"]))
 
 print("=" * 70)
 print(f"{'source':<22}{'n_trials':>10}{'pareto':>10}{'best_brier':>14}{'best_equity':>14}")
@@ -112,7 +101,6 @@ print(f"\nHypervolume (ref: brier=1.0, equity=$100):")
 print(f"  LLM merged : {hv(llm_global):.2f}")
 print(f"  Control    : {hv(ctrl_global):.2f}")
 
-# ── Plot ───────────────────────────────────────────────────────────────
 fig, axes = plt.subplots(1, 2, figsize=(13, 5.5))
 
 ax = axes[0]

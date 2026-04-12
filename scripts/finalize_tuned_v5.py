@@ -53,7 +53,6 @@ def main():
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    # ── Build dataset with row_interval=25 ───────────────────────────────
     print("Loading data...")
     ob_df = pd.read_csv(os.path.join(REPO, "data/live_orderbook_snapshots.csv"))
     btc_df = pd.read_csv(os.path.join(REPO, "data/btc_live_1s.csv"))
@@ -66,7 +65,6 @@ def main():
                              row_interval=TUNED_HPARAMS["row_interval"])
     print(f"  {len(df)} rows from {df['slot_ts'].nunique()} slots")
 
-    # ── Walk-forward split (same as v5 script) ───────────────────────────
     slots = sorted(df["slot_ts"].unique())
     split = max(1, int(len(slots) * 0.8))
     train_slots = set(slots[:split])
@@ -76,43 +74,19 @@ def main():
     print(f"Train: {len(train)} rows / {len(train_slots)} slots")
     print(f"Valid: {len(valid)} rows / {len(valid_slots)} slots")
 
-    # ── Train tuned v5 via run_experiment ────────────────────────────────
     print(f"\nTraining tuned v5 with {len(TUNED_FEATURES)} features...")
     result = v5mod.run_experiment(
         df, TUNED_FEATURES,
         {k: v for k, v in TUNED_HPARAMS.items() if k != "row_interval"},
     )
-    model_t = result["_model"]
-    scaler_t = result["_scaler"]
-    cal_t = result["_calibrator"]
+    model_t, scaler_t, cal_t = result["model"], result["scaler"], result["calibrator"]
 
-    # re-derive predictions on valid so we can plot the equity curve
     X_va = valid[TUNED_FEATURES].values.astype(float)
     y_va = valid["y"].values.astype(int)
-    Xs_va = scaler_t.transform(X_va)
-    p_raw = model_t.predict_proba(Xs_va)[:, 1]
-    p_vaT = cal_t.predict(p_raw)
+    p_vaT = cal_t.predict(model_t.predict_proba(scaler_t.transform(X_va))[:, 1])
 
-    # ── Score v4 on the same valid rows (direct sigmoid, pickle-safe) ───
-    v4_dir = os.path.join(REPO, "models/logreg_v4")
-    with open(os.path.join(v4_dir, "logreg_scaler.pkl"), "rb") as f:
-        scaler4 = pickle.load(f)
-    with open(os.path.join(v4_dir, "logreg_calibrator.pkl"), "rb") as f:
-        cal4 = pickle.load(f)
-    meta4 = json.loads(open(os.path.join(v4_dir, "logreg_meta.json")).read())
-    coef4 = np.asarray(meta4["coef"])
-    inter4 = float(meta4["intercept"])
+    p_va4 = v5mod.score_v4(valid, os.path.join(REPO, "models/logreg_v4"))
 
-    X_va4 = valid[v5mod.V4_FEATURES].values.astype(float)
-    p_va_raw4 = v5mod.score_linear(X_va4, scaler4, coef4, inter4)
-    if hasattr(cal4, "predict"):
-        p_va4 = cal4.predict(p_va_raw4)
-    elif hasattr(cal4, "transform"):
-        p_va4 = cal4.transform(p_va_raw4)
-    else:
-        p_va4 = np.asarray(cal4(p_va_raw4))
-
-    # ── Metrics ──────────────────────────────────────────────────────────
     def slot_acc(df_v, p):
         tmp = df_v.assign(p=p)
         s = tmp.groupby("slot_ts").agg(y=("y", "first"), pm=("p", "mean"))
@@ -136,7 +110,6 @@ def main():
         print(f"{k:<12}{a:>14.4f}{b:>16.4f}{(b - a):>+14.4f}")
     print("=" * 62)
 
-    # ── Backtest both on same valid slots, same sizing rules ─────────────
     print("\nBacktesting (tuned sizing from round 2 #40)...")
     bt_v4 = v5mod.backtest(
         valid, p_va4,
@@ -164,12 +137,10 @@ def main():
     f4, n4, wr4 = summary("v4", bt_v4)
     f5, n5, wr5 = summary("v5_tuned", bt_v5)
 
-    # Also report what v4 looks like under its OWN original sizing config
-    # for an honest baseline (not the tuned sizing).
-    bt_v4_baseline = v5mod.backtest(valid, p_va4)  # defaults: edge 0.02, k=0.15, cap 0.10
+    # Honest baseline: v4 under its original sizing, not the tuned sizing.
+    bt_v4_baseline = v5mod.backtest(valid, p_va4)
     fb, nb, wrb = summary("v4 (baseline sizing)", bt_v4_baseline)
 
-    # ── Plot ─────────────────────────────────────────────────────────────
     fig, axes = plt.subplots(1, 2, figsize=(13, 5))
 
     ax = axes[0]
@@ -206,7 +177,6 @@ def main():
     plt.savefig(out_png, dpi=120)
     print(f"\nSaved plot → {out_png}")
 
-    # ── Persist tuned v5 ─────────────────────────────────────────────────
     out_dir = os.path.join(REPO, "models/logreg_v5_tuned")
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, "logreg_model.pkl"), "wb") as f:

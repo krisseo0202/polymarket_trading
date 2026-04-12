@@ -17,9 +17,7 @@ Feature subset: fixed for a single study. Overridable via
 Usage:
   python scripts/tune_v5_optuna.py --trials 100 --round 0
   python scripts/tune_v5_optuna.py --trials 50 --round 1 \\
-      --feature-subset-file experiments/v5/round_0/suggestion.json \\
-      --search-space-file  experiments/v5/round_0/suggestion.json \\
-      --seed-trial-file    experiments/v5/round_0/suggestion.json
+      --config experiments/v5/round_0/suggestion.json
 """
 
 from __future__ import annotations
@@ -82,23 +80,13 @@ def suggest_param(trial: optuna.Trial, name: str, spec: dict):
 
 # ── Main ──────────────────────────────────────────────────────────────────
 
-def load_json_key(path: str | None, key: str, default):
-    if not path or not os.path.exists(path):
-        return default
-    data = json.loads(open(path).read())
-    return data.get(key, default)
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--trials", type=int, default=100)
     ap.add_argument("--round", type=int, default=0)
-    ap.add_argument("--feature-subset-file", default=None,
-                    help="JSON file containing a 'feature_subset' list.")
-    ap.add_argument("--search-space-file", default=None,
-                    help="JSON file containing 'hparam_ranges' dict.")
-    ap.add_argument("--seed-trial-file", default=None,
-                    help="JSON file containing a 'seed_trial' dict to enqueue first.")
+    ap.add_argument("--config", default=None,
+                    help="JSON with 'feature_subset', 'hparam_ranges', 'seed_trial' "
+                         "(typically a prior round's suggestion.json).")
     ap.add_argument("--out-dir", default=None)
     args = ap.parse_args()
 
@@ -107,10 +95,10 @@ def main():
     )
     os.makedirs(out_dir, exist_ok=True)
 
-    # Resolve search space + feature subset + seed
-    space = load_json_key(args.search_space_file, "hparam_ranges", DEFAULT_SPACE)
-    features = load_json_key(args.feature_subset_file, "feature_subset", v5mod.V5_FEATURES)
-    seed_trial = load_json_key(args.seed_trial_file, "seed_trial", None)
+    cfg = json.loads(open(args.config).read()) if args.config else {}
+    space = cfg.get("hparam_ranges", DEFAULT_SPACE)
+    features = cfg.get("feature_subset", v5mod.V5_FEATURES)
+    seed_trial = cfg.get("seed_trial")
 
     # Validate feature subset
     bad = [f for f in features if f not in AVAILABLE_FEATURES]
@@ -137,7 +125,6 @@ def main():
     labels = v5mod.v3.derive_labels(ob_df)
     print(f"Labels: {len(labels)} slots")
 
-    # ── Define objective ─────────────────────────────────────────────────
     def objective(trial: optuna.Trial):
         C = suggest_param(trial, "C", space["C"])
         row_interval = int(suggest_param(trial, "row_interval", space["row_interval"]))
@@ -182,7 +169,6 @@ def main():
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     study.optimize(objective, n_trials=args.trials, show_progress_bar=False)
 
-    # ── Summary / artifacts ──────────────────────────────────────────────
     pareto = study.best_trials
     print(f"\nPareto front: {len(pareto)} trial(s)")
     top_rows = []

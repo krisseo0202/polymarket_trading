@@ -1,172 +1,114 @@
-# Polymarket Trading System
+# Polymarket BTC 5-Min Up/Down Trading Bot
 
-A modular trading system for Polymarket with support for multiple strategies, backtesting, and risk management.
+Automated bot for Polymarket's 5-minute BTC Up/Down binary markets. Predicts `p_up`, sizes with fractional Kelly, enforces strict risk limits, logs everything.
 
-## Features
+Markets resolve using Chainlink BTC/USD stream start vs end price.
 
-- **Multiple Trading Strategies**: Arbitrage, Momentum, Mean Reversion
-- **Strategy Pattern**: Easy to add new strategies by extending the base `Strategy` class
-- **Risk Management**: Position sizing, stop-loss, daily limits, circuit breakers
-- **Backtesting Framework**: Test strategies on historical data
-- **Paper Trading**: Simulate trades without real money
-- **Live Trading**: Execute real trades on Polymarket
-- **Configuration Management**: YAML-based configuration
-- **Comprehensive Logging**: Track all trading activity
-
-## Installation
-
-### Using Conda (Recommended)
-
-1. Clone the repository:
-```bash
-git clone <repository-url>
-cd polymarket_trading
-```
-
-2. Create and activate the conda environment:
-```bash
-conda env create -f environment.yml
-conda activate polymarket_trading
-```
-
-### Using pip
-
-1. Clone the repository:
-```bash
-git clone <repository-url>
-cd polymarket_trading
-```
-
-2. Create a virtual environment and install dependencies:
-```bash
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-pip install -r requirements.txt
-```
-
-3. Set up environment variables (optional):
-```bash
-export PRIVATE_KEY="your_private_key"
-export FUNDER_ADDRESS="your_funder_address"
-export PAPER_TRADING="true"  # Set to "false" for live trading
-```
-
-See `SETUP.md` for detailed setup instructions.
-
-## Configuration
-
-Edit `config/config.yaml` to configure:
-- API credentials
-- Risk limits
-- Strategy parameters
-- Trading settings
-
-## Usage
-
-### Live Trading
-
-Run the trading system with configured strategies:
+## Run
 
 ```bash
-python examples/live_trading.py
+.venv/bin/python bot.py              # live loop (paper by default)
+.venv/bin/python dashboard.py        # local web dashboard
+.venv/bin/python quant_desk.py       # TUI for inspection
 ```
 
-### Backtesting
+Config lives in `config/config.yaml`. Secrets in `.env`.
 
-Test a strategy on historical data:
+## System layout
+
+```
+bot.py               entrypoint; single-cycle → sleep loop
+dashboard.py         Dash UI over decision logs + PnL
+quant_desk.py        terminal dashboard
+
+src/
+  api/               Polymarket CLOB client + types
+  models/            p_up estimators (logreg_v4, v5, xgb, baseline)
+  strategies/        decision rules (logreg_edge is primary)
+  engine/
+    cycle_runner     orchestrates one decision cycle
+    risk_manager     per-trade + daily limits, circuit breakers
+    execution        order placement, cancel, fill reconciliation
+    inventory        position state per market
+    pnl              equity + drawdown tracking
+    model_retrainer  online retrain hook
+    state_store      persistent slot state
+  utils/             config, logging, startup
+
+data/                live snapshots (BTC 1s, orderbooks, decision logs)
+models/              trained model artifacts (logreg_v4, v5, v5_tuned, xgb)
+experiments/v5/      Optuna studies + LLM suggestions (round_0, round_1, …)
+scripts/             training, tuning, analysis (see below)
+tests/               unit + integration
+```
+
+## Decision flow (`src/engine/cycle_runner.py`)
+
+1. `SYNC` — pull orderbook + BTC 1s + current positions
+2. `EVALUATE` — strategy calls model → `p_up`, computes edge vs fillable price
+3. `RISK_CHECK` — `risk_manager` gates size, caps exposure
+4. `PLACE/CANCEL` — `execution` submits limit, reconciles fills
+5. `ROLLOVER` — on slot end, `inventory` settles, `pnl` updates
+
+Exactly one active market at a time. At most one net position per market.
+
+## Models
+
+| Model | Features | Where |
+|---|---|---|
+| `logreg_v4` | 18 BTC-only (momentum, vol, vwap, rsi, td, ob) | `models/logreg_v4/` |
+| `logreg_v5` | 13 compact microstructure + momentum | `models/logreg_v5/` |
+| `logreg_v5_tuned` | 14 (Optuna+LLM-tuned round 2) | `models/logreg_v5_tuned/` |
+| `xgb` | same v4 feature set | `models/btc_updown_xgb*` |
+
+v4 is best calibrated; v5_tuned is the aggressive-sizing backtest winner. See `data/v4_vs_v5tuned_backtest.png`.
+
+## Optuna + LLM tuning loop
+
+Closed loop: Optuna searches hyperparameters multi-objectively (minimize Brier, maximize backtest equity), then Claude reads the Pareto front and proposes the next round's feature subset and tightened ranges.
 
 ```bash
-python examples/backtest_example.py
+ANTHROPIC_API_KEY=... .venv/bin/python scripts/tune_and_suggest_loop.py \
+    --rounds 3 --trials-per-round 100
 ```
 
-### Custom Strategy
+Relevant scripts:
 
-Create your own strategy by extending the `Strategy` base class:
+| Script | Purpose |
+|---|---|
+| `scripts/train_and_compare_v5.py` | Train v5, score v4 on same held-out, backtest both |
+| `scripts/tune_v5_optuna.py` | Single Optuna round (100 trials, NSGA-II) |
+| `scripts/llm_suggest_v5.py` | Claude proposes next round's config from study results |
+| `scripts/tune_and_suggest_loop.py` | Closed-loop orchestrator |
+| `scripts/compare_llm_vs_control.py` | LLM-assisted vs pure-Optuna comparison |
+| `scripts/finalize_tuned_v5.py` | Persist a chosen Pareto trial as `models/logreg_v5_tuned/` |
+| `scripts/_v5_feature_docs.py` | Feature descriptions (LLM prompt context) |
 
-```python
-from src.strategies.base import Strategy, Signal
+Artifacts: `experiments/v5/round_<n>/{study.db, top_trials.json, suggestion.json, pareto.png}`.
 
-class MyStrategy(Strategy):
-    def analyze(self, market_data):
-        # Your analysis logic
-        return signals
-    
-    def should_enter(self, signal):
-        # Your entry logic
-        return True
-```
+## Risk invariants (enforced in `risk_manager`)
 
-See `examples/simple_strategy.py` for a complete example.
+- Max fraction of account per market (configurable, 1–3%)
+- Max 1 open BTC 5-min position at a time
+- Daily loss limit halts trading
+- Cooldown after N consecutive losses
+- Never simultaneously long Up and Down on the same slot
+- All prices must lie in [0, 1]
 
-## Project Structure
+## Observability
 
-```
-polymarket_trading/
-├── src/
-│   ├── api/              # Polymarket API client
-│   ├── strategies/       # Trading strategies
-│   ├── engine/           # Trading engine and risk management
-│   ├── backtest/         # Backtesting framework
-│   └── utils/            # Configuration and logging
-├── config/               # Configuration files
-├── examples/             # Example scripts
-└── tests/                # Unit tests
-```
+Every cycle logs: `market_id`, `slug`, `time_to_expiry`, orderbook summary, `p_up`, chosen side, edge after costs, sizing fraction, executions, latencies, balance, daily PnL, skip reason.
 
-## Strategies
+Structured JSONL at `data/decision_log_*.jsonl`.
 
-### Arbitrage Strategy
-- Three-way arbitrage (YES + NO prices)
-- Spread arbitrage
-- Cross-market opportunities
+## Paper vs live
 
-### Momentum Strategy
-- Price momentum detection
-- Moving average crossovers
-- Volume breakouts
-
-### Mean Reversion Strategy
-- Oversold/overbought detection
-- RSI-based signals
-- Price deviation from mean
-
-## Risk Management
-
-The system includes comprehensive risk management:
-- Maximum position size limits
-- Daily loss limits
-- Stop-loss mechanisms
-- Circuit breakers
-- Exposure limits per market
-
-## Backtesting
-
-The backtesting framework allows you to:
-- Test strategies on historical data
-- Calculate performance metrics (Sharpe ratio, max drawdown, win rate)
-- Compare different strategies
-- Optimize strategy parameters
-
-## Paper Trading
-
-By default, the system runs in paper trading mode, which:
-- Simulates trades without executing real orders
-- Tracks positions and PnL
-- Allows safe testing of strategies
-
-## Contributing
-
-1. Create a new strategy by extending `Strategy` base class
-2. Implement `analyze()` and `should_enter()` methods
-3. Add strategy configuration to `config/config.yaml`
-4. Test with backtesting framework
-5. Deploy with paper trading first
-
-## License
-
-MIT License
+Paper is the default. Flip `PAPER_TRADING=false` in `.env` only after:
+- N days of paper runs matching config
+- Small-capital ramp with strict caps
+- Kill switch verified
+- Monitoring dashboard live
 
 ## Disclaimer
 
-This software is for educational purposes only. Trading involves risk of loss. Use at your own risk.
-
+Trading can lose money quickly. This is not financial advice.

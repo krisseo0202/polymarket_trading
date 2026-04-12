@@ -30,6 +30,7 @@ Design notes:
 
 from __future__ import annotations
 
+import glob
 import json
 import logging
 import os
@@ -37,7 +38,7 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -50,8 +51,13 @@ class RetrainConfig:
     window_s: int = 48 * 3600
     tolerance_brier: float = 0.005
     min_train_rows: int = 500
-    ob_csv: str = "data/live_orderbook_snapshots.csv"
-    btc_csv: str = "data/btc_live_1s.csv"
+    # Glob patterns (fed to glob.glob). The bot rotates these CSVs per
+    # session (e.g. btc_live_1s_20260412T011843Z.csv), so a fixed filename
+    # would freeze the retraining data. A pattern with `*` picks up every
+    # rotated file automatically; a plain path still works as a single
+    # literal match.
+    ob_csv_glob: str = "data/live_orderbook_snapshots*.csv"
+    btc_csv_glob: str = "data/btc_live_1s*.csv"
     history_path: str = "data/retrain_history.jsonl"
     output_parent: str = "models"
     model_prefix: str = "logreg_v4"
@@ -59,14 +65,18 @@ class RetrainConfig:
     @classmethod
     def from_dict(cls, d: Optional[dict]) -> "RetrainConfig":
         d = d or {}
+        # Accept both new keys (`*_glob`) and legacy single-path keys
+        # (`ob_csv`, `btc_csv`) so existing configs keep loading.
+        ob_glob = d.get("ob_csv_glob") or d.get("ob_csv") or "data/live_orderbook_snapshots*.csv"
+        btc_glob = d.get("btc_csv_glob") or d.get("btc_csv") or "data/btc_live_1s*.csv"
         return cls(
             enabled=bool(d.get("enabled", True)),
             interval_s=int(d.get("interval_s", 3600)),
             window_s=int(d.get("window_s", 48 * 3600)),
             tolerance_brier=float(d.get("tolerance_brier", 0.005)),
             min_train_rows=int(d.get("min_train_rows", 500)),
-            ob_csv=str(d.get("ob_csv", "data/live_orderbook_snapshots.csv")),
-            btc_csv=str(d.get("btc_csv", "data/btc_live_1s.csv")),
+            ob_csv_glob=str(ob_glob),
+            btc_csv_glob=str(btc_glob),
             history_path=str(d.get("history_path", "data/retrain_history.jsonl")),
             output_parent=str(d.get("output_parent", "models")),
             model_prefix=str(d.get("model_prefix", "logreg_v4")),
@@ -184,12 +194,19 @@ class Retrainer:
         }
 
         # ── Load rolling slice of the live CSVs ──
-        if not (os.path.exists(self.cfg.ob_csv) and os.path.exists(self.cfg.btc_csv)):
+        # Both globs match all rotated session files plus any legacy
+        # single-file. We concat everything, dedupe, and slice by
+        # timestamp so a fresh bot session is picked up automatically.
+        ob_files = self._list_csv(self.cfg.ob_csv_glob, since_ts)
+        btc_files = self._list_csv(self.cfg.btc_csv_glob, since_ts)
+        record["n_ob_files"] = len(ob_files)
+        record["n_btc_files"] = len(btc_files)
+        if not ob_files or not btc_files:
             record["reason"] = "csv_missing"
             return record
 
-        ob_df = pd.read_csv(self.cfg.ob_csv)
-        btc_df = pd.read_csv(self.cfg.btc_csv)
+        ob_df = self._concat_csv(ob_files, dedupe_subset=["slot_ts", "elapsed_s", "side"])
+        btc_df = self._concat_csv(btc_files, dedupe_subset=["timestamp"])
         ob_df = ob_df[ob_df["slot_ts"] >= since_ts].reset_index(drop=True)
         btc_df = btc_df[btc_df["timestamp"] >= since_ts].reset_index(drop=True)
         if ob_df.empty or btc_df.empty:
@@ -302,6 +319,49 @@ class Retrainer:
         record["accepted"] = True
         record["new_dir"] = new_dir
         return record
+
+    # ── CSV loading (rotated-file aware) ─────────────────────────────
+
+    @staticmethod
+    def _list_csv(pattern: str, since_ts: float) -> List[str]:
+        """Resolve a glob pattern to a sorted list of CSV files.
+
+        Files whose mtime is strictly earlier than `since_ts` are
+        dropped — they can't contain any row inside the rolling window.
+        This is a soft guard; we still filter by the in-CSV timestamp
+        column after concatenation, so it's safe to be imprecise here.
+        """
+        files = glob.glob(pattern)
+        kept = [f for f in files if os.path.getmtime(f) >= since_ts]
+        return sorted(kept)
+
+    @staticmethod
+    def _concat_csv(files: List[str], *, dedupe_subset: List[str]) -> pd.DataFrame:
+        """Read and concatenate multiple CSVs, dedupe, sort stably.
+
+        Overlap between a legacy single-file and its rotated successors
+        is possible in principle — we dedupe on a stable key rather
+        than whole-row to be robust to minor column-formatting drift.
+        """
+        if not files:
+            return pd.DataFrame()
+        frames: List[pd.DataFrame] = []
+        for f in files:
+            try:
+                frames.append(pd.read_csv(f))
+            except Exception:
+                # A concurrently-written file may hit a torn last line;
+                # pandas recovers on the next read. Skipping one file
+                # just shifts that data into the next retrain cycle.
+                continue
+        if not frames:
+            return pd.DataFrame()
+        df = pd.concat(frames, ignore_index=True)
+        # Only dedupe on columns that actually exist (schema drift-safe)
+        present = [c for c in dedupe_subset if c in df.columns]
+        if present:
+            df = df.drop_duplicates(subset=present, keep="last")
+        return df.reset_index(drop=True)
 
     def _load_prod_features(self) -> Optional[list]:
         """Read the prod model's feature list from its meta.json.

@@ -18,7 +18,6 @@ import argparse
 import json
 import os
 import sys
-import textwrap
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, REPO_ROOT)
@@ -34,7 +33,6 @@ from _v5_feature_docs import FEATURE_DOCS, AVAILABLE_FEATURES  # noqa: E402
 
 
 MODEL_ID = "claude-sonnet-4-6"
-FALLBACK_MODEL_ID = "claude-sonnet-4-5"
 MAX_TOKENS = 2048
 TEMPERATURE = 0.4
 
@@ -120,33 +118,20 @@ def build_user_prompt(round_dir: str, top_trials: dict) -> str:
 def call_claude(system: str, feature_docs: str, user: str) -> str:
     import anthropic
     client = anthropic.Anthropic()
-    # Try preferred model, fall back if the account doesn't have access
-    try:
-        resp = client.messages.create(
-            model=MODEL_ID,
-            max_tokens=MAX_TOKENS,
-            temperature=TEMPERATURE,
-            system=[
-                {"type": "text", "text": system,
-                 "cache_control": {"type": "ephemeral"}},
-                {"type": "text", "text": feature_docs,
-                 "cache_control": {"type": "ephemeral"}},
-            ],
-            messages=[{"role": "user", "content": user}],
-        )
-    except Exception as e:
-        print(f"WARN: primary model failed ({e}); retrying with fallback")
-        resp = client.messages.create(
-            model=FALLBACK_MODEL_ID,
-            max_tokens=MAX_TOKENS,
-            temperature=TEMPERATURE,
-            system=system + "\n\n" + feature_docs,
-            messages=[{"role": "user", "content": user}],
-        )
+    resp = client.messages.create(
+        model=MODEL_ID,
+        max_tokens=MAX_TOKENS,
+        temperature=TEMPERATURE,
+        system=[
+            {"type": "text", "text": system,
+             "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": feature_docs,
+             "cache_control": {"type": "ephemeral"}},
+        ],
+        messages=[{"role": "user", "content": user}],
+    )
     return resp.content[0].text if resp.content else ""
 
-
-# ── Parsing / validation ──────────────────────────────────────────────────
 
 REQUIRED_HPARAMS = {"C", "row_interval", "edge_threshold", "kelly_mult", "max_frac"}
 
@@ -200,8 +185,6 @@ def parse_and_validate(text: str) -> dict:
 
     return data
 
-
-# ── Main ──────────────────────────────────────────────────────────────────
 
 def main():
     ap = argparse.ArgumentParser()
