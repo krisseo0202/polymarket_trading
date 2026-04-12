@@ -1200,8 +1200,82 @@ def _build_strategy_panel(
     return Panel(tbl, title="[dim]Strategy[/dim]", border_style="dim")
 
 
-def _build_trade_log_panel(bot_state: Optional[dict]) -> Panel:
-    """Show recent BUY/SELL trades from bot_state.trade_log."""
+# ── Trades panel helpers ──────────────────────────────────────────────────────
+#
+# The Trades panel renders one row per fill from bot_state.trade_log (schema
+# enriched in src/engine/cycle_runner.py::execute_signals, ~line 767). All
+# three format helpers are pure functions of a single entry dict so they're
+# trivial to unit-test and tweak without touching the builder.
+
+# Narrow-mode breakpoint (panel width below which we drop low-priority cols).
+_TRADES_NARROW_WIDTH = 100
+
+
+def _trade_status(entry: dict, inventories: Optional[dict]) -> tuple[str, str]:
+    """Derive (label, style) for the STATUS cell of a trade row.
+
+    Priority:
+      1. OPEN      — row's token_id still has nonzero inventory position
+      2. SETTLED   — closing fill with a nonzero realized_pnl_delta
+      3. FILLED    — entry fill (BUY that opened or SELL that didn't realize)
+
+    CANCELED is a placeholder for a future extension (cycle_runner would need
+    to write canceled-order events into trade_log; it doesn't today).
+    """
+    token_id = entry.get("token_id")
+    if token_id and inventories:
+        inv = inventories.get(token_id)
+        position = 0.0
+        if isinstance(inv, dict):
+            position = float(inv.get("position", 0.0) or 0.0)
+        elif inv is not None:
+            position = float(getattr(inv, "position", 0.0) or 0.0)
+        if abs(position) > 1e-9:
+            return "OPEN", "bold cyan"
+
+    delta = entry.get("realized_pnl_delta")
+    if delta is not None and abs(float(delta)) > 1e-9:
+        return "SETTLED", "bold white"
+
+    return "FILLED", "dim white"
+
+
+def _fmt_pnl(delta: Optional[float]) -> Text:
+    """Render a realized-PnL delta as a signed dollar string with sign-based color."""
+    if delta is None or abs(float(delta)) < 1e-9:
+        return Text("—", style="dim")
+    d = float(delta)
+    sign = "+" if d >= 0 else "-"
+    return Text(f"{sign}${abs(d):.2f}", style="bold green" if d >= 0 else "bold red")
+
+
+def _fmt_tte(seconds: Optional[float]) -> str:
+    """Format a time-to-expiry value (seconds) like '73s' or '2m15s'."""
+    if seconds is None:
+        return "—"
+    s = int(max(0.0, float(seconds)))
+    return f"{s // 60}m{s % 60}s" if s >= 60 else f"{s}s"
+
+
+def _fmt_slot(slot_expiry_ts: Optional[float]) -> str:
+    """Render a slot expiry timestamp as a local HH:MM label."""
+    if not slot_expiry_ts:
+        return "—"
+    return datetime.fromtimestamp(float(slot_expiry_ts)).strftime("%H:%M")
+
+
+def _build_trade_log_panel(
+    bot_state: Optional[dict],
+    panel_width: Optional[int] = None,
+) -> Panel:
+    """Show recent fills from bot_state.trade_log as a single-row-per-trade table.
+
+    Columns (wide mode, panel width ≥ _TRADES_NARROW_WIDTH):
+        ▶  TIME  STRAT  SLOT  TTE  SIDE  OUT  PRICE  SHARES  NOTIONAL  EDGE  STATUS  PnL
+
+    Narrow mode drops TTE, NOTIONAL, and EDGE and shrinks STRAT to 8 chars.
+    Open rows (inventory still long in this token) get a leading ▶ marker.
+    """
     trades = (bot_state or {}).get("trade_log", [])
     if not trades:
         return Panel(
@@ -1210,30 +1284,82 @@ def _build_trade_log_panel(bot_state: Optional[dict]) -> Panel:
             border_style="dim",
         )
 
-    tbl = Table(show_header=True, box=None, padding=(0, 1), expand=True)
-    tbl.add_column("", width=4, no_wrap=True)       # BUY/SELL
-    tbl.add_column("", width=3, no_wrap=True)       # YES/NO
-    tbl.add_column("Price", justify="right", no_wrap=True, min_width=6)
-    tbl.add_column("Size", justify="right", no_wrap=True, min_width=6)
-    tbl.add_column("Age", justify="right", no_wrap=True, min_width=6)
+    # Width detection. Caller may pass an explicit width (tests); otherwise
+    # ask Rich for the terminal's current width. Fall back to wide mode if
+    # detection fails.
+    if panel_width is None:
+        try:
+            panel_width = Console().width
+        except Exception:
+            panel_width = 200
+    narrow = panel_width < _TRADES_NARROW_WIDTH
+    strat_width = 8 if narrow else 10
 
-    now = time.time()
+    inventories = (bot_state or {}).get("inventories") or {}
+
+    tbl = Table(show_header=True, box=None, padding=(0, 1), expand=True,
+                header_style="dim")
+    tbl.add_column("",         width=1, no_wrap=True)                   # ▶ marker
+    tbl.add_column("TIME",     width=8, no_wrap=True)
+    tbl.add_column("STRAT",    width=strat_width, no_wrap=True)
+    tbl.add_column("SLOT",     width=5, no_wrap=True)
+    if not narrow:
+        tbl.add_column("TTE",  width=6, justify="right", no_wrap=True)
+    tbl.add_column("SIDE",     width=4, no_wrap=True)
+    tbl.add_column("OUT",      width=3, no_wrap=True)
+    tbl.add_column("PRICE",    width=6, justify="right", no_wrap=True)
+    tbl.add_column("SHARES",   width=6, justify="right", no_wrap=True)
+    if not narrow:
+        tbl.add_column("NOTIONAL", width=8, justify="right", no_wrap=True)
+        tbl.add_column("EDGE",     width=7, justify="right", no_wrap=True)
+    tbl.add_column("STATUS",   width=9, no_wrap=True)
+    tbl.add_column("PnL",      width=8, justify="right", no_wrap=True)
+
     for entry in reversed(trades[-10:]):
-        action  = entry.get("action", "")
-        outcome = entry.get("outcome", "")
-        price   = entry.get("price", 0.0)
-        size    = entry.get("size", 0.0)
-        age_s   = int(now - entry.get("ts", now))
-        age_str = f"{age_s // 60}m{age_s % 60}s" if age_s >= 60 else f"{age_s}s"
+        action  = str(entry.get("action", ""))
+        outcome = str(entry.get("outcome", ""))
+        price   = float(entry.get("price", 0.0) or 0.0)
+        size    = float(entry.get("size", 0.0) or 0.0)
+        notional = price * size
 
-        act_style = "bold green" if action == "BUY" else "bold red"
-        tbl.add_row(
-            Text(action, style=act_style),
-            Text(outcome, style="white"),
-            Text(f"{price:.2f}", style="white"),
-            Text(f"{size:.1f}", style="dim"),
-            Text(age_str, style="dim"),
-        )
+        status_label, status_style = _trade_status(entry, inventories)
+        is_open = status_label == "OPEN"
+
+        side_style = "bold green" if action == "BUY" else "bold red"
+        out_style  = "green" if outcome == "YES" else "red"
+
+        edge_val = entry.get("edge")
+        edge_str = f"{edge_val:+.3f}" if isinstance(edge_val, (int, float)) else "—"
+
+        strat = str(entry.get("strategy_name") or "—")
+        if len(strat) > strat_width:
+            strat = strat[: strat_width - 1] + "…"
+
+        ts_val = entry.get("ts") or time.time()
+        time_str = datetime.fromtimestamp(float(ts_val)).strftime("%H:%M:%S")
+
+        row = [
+            Text("▶" if is_open else " ", style="bold cyan" if is_open else "dim"),
+            Text(time_str, style="white"),
+            Text(strat, style="white"),
+            Text(_fmt_slot(entry.get("slot_expiry_ts")), style="white"),
+        ]
+        if not narrow:
+            row.append(Text(_fmt_tte(entry.get("seconds_to_expiry")), style="dim"))
+        row += [
+            Text(action, style=side_style),
+            Text(outcome, style=out_style),
+            Text(f"${price:.2f}", style="white"),
+            Text(f"{size:.1f}", style="white"),
+        ]
+        if not narrow:
+            row.append(Text(f"${notional:.2f}", style="white"))
+            row.append(Text(edge_str, style="white"))
+        row += [
+            Text(status_label, style=status_style),
+            _fmt_pnl(entry.get("realized_pnl_delta")),
+        ]
+        tbl.add_row(*row)
 
     return Panel(tbl, title="[dim]Trades[/dim]", border_style="dim")
 
@@ -1347,12 +1473,120 @@ def _build_log_panel(log_file: str, n: int = 18) -> Panel:
 
 
 # ── Config panel ──────────────────────────────────────────────────────────────
+#
+# Runtime config doesn't change mid-session — the bot process reads
+# config/config.yaml once at launch and never re-loads it. So the dashboard
+# does the same: yaml.safe_load runs exactly once per dashboard process and
+# the projected summary is cached in module state. Operator-visible edits
+# to the file require a dashboard restart (documented in panel footer).
 
-def _build_config_panel(config_path: str) -> Panel:
-    """Show key settings from config.yaml in a compact panel."""
+_runtime_config_cache: Optional[Dict[str, Any]] = None
+
+
+def _build_runtime_summary(raw: dict, active_strategy: Optional[str]) -> Dict[str, Any]:
+    """Project raw config.yaml into the fields the operator cares about during live trading.
+
+    Returns a flat dict; pure function of inputs so it's trivially unit-testable.
+    If active_strategy is None or not in cfg.strategies, falls back to the
+    first enabled strategy block (or the first strategy at all).
+    """
+    trading = raw.get("trading", {}) or {}
+    risk = raw.get("risk", {}) or {}
+    strategies = raw.get("strategies", {}) or {}
+
+    # Resolve the active strategy block.
+    strat_cfg: dict = {}
+    strat_name = active_strategy or ""
+    if strat_name and strat_name in strategies and isinstance(strategies[strat_name], dict):
+        strat_cfg = strategies[strat_name]
+    else:
+        for name, block in strategies.items():
+            if isinstance(block, dict) and block.get("enabled", True):
+                strat_name, strat_cfg = name, block
+                break
+        else:
+            if strategies:
+                strat_name = next(iter(strategies))
+                strat_cfg = strategies[strat_name] if isinstance(strategies[strat_name], dict) else {}
+
+    # Position sizing: prefer min-max range, fall back to single cap, then
+    # to a min-only floor ("≥$10") when only the floor is configured.
+    size_min = strat_cfg.get("min_position_size_usdc")
+    size_max = strat_cfg.get("max_position_size_usdc") or strat_cfg.get("position_size_usdc")
+    if size_min is not None and size_max is not None:
+        max_position: Optional[str] = f"${size_min:g}–${size_max:g}"
+    elif size_max is not None:
+        max_position = f"${size_max:g}"
+    elif size_min is not None:
+        max_position = f"≥${size_min:g}"
+    else:
+        max_position = None
+
+    def _pct(x: Any) -> Optional[str]:
+        if x is None:
+            return None
+        try:
+            return f"{float(x) * 100:.0f}%"
+        except (TypeError, ValueError):
+            return None
+
+    def _money(x: Any) -> Optional[str]:
+        if x is None:
+            return None
+        try:
+            return f"${float(x):g}"
+        except (TypeError, ValueError):
+            return None
+
+    def _fnum(x: Any, fmt: str) -> Optional[str]:
+        if x is None:
+            return None
+        try:
+            return format(float(x), fmt)
+        except (TypeError, ValueError):
+            return None
+
+    # Values of None mean "not configured" — _build_config_panel drops those
+    # rows entirely rather than rendering a meaningless "—".
+    return {
+        "mode": "PAPER" if trading.get("paper_trading", True) else "LIVE",
+        "interval": f"{int(trading.get('interval', 300))}s "
+                    f"({int(trading.get('interval', 300)) // 60}m)",
+        "strategy": strat_name or "—",
+        "model_dir": strat_cfg.get("model_dir") or None,
+        "max_position": max_position,
+        "kelly": _fnum(strat_cfg.get("kelly_fraction"), ".2f"),
+        "min_edge": _fnum(strat_cfg.get("delta") or strat_cfg.get("min_edge"), ".3f"),
+        "min_conf": _fnum(strat_cfg.get("min_confidence"), ".2f"),
+        "max_exposure": _pct(risk.get("max_total_exposure")),
+        "daily_loss": _pct(risk.get("max_daily_loss")),
+        "session_loss": _money(risk.get("max_session_loss_usdc")),
+    }
+
+
+def _load_runtime_config(config_path: str, active_strategy: Optional[str]) -> Dict[str, Any]:
+    """Load and project config.yaml exactly once per process, then cache."""
+    global _runtime_config_cache
+    if _runtime_config_cache is not None:
+        return _runtime_config_cache
+    with open(config_path) as f:
+        raw = yaml.safe_load(f) or {}
+    _runtime_config_cache = _build_runtime_summary(raw, active_strategy)
+    return _runtime_config_cache
+
+
+def _build_config_panel(
+    bot_state: Optional[dict],
+    config_path: str,
+) -> Panel:
+    """Render a concise runtime summary of the active process's config.
+
+    Reads config.yaml once per dashboard lifetime (see _load_runtime_config).
+    Operator edits require a dashboard restart to take effect.
+    """
+    active_strategy = (bot_state or {}).get("strategy_name") or None
     try:
-        with open(config_path) as f:
-            cfg = yaml.safe_load(f) or {}
+        summary = _load_runtime_config(config_path, active_strategy)
     except (OSError, yaml.YAMLError) as e:
         return Panel(
             Text(f"Cannot load {config_path}:\n{e}", style="bold red"),
@@ -1364,38 +1598,36 @@ def _build_config_panel(config_path: str) -> Panel:
     tbl.add_column(style="dim", no_wrap=True)
     tbl.add_column(justify="left", no_wrap=True)
 
-    trading = cfg.get("trading", {})
-    risk    = cfg.get("risk", {})
+    mode_style = "bold yellow" if summary["mode"] == "PAPER" else "bold green"
 
-    tbl.add_row("paper",        Text(str(trading.get("paper_trading", "?")),
-                                    style="bold yellow" if trading.get("paper_trading") else "bold green"))
-    tbl.add_row("interval",     Text(f"{trading.get('interval', '?')}s"))
+    def _add(label: str, key: str, style: str = "white") -> None:
+        """Append a row only if the summary has a real value for this key."""
+        val = summary.get(key)
+        if val is None:
+            return
+        tbl.add_row(label, Text(str(val), style=style))
+
+    tbl.add_row("mode",      Text(summary["mode"], style=mode_style))
+    _add("interval",  "interval")
     tbl.add_row("", "")
 
-    tbl.add_row("max_pos",      Text(f"${risk.get('max_position_size', '?')}"))
-    tbl.add_row("max_pos_pct",  Text(f"{risk.get('max_position_pct', 0)*100:.0f}%"))
-    tbl.add_row("daily_loss",   Text(f"{risk.get('max_daily_loss', 0)*100:.0f}%"))
-    tbl.add_row("sess_loss",    Text(f"${risk.get('max_session_loss_usdc', '?')}"))
+    _add("strategy",  "strategy",     style="bold white")
+    _add("model",     "model_dir")
+    _add("position",  "max_position")
+    _add("kelly",     "kelly")
+    _add("min edge",  "min_edge")
+    _add("min conf",  "min_conf")
     tbl.add_row("", "")
 
-    # Show enabled strategies and their position sizes
-    for name, scfg in cfg.get("strategies", {}).items():
-        if not isinstance(scfg, dict):
-            continue
-        enabled = scfg.get("enabled", True)
-        size    = scfg.get("position_size_usdc")
-        edge    = scfg.get("min_edge")
-        parts   = []
-        if size  is not None: parts.append(f"${size}")
-        if edge  is not None: parts.append(f"edge≥{edge}")
-        val_str = "  ".join(parts) if parts else "–"
-        style   = "white" if enabled else "dim"
-        tbl.add_row(
-            Text(name[:18], style=style),
-            Text(("✓ " if enabled else "✗ ") + val_str, style=style),
-        )
+    _add("exposure",  "max_exposure")
+    _add("daily cap", "daily_loss")
+    _add("session",   "session_loss")
 
-    return Panel(tbl, title=f"[dim]Config  {os.path.basename(config_path)}[/dim]", border_style="dim")
+    return Panel(
+        tbl,
+        title=f"[dim]Config  {os.path.basename(config_path)}[/dim]",
+        border_style="dim",
+    )
 
 
 # ── Dashboard builder ─────────────────────────────────────────────────────────
@@ -1541,7 +1773,9 @@ def _build_panel(
     # ── Slot history panel (full-width) ───────────────────────────────────
     slot_history_panel = _build_slot_history_panel(bot_state)
 
-    # ── Market Cycle + Strategy + Trade Log panels (bottom row) ──────────
+    # ── Market Cycle + Strategy + Config panels (bottom row, 3-col) ──────
+    # Trades is promoted to its own full-width row below slot history so it
+    # has room for strategy/slot/status/PnL without truncation.
     market_cycle_panel = _build_market_cycle_panel(
         feed,
         chainlink_feed,
@@ -1550,14 +1784,13 @@ def _build_panel(
     )
     strategy_panel = _build_strategy_panel(bot_state, snapshot=snapshot)
     trade_log_panel = _build_trade_log_panel(bot_state)
-    config_panel = _build_config_panel(config_path)
+    config_panel = _build_config_panel(bot_state, config_path)
 
     bottom_row = Table.grid(expand=True)
     bottom_row.add_column(ratio=1)
     bottom_row.add_column(ratio=1)
     bottom_row.add_column(ratio=1)
-    bottom_row.add_column(ratio=1)
-    bottom_row.add_row(market_cycle_panel, strategy_panel, trade_log_panel, config_panel)
+    bottom_row.add_row(market_cycle_panel, strategy_panel, config_panel)
 
     # ── Footer ────────────────────────────────────────────────────────────
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
@@ -1576,6 +1809,7 @@ def _build_panel(
     outer.add_row(body)
     outer.add_row(middle_row)
     outer.add_row(slot_history_panel)
+    outer.add_row(trade_log_panel)
     outer.add_row(bottom_row)
     outer.add_row(log_panel)
     outer.add_row(footer)

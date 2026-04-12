@@ -98,31 +98,77 @@ strategies:
     slot_loss_limit_usdc: 15.0   # halt slot trading if cumulative loss exceeds this
 
   logreg_edge:
-    # Logistic regression edge strategy — hold to expiry.
-    # Entry: buy when model disagrees with market by > delta + half-spread.
-    # Exit: hold to binary resolution.
+    # Legacy logistic regression edge strategy (uses old LogRegModel class).
+    # Kept for backwards compatibility. New runs should use --strategy logreg
+    # which loads the v4 model from models/logreg_v4.
     enabled: true
     btc_symbol: "BTC-USD"
     btc_exchange: "coinbase"
-    model_dir: "models/logreg_v4"  # v4: no delta, +OB imbalance, isotonic calibration
+    model_dir: "models/logreg"
+
+    delta: 0.05
+    max_spread_pct: 0.06
+    min_seconds_to_expiry: 10
+    max_seconds_to_expiry: 295
+    max_hold_seconds: 300        # hold-to-expiry; unused at runtime (exit_rule is hardcoded), capped at slot length for display/safety
+    kelly_fraction: 0.15
+    position_size_usdc: 30.0
+    min_confidence: 0.51
+
+  logreg:
+    # Active logistic-regression strategy. Loads the v4 model
+    # (18 features + isotonic calibration) via LogRegV4Model.
+    enabled: true
+    btc_symbol: "BTC-USD"
+    btc_exchange: "coinbase"
+    model_dir: "models/logreg_v4"
 
     # Entry filters
-    delta: 0.08                  # minimum margin of safety beyond cost (raised from 0.05; calibration error is 8.5%)
+    delta: 0.025                  # minimum margin of safety beyond cost (override at runtime via --delta)
     max_spread_pct: 0.06         # reject if spread > 6% of mid
     min_seconds_to_expiry: 10    # don't enter with < 10s left (execution risk)
     max_seconds_to_expiry: 295   # allow entry near slot open
-    min_entry_price: 0.35        # skip cheap contracts (data: <0.35 loses money)
+    min_entry_price: 0.30        # skip cheap contracts (data: <0.35 loses money)
     max_entry_price: 0.65        # skip expensive contracts (data: >0.65 loses money)
+    min_entry_window_s: 10       # require ≥10s left in slot to open (matches min_seconds_to_expiry)
 
-    # Hold-to-expiry: disable the cycle runner's time-remaining suppression
-    max_hold_seconds: 999
+    # Hold-to-expiry: exit_rule is hardcoded to "hold_to_expiry" in
+    # LogRegEdgeStrategy, so this value is not consulted at runtime.
+    # Kept ≤ slot length (300s) so the dashboard display is truthful and
+    # so that flipping exit_rule later doesn't silently disable the cap.
+    max_hold_seconds: 300
 
-    # Kelly sizing
-    kelly_fraction: 0.10         # fractional Kelly multiplier (reduced from 0.15; break-even performance)
-    position_size_usdc: 30.0     # hard cap per trade
+    # Kelly sizing. Notional = clip(kelly_notional, min, max).
+    #   min: operational floor — small balances produce sub-$5 raw Kelly,
+    #        which isn't meaningfully placeable. Floor only applies when
+    #        Kelly > 0 (no edge → no trade).
+    #   max: explicit USDC ceiling enforced by the strategy. Do NOT trust
+    #        RiskManager alone — see tasks/todo.md for the units fix.
+    kelly_fraction: 0.10              # fractional Kelly multiplier
+    min_position_size_usdc: 10.0      # floor — applied only when Kelly > 0
+    max_position_size_usdc: 50.0      # hard ceiling per trade
 
     # Confidence gate
-    min_confidence: 0.55         # minimum model prob to allow trade (raised from 0.51; 0.5 conf = 40% WR)
+    min_confidence: 0.52         # minimum model prob to allow trade (raised from 0.51)
+
+    # Online retraining: a daemon thread refits the model on a rolling
+    # window of live CSV data. Hot-swaps only when the strategy is flat,
+    # and only if the new valid_brier does not regress vs the current
+    # production model by more than tolerance_brier.
+    retrain:
+      enabled: false             # flip to true once you've watched a few cycles
+      interval_s: 3600           # run one retrain attempt every hour
+      window_s: 172800           # use last 48h of live data
+      tolerance_brier: 0.005     # accept new model iff new_brier ≤ prod_brier + this
+      min_train_rows: 500        # skip the pass if the window has fewer rows than this
+      # Glob patterns — the bot rotates these CSVs per session, so a
+      # single frozen path would leave the retrainer training on stale
+      # data forever. `*` picks up every rotated file automatically.
+      ob_csv_glob:  "data/live_orderbook_snapshots*.csv"
+      btc_csv_glob: "data/btc_live_1s*.csv"
+      history_path: "data/retrain_history.jsonl"
+      output_parent: "models"
+      model_prefix: "logreg_v4"
 
   btc_vol_reversion:
     enabled: true
@@ -145,7 +191,7 @@ risk:
   max_position_pct: 0.05          # 5% of balance per position
   max_position_size: 200          # hard cap on shares per position
   max_total_exposure: 1.0         # total open notional as fraction of balance
-  max_session_loss_usdc: 5.0      # absolute session loss cap; bot shuts down when reached
+  max_session_loss_usdc: 50      # absolute session loss cap; bot shuts down when reached
 
 chainlink_feed:
   enabled: true

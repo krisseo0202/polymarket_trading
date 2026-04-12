@@ -224,6 +224,19 @@ class CycleRunner:
         )
         market_data = cycle_snap.to_market_data(yes_book, no_book, positions, balance)
 
+        # Online-retrain hot-swap: if the retrainer thread has a new model
+        # ready AND the strategy is currently flat, swap it in before the
+        # next analyze() call. Gated on is_flat so we never change models
+        # mid-slot while carrying a position.
+        retrainer = getattr(svc, "retrainer", None)
+        if retrainer is not None and retrainer.has_ready_model():
+            if svc.strategy.is_flat(by_token) and hasattr(svc.strategy, "reload_model"):
+                new_dir = retrainer.consume_ready_model()
+                if new_dir:
+                    svc.strategy.reload_model(new_dir)
+            else:
+                logger.debug("Retrainer has candidate but strategy not flat — deferring swap")
+
         svc.strategy.set_tokens(self._market_id, self._yes_tid, self._no_tid)
 
         # Seed price history from REST API so features like up_mid_ret_30s
@@ -240,9 +253,11 @@ class CycleRunner:
         _log_strategy_calc(svc.strategy, signals, logger, self)
         _log_decision(svc.strategy, signals, market_data, cycle_type="main")
 
-        # Suppress BUY entries if insufficient time remains
+        # Suppress BUY entries if insufficient time remains in the slot.
+        # min_entry_window_s is independent of max_hold_seconds (which is the
+        # exit cap, not an entry gate).
         time_remaining = (cycle_snap.slot_end_ts or 0) - time.time()
-        min_entry = getattr(svc.strategy, "max_hold_seconds", 240)
+        min_entry = getattr(svc.strategy, "min_entry_window_s", 10)
         if time_remaining < min_entry:
             original = len(signals)
             signals = [s for s in signals if s.action == "SELL"]
@@ -286,7 +301,7 @@ class CycleRunner:
                 return
 
             time_remaining = self._slot_expiry_ts - now_wall
-            min_entry_window = getattr(svc.strategy, "max_hold_seconds", 240)
+            min_entry_window = getattr(svc.strategy, "min_entry_window_s", 10)
 
             if svc.execution_tracker and svc.inventories is not None:
                 closed_orders = svc.execution_tracker.reconcile(
@@ -347,7 +362,7 @@ class CycleRunner:
                 if buy_count:
                     logger.info(
                         f"Intra-cycle: BUY suppressed ({time_remaining:.0f}s < "
-                        f"{min_entry_window}s window) — exits only"
+                        f"{min_entry_window}s entry window) — exits only"
                     )
                     svc.strategy._reset_position_state()
 
@@ -368,6 +383,15 @@ class CycleRunner:
         svc = self.svc
         logger = svc.logger
         logger.info("Graceful shutdown initiated")
+
+        # Stop the retrainer daemon first so it doesn't write a new
+        # candidate while we're tearing down state.
+        retrainer = getattr(svc, "retrainer", None)
+        if retrainer is not None:
+            try:
+                retrainer.stop()
+            except Exception as exc:
+                logger.warning(f"Retrainer stop raised: {exc}")
 
         for token_id, order_id in list(svc.state.active_order_ids.items()):
             if order_id:
@@ -740,12 +764,44 @@ def execute_signals(
                 f"{sig.action} {sig.outcome} @ {sig.price:.4f} | {sig.reason[:60]}"
             )
             state.strategy_last_signal_ts = time.time()
+
+            # Apply fill first so realized_pnl_delta (return value of
+            # apply_fill_to_state) can be attached to the trade_log entry.
+            # On paper trades this is the FIFO/avg-cost realized delta; 0.0
+            # for opens and nonzero only when the fill closes inventory.
+            realized_pnl_delta = 0.0
+            if paper_trading and inventories is not None:
+                inv = inventories.get(token_id)
+                if inv is None:
+                    inv = InventoryState(token_id=token_id)
+                    inventories[token_id] = inv
+                realized_pnl_delta = apply_fill_to_state(
+                    inv, sig.action, sig.price, sig.size, state, risk_manager
+                )
+                sync_inventories_to_state(state, inventories)
+
+            now_ts = time.time()
+            slot_expiry_ts = SlotContext.slot_for(now_ts) + SLOT_INTERVAL_S
+            # Pick the edge for the side we actually took; state fields are
+            # Optional[float] and may be None before the first cycle populates them.
+            edge_for_side = (
+                state.strategy_edge_yes if sig.outcome == "YES" else state.strategy_edge_no
+            )
             state.trade_log.append({
-                "ts": time.time(),
+                "ts": now_ts,
                 "action": sig.action,
                 "outcome": sig.outcome,
                 "price": sig.price,
                 "size": sig.size,
+                # Enrichment for the redesigned dashboard Trades panel.
+                "strategy_name": state.strategy_name,
+                "slot_expiry_ts": slot_expiry_ts,
+                "seconds_to_expiry": max(0.0, slot_expiry_ts - now_ts),
+                "token_id": token_id,
+                "confidence": sig.confidence,
+                "reason": sig.reason,
+                "edge": edge_for_side,
+                "realized_pnl_delta": realized_pnl_delta,
             })
             state.trade_log = state.trade_log[-20:]
 
@@ -758,14 +814,6 @@ def execute_signals(
                 state.strategy_status = "POSITION_OPEN"
             elif sig.action == "SELL":
                 state.strategy_status = "EXITED"
-
-            if paper_trading and inventories is not None:
-                inv = inventories.get(token_id)
-                if inv is None:
-                    inv = InventoryState(token_id=token_id)
-                    inventories[token_id] = inv
-                apply_fill_to_state(inv, sig.action, sig.price, sig.size, state, risk_manager)
-                sync_inventories_to_state(state, inventories)
 
             if sig.action == "BUY":
                 logger.info(
@@ -937,7 +985,7 @@ def _log_decision(strategy, signals, market_data, cycle_type="main") -> None:
     edge_yes = getattr(s, "last_edge_yes", None)
     edge_no = getattr(s, "last_edge_no", None)
 
-    # Model features (only available for logreg_v3)
+    # Model features (only available for logreg strategy)
     model_svc = getattr(s, "model_service", None)
     features = {}
     if model_svc is not None:
@@ -970,10 +1018,17 @@ def _log_decision(strategy, signals, market_data, cycle_type="main") -> None:
             ob[f"{prefix}_ask"] = float(asks[0].price) if asks else None
             ob[f"{prefix}_bid_size"] = float(bids[0].size) if bids else None
             ob[f"{prefix}_ask_size"] = float(asks[0].size) if asks else None
-            bid_d3 = sum(float(e.size) for e in bids[:3]) if bids else 0
-            ask_d3 = sum(float(e.size) for e in asks[:3]) if asks else 0
+            bid_d3 = sum(float(e.size) for e in bids[:3]) if bids else 0.0
+            ask_d3 = sum(float(e.size) for e in asks[:3]) if asks else 0.0
             ob[f"{prefix}_bid_depth_3"] = bid_d3
             ob[f"{prefix}_ask_depth_3"] = ask_d3
+            # Intra-book depth imbalance features (per-side, namespaced to
+            # avoid collision with the trained model's cross-market
+            # `depth_ratio` in src/models/logreg_model.py).
+            _hi = max(bid_d3, ask_d3)
+            _lo = max(min(bid_d3, ask_d3), 1e-9)
+            ob[f"{prefix}_depth_ratio"] = _hi / _lo
+            ob[f"{prefix}_depth_skew"] = math.log((bid_d3 + 1e-9) / (ask_d3 + 1e-9))
 
     record = {
         "ts": now,

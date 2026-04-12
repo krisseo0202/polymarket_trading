@@ -18,7 +18,7 @@ from ..engine.slot_state import SLOT_INTERVAL_S, SlotStateManager
 from ..engine.state_store import BotState, StateStore
 from ..models import BTCSigmoidModel
 from ..models.logreg_model import LogRegModel
-from ..models.logreg_v3_model import LogRegV3Model
+from ..models.logreg_v4_model import LogRegV4Model
 from ..strategies.btc_updown import BTCUpDownStrategy
 from ..strategies.btc_updown_xgb import BTCUpDownXGBStrategy
 from ..strategies.btc_vol_reversion import BTCVolatilityReversionStrategy
@@ -32,7 +32,13 @@ from ..utils.config import load_config
 from ..utils.logger import setup_logger
 from ..utils.market_utils import get_server_time
 
-STRATEGIES = ["btc_updown", "btc_updown_xgb", "btc_vol_reversion", "coin_toss", "logreg_edge", "logreg_v3", "prob_edge", "td_rsi"]
+STRATEGIES = ["btc_updown", "btc_updown_xgb", "btc_vol_reversion", "coin_toss", "logreg_edge", "logreg", "prob_edge", "td_rsi"]
+
+# The `logreg` strategy loads the v4 model (18 features + isotonic calibration)
+# from models/logreg_v4 via LogRegV4Model. This is the single supported live
+# logreg configuration — v2 runs through the separate `logreg_edge` strategy,
+# and v5/v6 are trained but have no live feature builder.
+LOGREG_MODEL_DIR = "models/logreg_v4"
 
 
 @dataclass
@@ -60,6 +66,10 @@ class Services:
     trade_log_path: Optional[str] = None
     price_tick_path: Optional[str] = None
     bot_start_ts: float = 0.0
+    # Online retraining: daemon thread that periodically refits logreg_v4
+    # on a rolling window of live data. None if disabled or not applicable
+    # to the active strategy.
+    retrainer: Optional[Any] = None
 
 
 def init_services(args) -> Services:
@@ -181,6 +191,7 @@ def init_services(args) -> Services:
     )
 
     btc_feed: Optional[BtcPriceFeed] = None
+    _retrainer: Optional[Any] = None  # set only by the `logreg` branch when enabled
     if strategy_name == "coin_toss":
         strategy = CoinTossStrategy(config=strategy_cfg)
     elif strategy_name == "btc_updown_xgb":
@@ -206,22 +217,36 @@ def init_services(args) -> Services:
             model_service=logreg_model,
             logger=logger,
         )
-    elif strategy_name == "logreg_v3":
+    elif strategy_name == "logreg":
         btc_feed = BtcPriceFeed(
             symbol=str(strategy_cfg.get("btc_symbol", "BTC-USD")),
             exchange=str(strategy_cfg.get("btc_exchange", "coinbase")),
             logger=logger,
         ).start()
-        model_dir = str(strategy_cfg.get("model_dir", "models/logreg_v3"))
-        v3_model = LogRegV3Model.load(model_dir, logger=logger)
-        if not v3_model.ready:
-            logger.warning("LogReg v3 model not found at %s — strategy will skip all trades until a model is trained", model_dir)
+        model_dir = str(strategy_cfg.get("model_dir", LOGREG_MODEL_DIR))
+        v4_model = LogRegV4Model.load(model_dir, logger=logger)
+        if not v4_model.ready:
+            logger.warning("LogReg v4 model not found at %s — strategy will skip all trades until a model is trained", model_dir)
+        else:
+            logger.info("LogReg v4 loaded from %s", model_dir)
         strategy = LogRegEdgeStrategy(
             config=strategy_cfg,
             btc_feed=btc_feed,
-            model_service=v3_model,
+            model_service=v4_model,
             logger=logger,
         )
+        # Optional: online retrainer. Wired here (not in Services) because
+        # it's strategy-specific — only the logreg branch has CSVs shaped
+        # the way the retrainer expects.
+        from ..engine.model_retrainer import Retrainer, RetrainConfig
+        retrain_cfg = RetrainConfig.from_dict(strategy_cfg.get("retrain") or {})
+        _retrainer = Retrainer(
+            cfg=retrain_cfg,
+            prod_model_dir=model_dir,
+            logger=logger,
+        ) if retrain_cfg.enabled else None
+        if _retrainer is not None:
+            _retrainer.start()
     elif strategy_name == "prob_edge":
         btc_feed = BtcPriceFeed(
             symbol=str(strategy_cfg.get("btc_symbol", "BTC-USD")),
@@ -299,6 +324,7 @@ def init_services(args) -> Services:
         trade_log_path=trade_log_path,
         price_tick_path=price_tick_path,
         bot_start_ts=time.time(),
+        retrainer=_retrainer,
     )
 
 

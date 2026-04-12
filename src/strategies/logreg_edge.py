@@ -18,9 +18,10 @@ Position sizing: fractional Kelly, capped at position_size_usdc.
 
 from __future__ import annotations
 
+import collections
 import logging
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 from .base import Signal, Strategy
 from ..api.types import OrderBook, Position
@@ -55,9 +56,32 @@ class LogRegEdgeStrategy(Strategy):
         self.max_hold_seconds: int = int(config.get("max_hold_seconds", 240))
         self.profit_target_pct: float = float(config.get("profit_target_pct", 999.0))
 
-        # Sizing
+        # Sizing: fractional Kelly clamped to a [min, max] USDC band.
+        #   - min_position_size_usdc: floor applied only when Kelly > 0, so
+        #     trades are operationally meaningful on small balances.
+        #   - max_position_size_usdc: hard ceiling on per-trade notional.
+        #     The strategy enforces this explicitly (do NOT rely on
+        #     RiskManager alone — its size check is share-denominated and
+        #     the units are load-dependent; see tasks/todo.md).
+        # Legacy `position_size_usdc` is read as a fallback for max so
+        # older configs keep working.
         self.kelly_fraction: float = float(config.get("kelly_fraction", 0.15))
-        self.position_size_usdc: float = float(config.get("position_size_usdc", 30.0))
+        _legacy_cap = float(config.get("position_size_usdc", 30.0))
+        self.max_position_size_usdc: float = float(
+            config.get("max_position_size_usdc", _legacy_cap)
+        )
+        self.min_position_size_usdc: float = float(
+            config.get("min_position_size_usdc", 0.0)
+        )
+        # Kept as an alias (= max) so dashboards / telemetry that still
+        # read the single `position_size_usdc` key show something useful.
+        self.position_size_usdc: float = self.max_position_size_usdc
+
+        # Rolling YES orderbook history for v5 microstructure features:
+        # (wall_ts, bid_depth_top3, ask_depth_top3). 30s is enough for the
+        # 10s imbalance window + 5s ratio-change lag with slack.
+        self._ob_history: Deque[Tuple[float, float, float]] = collections.deque()
+        self._ob_history_max_age: float = 30.0
 
         # Observable state
         self.last_prob_yes: Optional[float] = None
@@ -99,6 +123,21 @@ class LogRegEdgeStrategy(Strategy):
                 mid = get_mid_price(book)
                 if mid:
                     self.record_price(tid, mid, now_mono)
+
+        # Record YES orderbook depth history for v5 microstructure features.
+        # NOTE: this runs on every cycle, including while we're holding an
+        # open position (we short-circuit with "in_position" below). That's
+        # intentional — the 30s rolling window needs to be warm when the
+        # next slot opens and we start evaluating entries. Do NOT move this
+        # under the "not in position" branch.
+        yes_book_for_ob = order_books.get(self._yes_token_id)
+        if yes_book_for_ob and yes_book_for_ob.bids and yes_book_for_ob.asks:
+            bid_d = sum(float(e.size) for e in yes_book_for_ob.bids[:3])
+            ask_d = sum(float(e.size) for e in yes_book_for_ob.asks[:3])
+            self._ob_history.append((now_wall, bid_d, ask_d))
+            cutoff = now_wall - self._ob_history_max_age
+            while self._ob_history and self._ob_history[0][0] < cutoff:
+                self._ob_history.popleft()
 
         self._auto_recover_position(by_token, now_mono)
 
@@ -276,6 +315,7 @@ class LogRegEdgeStrategy(Strategy):
             "yes_book": order_books.get(self._yes_token_id),
             "no_book": order_books.get(self._no_token_id),
             "yes_history": yes_history,
+            "yes_ob_history": list(self._ob_history),
             "question": market_data.get("question", ""),
             "strike_price": market_data.get("strike_price"),
             "slot_expiry_ts": market_data.get("slot_expiry_ts"),
@@ -301,19 +341,72 @@ class LogRegEdgeStrategy(Strategy):
         return prediction
 
     # ------------------------------------------------------------------
+    # Hot-reload for online retraining
+    # ------------------------------------------------------------------
+
+    def reload_model(self, new_dir: str) -> bool:
+        """Swap self.model_service for a freshly-loaded model from disk.
+
+        Called by CycleRunner between cycles when Retrainer has a new
+        candidate ready AND the strategy is flat. Only swaps if the new
+        model loads cleanly (ready=True); on failure the old model
+        stays in place and we log the skip.
+        """
+        # Import here to avoid a cycle on module load (LogRegV4Model
+        # transitively imports xgb_model → PredictionResult).
+        from ..models.logreg_v4_model import LogRegV4Model
+        try:
+            new_model = LogRegV4Model.load(new_dir, logger=self.logger)
+        except Exception as exc:
+            self.logger.warning("reload_model: load failed for %s: %s", new_dir, exc)
+            return False
+        if not getattr(new_model, "ready", False):
+            self.logger.warning("reload_model: new model at %s not ready — keeping old", new_dir)
+            return False
+        old_version = getattr(self.model_service, "model_version", "unknown")
+        self.model_service = new_model
+        self.logger.info(
+            "logreg model hot-reloaded: %s → %s (from %s)",
+            old_version, new_model.model_version, new_dir,
+        )
+        return True
+
+    # ------------------------------------------------------------------
     # Kelly sizing (same formula as ProbEdgeStrategy)
     # ------------------------------------------------------------------
 
     def _kelly_size(self, prob: float, price: float, balance: float) -> float:
-        """Fractional Kelly notional for a binary contract.
+        """Fractional Kelly notional for a binary contract, clamped to the
+        [min_position_size_usdc, max_position_size_usdc] band.
 
-        f_kelly = (p - x) / (1 - x)
-        f_used  = kelly_fraction * f_kelly
-        usdc    = f_used * balance, capped at position_size_usdc
+            f_kelly = (p - x) / (1 - x)
+            f_used  = kelly_fraction * f_kelly
+            usdc    = f_used * balance
+            return  = clip(usdc, min, max)   if usdc > 0
+                      0                       otherwise
+
+        The floor is applied only when Kelly is positive — a zero-Kelly
+        signal (no edge at the ask) returns 0 and no trade fires. By the
+        time this runs, the entry gate (delta + min_confidence) has
+        already confirmed meaningful edge, so floor-enforcement just
+        bumps operationally-too-small raw Kelly outputs up to a placeable
+        size. The max ceiling is enforced here (not trusted to the
+        RiskManager) because RiskManager's size check is share-
+        denominated and the units are load-dependent — see
+        tasks/todo.md for the refactor.
         """
         if price <= 0 or price >= 1 or prob <= price:
             return 0.0
+        if balance <= 0:
+            # Unknown/zero balance: fall back to the floor (or the legacy
+            # single-number cap for configs that don't set a floor).
+            return self.min_position_size_usdc or self.max_position_size_usdc
         f_full = (prob - price) / (1.0 - price)
         f_used = max(0.0, self.kelly_fraction * f_full)
-        usdc = f_used * balance if balance > 0 else self.position_size_usdc
-        return min(usdc, self.position_size_usdc)
+        usdc = f_used * balance
+        if usdc <= 0:
+            return 0.0
+        usdc = min(usdc, self.max_position_size_usdc)
+        if self.min_position_size_usdc > 0:
+            usdc = max(usdc, self.min_position_size_usdc)
+        return usdc

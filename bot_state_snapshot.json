@@ -1,0 +1,136 @@
+{
+  "market_id": "1943064",
+  "question": "Bitcoin Up or Down - April 11, 9:50PM-9:55PM ET",
+  "yes_token_id": "55634765459660228738076402534070205897933584722987606757670186887444267429345",
+  "no_token_id": "69137328625352623562476359495934590795738998081127922688474340735778810345221",
+  "slot_ts": 1775958600,
+  "slot_end_ts": 1775958900,
+  "tte_seconds": 296.63873076438904,
+  "price_to_beat": 71434.32500000001,
+  "btc_now": 71350.22,
+  "yes_bid": 0.33,
+  "yes_ask": 0.34,
+  "yes_mid": 0.335,
+  "no_bid": 0.66,
+  "no_ask": 0.67,
+  "no_mid": 0.665,
+  "yes_bids": [
+    {
+      "price": 0.33,
+      "size": 509.73
+    },
+    {
+      "price": 0.32,
+      "size": 108.55
+    },
+    {
+      "price": 0.31,
+      "size": 530.0
+    },
+    {
+      "price": 0.3,
+      "size": 232.0
+    },
+    {
+      "price": 0.29,
+      "size": 122.0
+    }
+  ],
+  "yes_asks": [
+    {
+      "price": 0.34,
+      "size": 173.4
+    },
+    {
+      "price": 0.35,
+      "size": 217.0
+    },
+    {
+      "price": 0.36,
+      "size": 40.0
+    },
+    {
+      "price": 0.37,
+      "size": 204.15
+    },
+    {
+      "price": 0.38,
+      "size": 83.0
+    }
+  ],
+  "no_bids": [
+    {
+      "price": 0.66,
+      "size": 168.4
+    },
+    {
+      "price": 0.65,
+      "size": 217.0
+    },
+    {
+      "price": 0.64,
+      "size": 40.0
+    },
+    {
+      "price": 0.63,
+      "size": 204.15
+    },
+    {
+      "price": 0.62,
+      "size": 83.0
+    }
+  ],
+  "no_asks": [
+    {
+      "price": 0.67,
+      "size": 522.18
+    },
+    {
+      "price": 0.68,
+      "size": 108.55
+    },
+    {
+      "price": 0.69,
+      "size": 530.0
+    },
+    {
+      "price": 0.7,
+      "size": 237.0
+    },
+    {
+      "price": 0.71,
+      "size": 122.0
+    }
+  ],
+  "positions": {},
+  "active_orders": [],
+  "bot_status": "EVALUATING",
+  "held_side": "FLAT",
+  "daily_realized_pnl": -19.348699999999997,
+  "slot_realized_pnl": 29.840500000000002,
+  "unrealized_pnl": null,
+  "strategy_name": "logreg_edge",
+  "strategy_status": "WATCHING",
+  "strategy_prob_yes": 0.03125,
+  "strategy_prob_no": null,
+  "strategy_edge_yes": 0.02625,
+  "strategy_edge_no": -0.02625,
+  "strategy_net_edge_yes": 0.02625,
+  "strategy_net_edge_no": -0.02625,
+  "strategy_expected_fill_yes": null,
+  "strategy_expected_fill_no": null,
+  "strategy_required_edge": null,
+  "strategy_tte_seconds": 295.8041021823883,
+  "strategy_distance_to_break_pct": null,
+  "strategy_distance_to_strike_bps": null,
+  "strategy_model_version": "logreg_v4",
+  "strategy_feature_status": "ready",
+  "strategy_score_breakdown": null,
+  "strategy_skip_reason": "tte: 296s (range 10-295)",
+  "cycle_count": 10,
+  "paper_trading": true,
+  "updated_at": 1775958604.2054012,
+  "strike": 71434.32500000001,
+  "start_ts": 1775958600,
+  "end_ts": 1775958900
+}

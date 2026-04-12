@@ -1,0 +1,54 @@
+{
+  "rationale": "The Pareto front strongly favors row_interval=20 and low C (0.001-0.03), suggesting heavy regularization is key. High equity trials use higher edge_threshold (0.05-0.065) with higher kelly_mult (0.35-0.38) and max_frac near 0.21-0.24. depth_skew and depth_ratio are aliases (collinear), so drop depth_skew to reduce redundancy. Also drop ret_60s (collinear with ret_30s) and range_30s (collinear with rolling_std_30s) to improve calibration. Tighten C range around the Pareto cluster and focus row_interval on 20.",
+  "feature_subset": [
+    "ret_30s",
+    "depth_ratio",
+    "imbalance",
+    "spread",
+    "wall_flag",
+    "depth_change",
+    "mid_return_5s",
+    "acceleration",
+    "rolling_std_30s",
+    "time_to_expiry",
+    "vol_ratio_15_60",
+    "cvd_60s"
+  ],
+  "hparam_ranges": {
+    "C": {
+      "type": "log_uniform",
+      "low": 0.001,
+      "high": 0.1
+    },
+    "row_interval": {
+      "type": "categorical",
+      "choices": [
+        15,
+        20,
+        25
+      ]
+    },
+    "edge_threshold": {
+      "type": "uniform",
+      "low": 0.01,
+      "high": 0.08
+    },
+    "kelly_mult": {
+      "type": "uniform",
+      "low": 0.15,
+      "high": 0.45
+    },
+    "max_frac": {
+      "type": "uniform",
+      "low": 0.1,
+      "high": 0.25
+    }
+  },
+  "seed_trial": {
+    "C": 0.012,
+    "row_interval": 20,
+    "edge_threshold": 0.055,
+    "kelly_mult": 0.36,
+    "max_frac": 0.21
+  }
+}
