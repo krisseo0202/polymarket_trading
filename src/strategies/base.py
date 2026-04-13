@@ -124,6 +124,30 @@ class Strategy(ABC):
         while buf and buf[0][0] < cutoff:
             buf.popleft()
 
+    def get_price_ago(self, token_id: str, seconds_ago: float,
+                      now: Optional[float] = None) -> Optional[float]:
+        """Look up the closest mid-price observation ~seconds_ago.
+
+        Returns None if there's no history older than (now - seconds_ago * 0.5).
+        Uses a binary-ish scan from the left of the deque (oldest first).
+        """
+        buf = self._price_history.get(token_id)
+        if not buf:
+            return None
+        ref = (now if now is not None else time.monotonic()) - seconds_ago
+        best_ts, best_px = None, None
+        for ts, px in buf:
+            if ts <= ref:
+                best_ts, best_px = ts, px
+            else:
+                break  # deque is sorted ascending
+        if best_px is None:
+            return None
+        # Reject if the closest sample is more than half the lookback away
+        if best_ts is not None and abs(best_ts - ref) > seconds_ago * 0.5:
+            return None
+        return best_px
+
     def seed_price_history(self, token_id: str, history: List[Tuple[float, float]]) -> None:
         """Seed price history from external data (e.g. REST API).
 

@@ -70,7 +70,8 @@
       "Bash(/mnt/c/Users/seohj/Desktop/stuffs/side_projects/polymarket/.venv/bin/pip install:*)",
       "Bash(/mnt/c/Users/seohj/Desktop/stuffs/side_projects/polymarket/.venv/bin/python -c \"import optuna, anthropic; print\\('optuna', optuna.__version__, 'anthropic', anthropic.__version__\\)\")",
       "Bash(.venv/bin/python:*)",
-      "Bash(env)"
+      "Bash(env)",
+      "Bash(awk:*)"
     ]
   }
 }

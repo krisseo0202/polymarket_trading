@@ -321,16 +321,36 @@ def apply_slot_settlement(
             continue
         price = settlement[side]
         size = inv.position
+        entry_cost = inv.avg_cost
         realized = apply_fill_to_state(inv, "SELL", price, size, state, risk_manager)
         if realized > 0:
             state.session_wins += 1
         elif realized < 0:
             state.session_losses += 1
+
+        # Record settlement in the trade log so the dashboard and post-hoc
+        # analysis can show the full lifecycle: BUY entry → settlement result.
+        # Before this fix, only BUY entries were logged and settlements were
+        # invisible (realized_pnl_delta always showed 0.0000).
+        state.trade_log.append({
+            "ts": time.time(),
+            "action": "SETTLE",
+            "outcome": side,
+            "price": price,
+            "size": size,
+            "entry_price": entry_cost,
+            "resolved_outcome": outcome,
+            "realized_pnl_delta": realized,
+            "token_id": token_id,
+            "strategy_name": state.strategy_name,
+        })
+        state.trade_log = state.trade_log[-20:]
+
         label = "paper" if paper_trading else "live"
         logger.info(
             f"[{label}] {label_prefix}: {side} {token_id[:8]} "
-            f"{size:.2f}sh @ {price:.2f} → realized {realized:+.4f} "
-            f"(outcome: {outcome})"
+            f"{size:.2f}sh @ {price:.2f} (entry {entry_cost:.4f}) "
+            f"→ realized {realized:+.4f} (outcome: {outcome})"
         )
         settled += 1
     return settled
