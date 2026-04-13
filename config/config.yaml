@@ -191,7 +191,8 @@ risk:
   max_position_pct: 0.05          # 5% of balance per position
   max_position_size: 200          # hard cap on shares per position
   max_total_exposure: 1.0         # total open notional as fraction of balance
-  max_session_loss_usdc: 50      # absolute session loss cap; bot shuts down when reached
+  max_daily_loss: 1.0             # pct-based daily loss (1.0 = disabled; use max_session_loss_usdc instead)
+  max_session_loss_usdc: 50       # absolute session loss cap in USDC — the real stop-loss
 
 chainlink_feed:
   enabled: true

@@ -94,6 +94,11 @@ class LogRegEdgeStrategy(Strategy):
         self.last_tte_seconds: Optional[float] = None
         self.last_feature_status: str = ""
         self.last_model_version: str = ""
+        # Polymarket-derived features (computed per-cycle, logged to JSONL)
+        self.last_microprice_yes: Optional[float] = None
+        self.last_micro_delta_yes: Optional[float] = None
+        self.last_f_ret_30s: Optional[float] = None
+        self.last_f_delta: Optional[float] = None
 
     # ------------------------------------------------------------------
     # Core interface
@@ -146,7 +151,7 @@ class LogRegEdgeStrategy(Strategy):
             self.last_skip_reason = "in_position"
             return []
 
-        return self._check_entry(order_books, by_token, market_data, now_wall, balance)
+        return self._check_entry(order_books, by_token, market_data, now_wall, now_mono, balance)
 
     def should_enter(self, signal: Signal) -> bool:
         return self.validate_signal(signal) and signal.confidence >= self.min_confidence
@@ -161,6 +166,7 @@ class LogRegEdgeStrategy(Strategy):
         by_token: Dict[str, Position],
         market_data: Dict[str, Any],
         now_wall: float,
+        now_mono: float,
         balance: float,
     ) -> List[Signal]:
         # Time-to-expiry gate
@@ -192,6 +198,46 @@ class LogRegEdgeStrategy(Strategy):
 
         self.last_q_t = q_t
         self.last_c_t = c_t
+
+        # ── Polymarket-derived features ──────────────────────────────────
+        # Computed every entry-check cycle and stored as observables so
+        # _log_decision can pick them up for the JSONL decision log.
+
+        # Microprice: size-weighted fair value. When the bid side is thick
+        # relative to ask, microprice pulls toward the ask (and vice versa),
+        # signaling short-term directional pressure.
+        yes_bid_size = float(yes_book.bids[0].size) if yes_book.bids else 0.0
+        yes_ask_size = float(yes_book.asks[0].size) if yes_book.asks else 0.0
+        total_size = yes_bid_size + yes_ask_size
+        if total_size > 0:
+            microprice_yes = (yes_bid * yes_ask_size + yes_ask * yes_bid_size) / total_size
+        else:
+            microprice_yes = q_t  # degenerate: fall back to mid
+        self.last_microprice_yes = microprice_yes
+        self.last_micro_delta_yes = microprice_yes - q_t
+
+        # f_ret_30s: 30-second return on YES market mid.
+        # Uses the strategy's rolling price history (base.py record_price).
+        # Returns None when < 15s of history exists (avoids leaking stale data).
+        q_t_30s_ago = self.get_price_ago(self._yes_token_id, 30.0, now=now_mono)
+        if q_t_30s_ago is not None and q_t_30s_ago > 0:
+            self.last_f_ret_30s = (q_t - q_t_30s_ago) / q_t_30s_ago
+        else:
+            self.last_f_ret_30s = None
+
+        # f_delta: (btc_spot - strike) / strike. Canonical BTC delta used
+        # by the v2 model (logreg_model.py:116). Recomputed here from the
+        # live btc_feed so it's always fresh and available for logging even
+        # when the active model doesn't use it as a feature.
+        strike_price = market_data.get("strike_price")
+        btc_prices = []
+        if self.btc_feed is not None:
+            btc_prices = getattr(self.btc_feed, "get_recent_prices", lambda w=10: [])(10)
+        if btc_prices and strike_price and float(strike_price) > 0:
+            btc_mid = float(btc_prices[-1][1])
+            self.last_f_delta = (btc_mid - float(strike_price)) / float(strike_price)
+        else:
+            self.last_f_delta = None
 
         # Predict
         prediction = self._predict(order_books, market_data, now_wall)

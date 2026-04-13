@@ -1073,11 +1073,15 @@ def _log_decision(strategy, signals, market_data, cycle_type="main") -> None:
         "c_t": c_t,
         "edge_yes": edge_yes,
         "edge_no": edge_no,
+        # Polymarket-derived features (computed in logreg_edge._check_entry)
+        "microprice_yes": getattr(s, "last_microprice_yes", None),
+        "micro_delta_yes": getattr(s, "last_micro_delta_yes", None),
+        "f_ret_30s": getattr(s, "last_f_ret_30s", None),
+        "f_delta": getattr(s, "last_f_delta", None),
         # Decision
         "skip_reason": skip_reason,
         "action": action,
         # BTC
-        "btc_mid": features.get("delta", None),  # delta = (spot-strike)/strike
         "strike": market_data.get("strike_price"),
         # Features (flat dict for easy CSV conversion)
         **{f"f_{k}": v for k, v in features.items()},

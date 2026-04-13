@@ -178,6 +178,7 @@ def init_services(args) -> Services:
         paper_balance=paper_balance,
     )
 
+    session_loss_cap: float = raw_yaml.get("risk", {}).get("max_session_loss_usdc", float("inf"))
     risk_limits = RiskLimits(
         max_position_size=cfg.risk_limits.get("max_position_size", 200.0),
         max_position_pct=cfg.risk_limits.get("max_position_pct", 0.05),
@@ -186,9 +187,9 @@ def init_services(args) -> Services:
         max_exposure_per_market=cfg.risk_limits.get("max_exposure_per_market", 0.10),
         circuit_breaker_enabled=cfg.risk_limits.get("circuit_breaker_enabled", True),
         circuit_breaker_threshold=cfg.risk_limits.get("circuit_breaker_threshold", 0.20),
+        max_session_loss_usdc=session_loss_cap,
     )
     risk_manager = RiskManager(limits=risk_limits)
-    session_loss_cap: float = raw_yaml.get("risk", {}).get("max_session_loss_usdc", float("inf"))
 
     execution_tracker = ExecutionTracker(
         orders_sync_interval_s=5.0,

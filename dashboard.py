@@ -1331,11 +1331,23 @@ def _build_trade_log_panel(
         size    = float(entry.get("size", 0.0) or 0.0)
         notional = price * size
 
-        status_label, status_style = _trade_status(entry, inventories)
-        is_open = status_label == "OPEN"
+        # Settlement rows use a distinct style: show entry→settle with
+        # the resolution outcome and realized PnL highlighted.
+        is_settle = action == "SETTLE"
 
-        side_style = "bold green" if action == "BUY" else "bold red"
-        out_style  = "green" if outcome == "YES" else "red"
+        if is_settle:
+            resolved = entry.get("resolved_outcome", "")
+            entry_px = float(entry.get("entry_price", 0.0) or 0.0)
+            status_label = f"{'WIN' if entry.get('realized_pnl_delta', 0) >= 0 else 'LOSS'} ({resolved})"
+            status_style = "bold green" if entry.get("realized_pnl_delta", 0) >= 0 else "bold red"
+            is_open = False
+            side_style = "bold yellow"
+            out_style = "green" if outcome == "YES" else "red"
+        else:
+            status_label, status_style = _trade_status(entry, inventories)
+            is_open = status_label == "OPEN"
+            side_style = "bold green" if action == "BUY" else "bold red"
+            out_style  = "green" if outcome == "YES" else "red"
 
         edge_val = entry.get("edge")
         edge_str = f"{edge_val:+.3f}" if isinstance(edge_val, (int, float)) else "—"
@@ -1346,6 +1358,13 @@ def _build_trade_log_panel(
 
         ts_val = entry.get("ts") or time.time()
         time_str = datetime.fromtimestamp(float(ts_val)).strftime("%H:%M:%S")
+
+        # For SETTLE rows, show entry_price→settle_price in the PRICE col
+        if is_settle:
+            entry_px = float(entry.get("entry_price", 0.0) or 0.0)
+            price_str = f"{entry_px:.2f}→{price:.2f}"
+        else:
+            price_str = f"${price:.2f}"
 
         row = [
             Text("▶" if is_open else " ", style="bold cyan" if is_open else "dim"),
@@ -1358,7 +1377,7 @@ def _build_trade_log_panel(
         row += [
             Text(action, style=side_style),
             Text(outcome, style=out_style),
-            Text(f"${price:.2f}", style="white"),
+            Text(price_str, style="white"),
             Text(f"{size:.1f}", style="white"),
         ]
         if not narrow:

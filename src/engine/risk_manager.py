@@ -20,6 +20,11 @@ class RiskLimits:
     stop_loss_pct: float = 0.1  # 10% stop loss
     circuit_breaker_enabled: bool = True
     circuit_breaker_threshold: float = 0.15  # 15% drawdown triggers circuit breaker
+    # Absolute session loss cap in USDC. When cumulative realized PnL
+    # (tracked via record_trade) drops below -max_session_loss_usdc,
+    # both validate_signal and calculate_position_size reject all new
+    # entries. This is the "stop trading" hard floor.
+    max_session_loss_usdc: float = float("inf")
 
 
 class RiskManager:
@@ -111,7 +116,13 @@ class RiskManager:
         if self.circuit_breaker_active:
             return False, "Circuit breaker is active"
 
-        # Check daily loss limit
+        # Check absolute session loss cap (USDC). This fires before the
+        # percentage-based daily loss check so a $50 cap means $50, not
+        # "10% of whatever the balance is right now".
+        if self.daily_pnl <= -self.limits.max_session_loss_usdc:
+            return False, f"Session loss cap reached: PnL ${self.daily_pnl:.2f} < -${self.limits.max_session_loss_usdc:.2f}"
+
+        # Check daily loss limit (percentage of balance)
         if self.daily_pnl < -abs(self.limits.max_daily_loss * balance):
             return False, f"Daily loss limit reached: {self.daily_pnl:.2f}"
 
@@ -171,8 +182,17 @@ class RiskManager:
             current_price: Current market price
 
         Returns:
-            Safe position size (shares)
+            Safe position size (shares), or 0 if risk limits prohibit entry.
         """
+        # Session loss cap: stop sizing new entries once cumulative PnL
+        # exceeds the absolute USDC loss limit.
+        if self.daily_pnl <= -self.limits.max_session_loss_usdc:
+            return 0.0
+
+        # Percentage-based daily loss check
+        if balance > 0 and self.daily_pnl < -abs(self.limits.max_daily_loss * balance):
+            return 0.0
+
         # Start with signal size
         size = signal.size
 
