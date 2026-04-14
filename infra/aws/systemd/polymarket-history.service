@@ -1,0 +1,17 @@
+[Unit]
+Description=Polymarket History Collector (batch)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=polymarket
+Group=polymarket
+WorkingDirectory=/opt/polymarket/app
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/polymarket/venv/bin/python scripts/collect_history.py \
+    --hours 2 \
+    --output /opt/polymarket/data/btc_updown_5m.csv
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=history-collector

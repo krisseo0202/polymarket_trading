@@ -1,0 +1,25 @@
+[Unit]
+Description=Polymarket BTC 1s OHLCV Recorder
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/opt/polymarket/app/.env
+
+[Service]
+Type=simple
+User=polymarket
+Group=polymarket
+WorkingDirectory=/opt/polymarket/app
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/polymarket/venv/bin/python scripts/record_btc_1s.py \
+    --output /opt/polymarket/data/btc_live_1s.csv \
+    --exchange coinbase
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=300
+StartLimitBurst=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=btc-recorder
+
+[Install]
+WantedBy=multi-user.target

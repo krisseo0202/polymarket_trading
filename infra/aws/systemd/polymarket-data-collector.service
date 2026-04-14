@@ -1,0 +1,28 @@
+[Unit]
+Description=Polymarket Unified Data Collector (BTC + Snapshots + History + Slot Map)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/opt/polymarket/app/.env
+
+[Service]
+Type=simple
+User=polymarket
+Group=polymarket
+WorkingDirectory=/opt/polymarket/app
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/polymarket/venv/bin/python scripts/data_collector.py \
+    --snap-output /opt/polymarket/data/snapshots.jsonl \
+    --history-output /opt/polymarket/data/btc_updown_5m.csv \
+    --history-hours 2 \
+    --history-interval 3600 \
+    --map-interval 600
+Restart=always
+RestartSec=10
+StartLimitIntervalSec=300
+StartLimitBurst=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=polymarket-collector
+
+[Install]
+WantedBy=multi-user.target

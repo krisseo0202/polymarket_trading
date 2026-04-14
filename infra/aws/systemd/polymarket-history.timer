@@ -1,0 +1,10 @@
+[Unit]
+Description=Run history collector every hour
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=60
+
+[Install]
+WantedBy=timers.target
