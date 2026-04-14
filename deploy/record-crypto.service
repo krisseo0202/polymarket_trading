@@ -1,0 +1,35 @@
+[Unit]
+Description=Crypto 1s OHLCV bar recorder (ETH + SOL)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/polymarket
+ExecStart=/home/ubuntu/polymarket/.venv/bin/python scripts/record_crypto_1s.py --assets ETH SOL
+
+# Postgres connection — override in /etc/systemd/system/record-crypto.service.d/override.conf
+# or set directly here.
+Environment=DB_HOST=localhost
+Environment=DB_PORT=5432
+Environment=DB_NAME=polymarket
+Environment=DB_USER=poly
+Environment=DB_PASSWORD=poly_dev_password
+
+# Restart on crash, back off to avoid hammering the exchange WS
+Restart=always
+RestartSec=5
+
+# Logging to journald (view with: journalctl -u record-crypto -f)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=record-crypto
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/home/ubuntu/polymarket/data
+
+[Install]
+WantedBy=multi-user.target
