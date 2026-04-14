@@ -1,0 +1,25 @@
+[Unit]
+Description=Polymarket Orderbook Snapshot Collector
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/opt/polymarket/app/.env
+
+[Service]
+Type=simple
+User=polymarket
+Group=polymarket
+WorkingDirectory=/opt/polymarket/app
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/polymarket/venv/bin/python scripts/collect_snapshots.py \
+    --interval 5 \
+    --output /opt/polymarket/data/snapshots.jsonl
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=300
+StartLimitBurst=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=snapshots-collector
+
+[Install]
+WantedBy=multi-user.target
