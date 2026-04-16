@@ -3,24 +3,26 @@
 Unified data collector: runs all three collection pipelines in parallel,
 partitions output by hour, and maintains a slot-key mapping.
 
+Supports multi-asset collection (BTC, ETH, SOL, DOGE, XRP).
+
 Output layout:
-    data/YYYY-MM-DD/HH/btc_1s.csv
-    data/YYYY-MM-DD/HH/snapshots.jsonl
-    data/YYYY-MM-DD/HH/history.csv
+    data/YYYY-MM-DD/HH/{asset}_1s.csv
+    data/YYYY-MM-DD/HH/snapshots_{asset}.jsonl
+    data/YYYY-MM-DD/HH/history_{asset}.csv
     data/YYYY-MM-DD/HH/slot_key_map.csv
 
-Processes:
-  1. record_btc_1s.py      — 1-second BTC OHLCV bars (Coinbase WebSocket)
-  2. collect_snapshots.py   — orderbook snapshots + Chainlink prices every 5s
-  3. collect_history.py     — closed 5-min market outcomes (hourly batch)
+Processes per asset:
+  1. record_crypto_1s.py   — 1-second OHLCV bars (Coinbase WebSocket)
+  2. collect_snapshots.py  — orderbook snapshots + Chainlink prices every 5s
+  3. collect_history.py    — closed 5-min market outcomes (hourly batch)
 
 At each hour boundary the daemons are gracefully restarted with new output
 paths so each hour's data lands in its own directory.
 
 Usage:
     python scripts/data_collector.py
-    python scripts/data_collector.py --no-history
-    python scripts/data_collector.py --history-hours 4
+    python scripts/data_collector.py --assets BTC ETH SOL
+    python scripts/data_collector.py --assets BTC ETH SOL DOGE XRP --no-history
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ import csv
 import glob
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -41,11 +44,12 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # ANSI colors for log prefix
 _COLORS = {
-    "btc":       "\033[93m",  # yellow
+    "price":     "\033[93m",  # yellow
     "snapshots": "\033[92m",  # green
     "history":   "\033[96m",  # cyan
     "mapper":    "\033[95m",  # magenta
     "rotate":    "\033[91m",  # red
+    "s3":        "\033[94m",  # blue
 }
 _RESET = "\033[0m"
 
@@ -68,17 +72,21 @@ def _current_hour_tag() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d/%H")
 
 
-def _hourly_paths(base: str = "data") -> dict:
+def _hourly_paths(base: str = "data", assets: Optional[List[str]] = None) -> dict:
     """Return all output paths for the current hour partition."""
     hour_dir = _current_hour_dir(base)
     os.makedirs(hour_dir, exist_ok=True)
-    return {
-        "dir":       hour_dir,
-        "btc":       os.path.join(hour_dir, "btc_1s.csv"),
-        "snapshots": os.path.join(hour_dir, "snapshots.jsonl"),
-        "history":   os.path.join(hour_dir, "history.csv"),
-        "map":       os.path.join(hour_dir, "slot_key_map.csv"),
+    assets = assets or ["BTC"]
+    paths: dict = {
+        "dir": hour_dir,
+        "map": os.path.join(hour_dir, "slot_key_map.csv"),
     }
+    for asset in assets:
+        a = asset.lower()
+        paths[f"price_{asset}"] = os.path.join(hour_dir, f"{a}_1s.csv")
+        paths[f"snapshots_{asset}"] = os.path.join(hour_dir, f"snapshots_{a}.jsonl")
+        paths[f"history_{asset}"] = os.path.join(hour_dir, f"history_{a}.csv")
+    return paths
 
 
 # ---------------------------------------------------------------------------
@@ -183,48 +191,90 @@ def build_slot_key_map(
 
 
 # ---------------------------------------------------------------------------
+# S3 sync
+# ---------------------------------------------------------------------------
+
+_S3_BUCKET = "k-polymarket-data"
+
+
+def _s3_sync_available() -> bool:
+    """Check if AWS CLI is installed and configured."""
+    return shutil.which("aws") is not None
+
+
+def _sync_to_s3(local_dir: str, s3_bucket: str = _S3_BUCKET) -> bool:
+    """Sync a local hour directory to S3. Returns True on success."""
+    # local_dir is like "data/2026-04-15/03"
+    # Upload to s3://bucket/data/2026-04-15/03/
+    s3_path = f"s3://{s3_bucket}/{local_dir}/"
+    cmd = ["aws", "s3", "sync", local_dir, s3_path, "--region", "us-west-2"]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if result.returncode == 0:
+            print(f"{_prefix('s3')} synced {local_dir} -> {s3_path}")
+            return True
+        else:
+            print(f"{_prefix('s3')} FAILED: {result.stderr.strip()}")
+            return False
+    except subprocess.TimeoutExpired:
+        print(f"{_prefix('s3')} timeout syncing {local_dir}")
+        return False
+    except FileNotFoundError:
+        print(f"{_prefix('s3')} aws CLI not found — skipping sync")
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Process management
 # ---------------------------------------------------------------------------
 
 def _launch_daemons(
-    btc_output: str,
-    btc_exchange: str,
-    snap_output: str,
+    paths: dict,
+    assets: List[str],
+    exchange: str,
     snap_interval: int,
 ) -> Dict[str, subprocess.Popen]:
-    """Launch the two long-running collector daemons."""
+    """Launch per-asset price recorder and snapshot collector daemons."""
     env = {**os.environ, "PYTHONUNBUFFERED": "1"}
     procs: Dict[str, subprocess.Popen] = {}
 
-    btc_cmd = [
-        sys.executable, "scripts/record_btc_1s.py",
-        "--output", btc_output,
-        "--exchange", btc_exchange,
+    # Single multi-asset price recorder
+    price_cmd = [
+        sys.executable, "scripts/record_crypto_1s.py",
+        "--assets", *assets,
+        "--exchange", exchange,
+        "--output-dir", paths["dir"],
+        "--csv-only",
     ]
-    procs["btc"] = subprocess.Popen(btc_cmd, cwd=_PROJECT_ROOT, env=env)
-    print(f"{_prefix('btc')} PID {procs['btc'].pid}  ->  {btc_output}")
+    procs["price"] = subprocess.Popen(price_cmd, cwd=_PROJECT_ROOT, env=env)
+    print(f"{_prefix('price')} PID {procs['price'].pid}  ->  {paths['dir']}/  ({', '.join(assets)})")
 
-    snap_cmd = [
-        sys.executable, "scripts/collect_snapshots.py",
-        "--interval", str(snap_interval),
-        "--output", snap_output,
-    ]
-    procs["snapshots"] = subprocess.Popen(snap_cmd, cwd=_PROJECT_ROOT, env=env)
-    print(f"{_prefix('snapshots')} PID {procs['snapshots'].pid}  ->  {snap_output}")
+    # Per-asset snapshot collectors
+    for asset in assets:
+        snap_key = f"snapshots_{asset}"
+        snap_cmd = [
+            sys.executable, "scripts/collect_snapshots.py",
+            "--asset", asset,
+            "--interval", str(snap_interval),
+            "--output", paths[snap_key],
+        ]
+        procs[snap_key] = subprocess.Popen(snap_cmd, cwd=_PROJECT_ROOT, env=env)
+        print(f"{_prefix('snapshots')} [{asset}] PID {procs[snap_key].pid}  ->  {paths[snap_key]}")
 
     return procs
 
 
-def _run_history_batch(history_output: str, hours: int) -> Optional[subprocess.Popen]:
+def _run_history_batch(history_output: str, hours: int, asset: str = "BTC") -> Optional[subprocess.Popen]:
     """Launch a one-shot history collection and return the Popen."""
     env = {**os.environ, "PYTHONUNBUFFERED": "1"}
     cmd = [
         sys.executable, "scripts/collect_history.py",
+        "--asset", asset,
         "--hours", str(hours),
         "--output", history_output,
     ]
     proc = subprocess.Popen(cmd, cwd=_PROJECT_ROOT, env=env)
-    print(f"{_prefix('history')} PID {proc.pid}  batch ({hours}h) ->  {history_output}")
+    print(f"{_prefix('history')} [{asset}] PID {proc.pid}  batch ({hours}h) ->  {history_output}")
     return proc
 
 
@@ -254,13 +304,22 @@ def main() -> None:
         description="Unified Polymarket data collector — hourly partitioned",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--btc-exchange", default="coinbase", choices=["coinbase", "binance_us"])
+    parser.add_argument("--assets", nargs="+", default=["BTC"],
+                        help="Asset tickers to collect (default: BTC). Use BTC ETH SOL DOGE XRP for all.")
+    parser.add_argument("--exchange", default="coinbase", choices=["coinbase", "binance_us"])
     parser.add_argument("--snap-interval", type=int, default=5, help="Snapshot poll interval (seconds)")
     parser.add_argument("--history-hours", type=int, default=2, help="Hours of history per batch")
     parser.add_argument("--no-history", action="store_true", help="Skip periodic history collection")
     parser.add_argument("--map-interval", type=int, default=600, help="Seconds between slot-key map rebuilds")
     parser.add_argument("--data-dir", default="data", help="Base data directory")
+    parser.add_argument("--s3-bucket", default=_S3_BUCKET, help="S3 bucket for syncing data")
+    parser.add_argument("--no-s3", action="store_true", help="Disable S3 sync")
     args = parser.parse_args()
+
+    s3_enabled = not args.no_s3 and _s3_sync_available()
+    if not args.no_s3 and not s3_enabled:
+        print("  [warn] AWS CLI not found — S3 sync disabled")
+        print("         Install awscli and run 'aws configure' to enable.\n")
 
     def _handle_signal(sig, frame):
         global _shutdown
@@ -269,30 +328,37 @@ def main() -> None:
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
 
+    assets = [a.upper() for a in args.assets]
+
     # --- Initial hour ---
-    paths = _hourly_paths(args.data_dir)
+    paths = _hourly_paths(args.data_dir, assets)
     current_hour = _current_hour_tag()
 
     print("=" * 60)
-    print("  Polymarket Data Collector  (hourly partitioned)")
+    print("  Polymarket Data Collector  (hourly partitioned, multi-asset)")
     print("=" * 60)
+    print(f"  Assets:  {', '.join(assets)}")
     print(f"  Layout:  {args.data_dir}/YYYY-MM-DD/HH/")
-    print(f"           btc_1s.csv | snapshots.jsonl | history.csv | slot_key_map.csv")
+    print(f"           {{asset}}_1s.csv | snapshots_{{asset}}.jsonl | history_{{asset}}.csv")
     print(f"  Current: {paths['dir']}/")
+    print(f"  S3 sync: {'s3://' + args.s3_bucket + '/' if s3_enabled else 'disabled'}")
     print(f"\n  Press Ctrl+C to stop all.\n")
 
     # Launch daemons for current hour
     procs = _launch_daemons(
-        btc_output=paths["btc"],
-        btc_exchange=args.btc_exchange,
-        snap_output=paths["snapshots"],
+        paths=paths,
+        assets=assets,
+        exchange=args.exchange,
         snap_interval=args.snap_interval,
     )
 
-    # Initial history batch
-    history_proc: Optional[subprocess.Popen] = None
+    # Initial history batch (one per asset)
+    history_procs: Dict[str, subprocess.Popen] = {}
     if not args.no_history:
-        history_proc = _run_history_batch(paths["history"], args.history_hours)
+        for asset in assets:
+            history_procs[asset] = _run_history_batch(
+                paths[f"history_{asset}"], args.history_hours, asset=asset,
+            )
 
     last_map_build = 0.0
 
@@ -306,10 +372,11 @@ def main() -> None:
             if new_hour != current_hour:
                 print(f"\n{_prefix('rotate')} hour changed: {current_hour} -> {new_hour}")
 
-                # Build final map for the ending hour
+                # Build final map for the ending hour (use first asset's snapshots/history)
+                first = assets[0]
                 try:
                     count = build_slot_key_map(
-                        paths["snapshots"], paths["history"], paths["map"]
+                        paths[f"snapshots_{first}"], paths[f"history_{first}"], paths["map"]
                     )
                     print(f"{_prefix('mapper')} final map for {current_hour}  ({count} slots)")
                 except Exception as exc:
@@ -318,27 +385,34 @@ def main() -> None:
                 # Stop daemons
                 _stop_procs(procs, timeout=5.0)
 
+                # Sync completed hour to S3
+                if s3_enabled:
+                    _sync_to_s3(paths["dir"], args.s3_bucket)
+
                 # New hour paths
                 current_hour = new_hour
-                paths = _hourly_paths(args.data_dir)
+                paths = _hourly_paths(args.data_dir, assets)
                 print(f"{_prefix('rotate')} new dir: {paths['dir']}/")
 
                 # Relaunch daemons with new output paths
                 procs = _launch_daemons(
-                    btc_output=paths["btc"],
-                    btc_exchange=args.btc_exchange,
-                    snap_output=paths["snapshots"],
+                    paths=paths,
+                    assets=assets,
+                    exchange=args.exchange,
                     snap_interval=args.snap_interval,
                 )
 
-                # New history batch
+                # New history batch per asset
                 if not args.no_history:
-                    if history_proc is not None and history_proc.poll() is None:
-                        history_proc.terminate()
-                        history_proc.wait(timeout=5)
-                    history_proc = _run_history_batch(
-                        paths["history"], args.history_hours
-                    )
+                    for asset_name, hproc in history_procs.items():
+                        if hproc.poll() is None:
+                            hproc.terminate()
+                            hproc.wait(timeout=5)
+                    history_procs.clear()
+                    for asset_name in assets:
+                        history_procs[asset_name] = _run_history_batch(
+                            paths[f"history_{asset_name}"], args.history_hours, asset=asset_name,
+                        )
 
                 last_map_build = now
                 print()
@@ -349,35 +423,36 @@ def main() -> None:
                 if ret is not None and not _shutdown:
                     print(f"\n{_prefix(name)} exited unexpectedly (code {ret}), restarting...")
                     del procs[name]
-                    # Restart the dead daemon
-                    if name == "btc":
-                        new_procs = _launch_daemons(
-                            btc_output=paths["btc"],
-                            btc_exchange=args.btc_exchange,
-                            snap_output=paths["snapshots"],
-                            snap_interval=args.snap_interval,
-                        )
-                        procs["btc"] = new_procs["btc"]
-                        # Stop the duplicate snapshot proc we just launched
-                        new_procs["snapshots"].terminate()
-                        new_procs["snapshots"].wait(timeout=3)
-                    elif name == "snapshots":
+                    # Restart the dead daemon individually
+                    if name == "price":
+                        env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+                        price_cmd = [
+                            sys.executable, "scripts/record_crypto_1s.py",
+                            "--assets", *assets,
+                            "--exchange", args.exchange,
+                            "--output-dir", paths["dir"],
+                            "--csv-only",
+                        ]
+                        procs["price"] = subprocess.Popen(price_cmd, cwd=_PROJECT_ROOT, env=env)
+                        print(f"{_prefix('price')} restarted PID {procs['price'].pid}")
+                    elif name.startswith("snapshots_"):
+                        asset_name = name.split("_", 1)[1]
                         env = {**os.environ, "PYTHONUNBUFFERED": "1"}
                         snap_cmd = [
                             sys.executable, "scripts/collect_snapshots.py",
+                            "--asset", asset_name,
                             "--interval", str(args.snap_interval),
-                            "--output", paths["snapshots"],
+                            "--output", paths[name],
                         ]
-                        procs["snapshots"] = subprocess.Popen(
-                            snap_cmd, cwd=_PROJECT_ROOT, env=env
-                        )
-                        print(f"{_prefix('snapshots')} restarted PID {procs['snapshots'].pid}")
+                        procs[name] = subprocess.Popen(snap_cmd, cwd=_PROJECT_ROOT, env=env)
+                        print(f"{_prefix('snapshots')} [{asset_name}] restarted PID {procs[name].pid}")
 
             # ---- Periodic slot-key map rebuild ----
             if now - last_map_build >= args.map_interval:
+                first = assets[0]
                 try:
                     count = build_slot_key_map(
-                        paths["snapshots"], paths["history"], paths["map"]
+                        paths[f"snapshots_{first}"], paths[f"history_{first}"], paths["map"]
                     )
                     print(
                         f"{_prefix('mapper')} rebuilt slot_key_map.csv  "
@@ -396,18 +471,24 @@ def main() -> None:
     print("Shutting down all processes...")
     print(f"{'=' * 60}")
 
-    if history_proc is not None and history_proc.poll() is None:
-        procs["history"] = history_proc
+    for asset_name, hproc in history_procs.items():
+        if hproc.poll() is None:
+            procs[f"history_{asset_name}"] = hproc
     _stop_procs(procs)
 
     # Final map build
+    first = assets[0]
     try:
         count = build_slot_key_map(
-            paths["snapshots"], paths["history"], paths["map"]
+            paths[f"snapshots_{first}"], paths[f"history_{first}"], paths["map"]
         )
         print(f"\n{_prefix('mapper')} final slot_key_map.csv  ({count} slots)")
     except Exception as exc:
         print(f"{_prefix('mapper')} final build failed: {exc}")
+
+    # Final S3 sync for current (partial) hour
+    if s3_enabled:
+        _sync_to_s3(paths["dir"], args.s3_bucket)
 
     print("\nDone.")
 

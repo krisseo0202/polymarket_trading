@@ -15,66 +15,24 @@ provider "aws" {
 
 data "aws_caller_identity" "current" {}
 
+# Lightsail instance is managed manually — not via Terraform.
+
 # -----------------------------------------------------------------------------
-# Lightsail instance
+# S3 bucket for data storage
 # -----------------------------------------------------------------------------
 
-resource "aws_lightsail_instance" "collector" {
-  name              = var.project_name
-  availability_zone = "${var.aws_region}a"
-  blueprint_id      = var.blueprint_id
-  bundle_id         = var.bundle_id
-  key_pair_name     = var.key_pair_name
-  user_data         = file("${path.module}/user_data.sh")
+resource "aws_s3_bucket" "data" {
+  count  = var.enable_s3_backup ? 1 : 0
+  bucket = var.s3_bucket_name
 
   tags = {
     Project = var.project_name
   }
 }
 
-# -----------------------------------------------------------------------------
-# Static IP (free while attached)
-# -----------------------------------------------------------------------------
-
-resource "aws_lightsail_static_ip" "collector" {
-  name = "${var.project_name}-ip"
-}
-
-resource "aws_lightsail_static_ip_attachment" "collector" {
-  static_ip_name = aws_lightsail_static_ip.collector.name
-  instance_name  = aws_lightsail_instance.collector.name
-}
-
-# -----------------------------------------------------------------------------
-# Firewall — SSH only
-# -----------------------------------------------------------------------------
-
-resource "aws_lightsail_instance_public_ports" "collector" {
-  instance_name = aws_lightsail_instance.collector.name
-
-  port_info {
-    protocol  = "tcp"
-    from_port = 22
-    to_port   = 22
-  }
-}
-
-# -----------------------------------------------------------------------------
-# S3 bucket for daily data backups (conditional)
-# -----------------------------------------------------------------------------
-
-resource "aws_s3_bucket" "backup" {
+resource "aws_s3_bucket_server_side_encryption_configuration" "data" {
   count  = var.enable_s3_backup ? 1 : 0
-  bucket = "${var.project_name}-data-${data.aws_caller_identity.current.account_id}"
-
-  tags = {
-    Project = var.project_name
-  }
-}
-
-resource "aws_s3_bucket_server_side_encryption_configuration" "backup" {
-  count  = var.enable_s3_backup ? 1 : 0
-  bucket = aws_s3_bucket.backup[0].id
+  bucket = aws_s3_bucket.data[0].id
 
   rule {
     apply_server_side_encryption_by_default {
@@ -83,28 +41,9 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "backup" {
   }
 }
 
-resource "aws_s3_bucket_lifecycle_configuration" "backup" {
+resource "aws_s3_bucket_public_access_block" "data" {
   count  = var.enable_s3_backup ? 1 : 0
-  bucket = aws_s3_bucket.backup[0].id
-
-  rule {
-    id     = "archive-and-expire"
-    status = "Enabled"
-
-    transition {
-      days          = 30
-      storage_class = "GLACIER"
-    }
-
-    expiration {
-      days = 365
-    }
-  }
-}
-
-resource "aws_s3_bucket_public_access_block" "backup" {
-  count  = var.enable_s3_backup ? 1 : 0
-  bucket = aws_s3_bucket.backup[0].id
+  bucket = aws_s3_bucket.data[0].id
 
   block_public_acls       = true
   block_public_policy     = true
@@ -113,7 +52,7 @@ resource "aws_s3_bucket_public_access_block" "backup" {
 }
 
 # -----------------------------------------------------------------------------
-# IAM user for S3 backups (Lightsail has no instance profiles)
+# IAM user for S3 access (Lightsail has no instance profiles)
 # -----------------------------------------------------------------------------
 
 resource "aws_iam_user" "backup" {
@@ -127,7 +66,7 @@ resource "aws_iam_user" "backup" {
 
 resource "aws_iam_user_policy" "backup" {
   count = var.enable_s3_backup ? 1 : 0
-  name  = "${var.project_name}-s3-write"
+  name  = "${var.project_name}-s3-access"
   user  = aws_iam_user.backup[0].name
 
   policy = jsonencode({
@@ -137,11 +76,12 @@ resource "aws_iam_user_policy" "backup" {
         Effect = "Allow"
         Action = [
           "s3:PutObject",
+          "s3:GetObject",
           "s3:ListBucket",
         ]
         Resource = [
-          aws_s3_bucket.backup[0].arn,
-          "${aws_s3_bucket.backup[0].arn}/*",
+          aws_s3_bucket.data[0].arn,
+          "${aws_s3_bucket.data[0].arn}/*",
         ]
       }
     ]

@@ -64,9 +64,11 @@ SYMBOLS = {
 }
 
 PRICE_DECIMALS = {
+    "BTC": 2,
     "ETH": 2,
     "SOL": 4,
-    "BTC": 2,
+    "DOGE": 6,
+    "XRP": 4,
 }
 
 

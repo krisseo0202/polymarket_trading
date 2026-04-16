@@ -49,14 +49,18 @@ class CryptoPriceFeed:
 
     # Default symbols per exchange for common assets
     COINBASE_SYMBOLS = {
+        "BTC": "BTC-USD",
         "ETH": "ETH-USD",
         "SOL": "SOL-USD",
-        "BTC": "BTC-USD",
+        "DOGE": "DOGE-USD",
+        "XRP": "XRP-USD",
     }
     BINANCE_SYMBOLS = {
+        "BTC": "btcusd",
         "ETH": "ethusd",
         "SOL": "solusd",
-        "BTC": "btcusd",
+        "DOGE": "dogeusd",
+        "XRP": "xrpusd",
     }
 
     def __init__(
