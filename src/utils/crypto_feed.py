@@ -1,5 +1,5 @@
 """
-Generic cryptocurrency live price feed via WebSocket — supports Coinbase and Binance.US.
+Generic cryptocurrency live price feed via WebSocket — supports Coinbase, Binance, and Binance.US.
 
 Works for any asset available on the exchange: BTC-USD, ETH-USD, SOL-USD, etc.
 This is the generalized version of BtcPriceFeed — same thread-safe interface:
@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Deque, List, Literal, Optional, Tuple
 
-Exchange = Literal["coinbase", "binance_us"]
+Exchange = Literal["coinbase", "binance", "binance_us"]
 
 _STALE_WARN_S = 2.0
 _RECONNECT_S = 5.0
@@ -43,8 +43,9 @@ class CryptoPriceFeed:
     Args:
         symbol:   Product symbol for the chosen exchange.
                   Coinbase:   "ETH-USD", "SOL-USD", "BTC-USD", etc.
+                  Binance:    "ethusdt", "solusdt", "btcusdt", etc.
                   Binance.US: "ethusd", "solusd", "btcusd", etc.
-        exchange: "coinbase" (default) | "binance_us"
+        exchange: "coinbase" (default) | "binance" | "binance_us"
     """
 
     # Default symbols per exchange for common assets
@@ -56,6 +57,13 @@ class CryptoPriceFeed:
         "XRP": "XRP-USD",
     }
     BINANCE_SYMBOLS = {
+        "BTC": "btcusdt",
+        "ETH": "ethusdt",
+        "SOL": "solusdt",
+        "DOGE": "dogeusdt",
+        "XRP": "xrpusdt",
+    }
+    BINANCE_US_SYMBOLS = {
         "BTC": "btcusd",
         "ETH": "ethusd",
         "SOL": "solusd",
@@ -72,8 +80,8 @@ class CryptoPriceFeed:
         reconnect_s: float = _RECONNECT_S,
         buffer_s: float = _BUFFER_S,
     ):
-        if exchange not in ("coinbase", "binance_us"):
-            raise ValueError(f"exchange must be 'coinbase' or 'binance_us', got {exchange!r}")
+        if exchange not in ("coinbase", "binance", "binance_us"):
+            raise ValueError(f"exchange must be 'coinbase', 'binance', or 'binance_us', got {exchange!r}")
 
         self._exchange: Exchange = exchange
         self._symbol = symbol
@@ -184,6 +192,8 @@ class CryptoPriceFeed:
             try:
                 if self._exchange == "coinbase":
                     await self._run_coinbase()
+                elif self._exchange == "binance":
+                    await self._run_binance()
                 else:
                     await self._run_binance_us()
 
@@ -258,16 +268,17 @@ class CryptoPriceFeed:
 
                 self._update(bid, ask, mid, exchange_ts)
 
-    # -- Binance.US WebSocket --------------------------------------------------
+    # -- Binance WebSocket (shared by global and US) ----------------------------
 
-    async def _run_binance_us(self) -> None:
+    async def _run_binance_ws(self, host: str, label: str) -> None:
+        """Connect to a Binance bookTicker stream at the given host."""
         import websockets
 
         symbol = self._symbol.lower()
-        uri = f"wss://stream.binance.us:9443/ws/{symbol}@bookTicker"
+        uri = f"wss://{host}:9443/ws/{symbol}@bookTicker"
 
         async with websockets.connect(uri, ping_interval=20, ping_timeout=10) as ws:
-            self._logger.info(f"[binance_us] Connected — {symbol}@bookTicker")
+            self._logger.info(f"[{label}/{self._asset_tag}] Connected — {symbol}@bookTicker")
 
             while not self._stop_evt.is_set():
                 try:
@@ -277,7 +288,7 @@ class CryptoPriceFeed:
                         latest_ts = self._latest.local_ts if self._latest else None
                     if latest_ts is not None and (time.time() - latest_ts) > self._reconnect_s:
                         raise ConnectionError(
-                            f"[{self._exchange}/{self._asset_tag}] No price data for "
+                            f"[{label}/{self._asset_tag}] No price data for "
                             f"{self._reconnect_s:.0f}s — reconnecting"
                         )
                     continue
@@ -287,11 +298,17 @@ class CryptoPriceFeed:
                     bid = float(msg["b"])
                     ask = float(msg["a"])
                 except (json.JSONDecodeError, KeyError, ValueError) as e:
-                    self._logger.debug(f"[binance_us/{self._asset_tag}] Bad message: {e}")
+                    self._logger.debug(f"[{label}/{self._asset_tag}] Bad message: {e}")
                     continue
 
                 mid = (bid + ask) / 2.0
                 self._update(bid, ask, mid, None)
+
+    async def _run_binance(self) -> None:
+        await self._run_binance_ws("stream.binance.com", "binance")
+
+    async def _run_binance_us(self) -> None:
+        await self._run_binance_ws("stream.binance.us", "binance_us")
 
     # -- Watchdog --------------------------------------------------------------
 

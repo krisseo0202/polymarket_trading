@@ -136,13 +136,13 @@ def run(output: str, exchange: str, symbol: str):
 def main():
     parser = argparse.ArgumentParser(description="Record live BTC 1s OHLCV bars")
     parser.add_argument("--output", default="data/btc_live_1s.csv", help="Output CSV path")
-    parser.add_argument("--exchange", default="coinbase", choices=["coinbase", "binance_us"])
-    parser.add_argument("--symbol", default=None, help="Symbol (default: BTC-USD for coinbase, btcusd for binance_us)")
+    parser.add_argument("--exchange", default="binance", choices=["coinbase", "binance", "binance_us"])
+    parser.add_argument("--symbol", default=None, help="Symbol (default: BTC-USD for coinbase, btcusdt for binance, btcusd for binance_us)")
     args = parser.parse_args()
 
     symbol = args.symbol
     if symbol is None:
-        symbol = "BTC-USD" if args.exchange == "coinbase" else "btcusd"
+        symbol = {"coinbase": "BTC-USD", "binance": "btcusdt", "binance_us": "btcusd"}[args.exchange]
 
     run(args.output, args.exchange, symbol)
 

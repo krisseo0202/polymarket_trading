@@ -5,10 +5,18 @@ Records per-snapshot ML features to data/snapshots.jsonl at configurable
 cadence (default 5s).  Runs standalone alongside or without the trading bot.
 
 Each snapshot record contains:
-  slot_ts, snapshot_ts, strike, strike_source, btc_now, btc_source,
+  slot_ts, snapshot_ts, up_token, down_token,
+  strike, strike_source, btc_now, btc_source,
   yes_bid, yes_ask, yes_mid, yes_spread, yes_imbalance,
+  yes_bids, yes_asks (full depth dicts {price: size}),
+  yes_bid_depth, yes_ask_depth, yes_n_levels,
   no_bid, no_ask, no_mid, no_spread, no_imbalance,
+  no_bids, no_asks (full depth dicts {price: size}),
+  no_bid_depth, no_ask_depth, no_n_levels,
   realized_vol_30s, realized_vol_60s
+
+  bid/ask are VWAP of the top-N levels by volume, not raw top-of-book
+  (which is always 0.01/0.99 dust on these markets).
 
 At each slot rollover an outcome sentinel is appended:
   {"type": "outcome", "slot_ts": <N>, "outcome": "Up"|"Down"}
@@ -58,11 +66,19 @@ _TOP_N_LEVELS = 5
 
 @dataclass
 class BookSummary:
-    bid: Optional[float]
-    ask: Optional[float]
-    mid: Optional[float]
-    spread: Optional[float]
-    imbalance: Optional[float]
+    # Volume-weighted top-N prices (the real market, not 0.01/0.99 dust)
+    bid: Optional[float]       # VWAP of top-N bid levels
+    ask: Optional[float]       # VWAP of top-N ask levels
+    mid: Optional[float]       # (bid + ask) / 2
+    spread: Optional[float]    # ask - bid
+    imbalance: Optional[float] # (bid_depth - ask_depth) / total at top-N
+    # Full book depth
+    bids: Optional[Dict[str, str]] = None  # {price: size}
+    asks: Optional[Dict[str, str]] = None  # {price: size}
+    bid_depth: Optional[float] = None      # total bid size
+    ask_depth: Optional[float] = None      # total ask size
+    n_bid_levels: int = 0
+    n_ask_levels: int = 0
 
 
 def _parse_json_field(raw) -> list:
@@ -203,25 +219,43 @@ class BookFetcher:
 
         bids = data.get("bids", [])
         asks = data.get("asks", [])
-        # CLOB returns bids descending, asks ascending — take top_n each side
-        top_bids = bids[: self._top_n]
-        top_asks = asks[: self._top_n]
 
-        if not top_bids and not top_asks:
+        if not bids and not asks:
             return None
 
-        best_bid = float(top_bids[0]["price"]) if top_bids else None
-        best_ask = float(top_asks[0]["price"]) if top_asks else None
-        mid = (best_bid + best_ask) / 2 if best_bid is not None and best_ask is not None else None
-        spread = (best_ask - best_bid) if best_bid is not None and best_ask is not None else None
+        # Build full dict + total depth in one pass, then VWAP from sorted top-N
+        def _process_side(levels: list, top_n: int, reverse: bool = False):
+            full = {}
+            sz_total = 0.0
+            for entry in levels:
+                full[entry["price"]] = entry["size"]
+                sz_total += float(entry.get("size", 0))
+            # Sort by price: bids descending (best=highest), asks ascending (best=lowest)
+            sorted_prices = sorted(full.keys(), key=float, reverse=reverse)
+            vwap_num = 0.0
+            vwap_den = 0.0
+            for p in sorted_prices[:top_n]:
+                sz = float(full[p])
+                vwap_num += float(p) * sz
+                vwap_den += sz
+            vwap = vwap_num / vwap_den if vwap_den > 0 else None
+            return full, sz_total, vwap, vwap_den
 
-        bid_sz = sum(float(b.get("size", 0)) for b in top_bids)
-        ask_sz = sum(float(a.get("size", 0)) for a in top_asks)
-        denom = bid_sz + ask_sz
-        imbalance = (bid_sz - ask_sz) / denom if denom > 0 else None
+        # Bids: best = highest price → reverse=True
+        # Asks: best = lowest price  → reverse=False
+        full_bids, bid_depth, vwap_bid, bid_top_sz = _process_side(bids, self._top_n, reverse=True)
+        full_asks, ask_depth, vwap_ask, ask_top_sz = _process_side(asks, self._top_n, reverse=False)
+
+        mid = (vwap_bid + vwap_ask) / 2 if vwap_bid is not None and vwap_ask is not None else None
+        spread = (vwap_ask - vwap_bid) if vwap_bid is not None and vwap_ask is not None else None
+        denom = bid_top_sz + ask_top_sz
+        imbalance = (bid_top_sz - ask_top_sz) / denom if denom > 0 else None
 
         return BookSummary(
-            bid=best_bid, ask=best_ask, mid=mid, spread=spread, imbalance=imbalance
+            bid=vwap_bid, ask=vwap_ask, mid=mid, spread=spread, imbalance=imbalance,
+            bids=full_bids, asks=full_asks,
+            bid_depth=bid_depth, ask_depth=ask_depth,
+            n_bid_levels=len(bids), n_ask_levels=len(asks),
         )
 
     def fetch_pair(
@@ -376,6 +410,8 @@ class SnapshotCollector:
         record = {
             "slot_ts":          slot_ts,
             "snapshot_ts":      snapshot_ts,
+            "up_token":         up_token,
+            "down_token":       down_token,
             "strike":           strike,
             "strike_source":    strike_src,
             "btc_now":          price_now,
@@ -386,12 +422,22 @@ class SnapshotCollector:
             "yes_mid":          yes_book.mid       if yes_book else None,
             "yes_spread":       yes_book.spread    if yes_book else None,
             "yes_imbalance":    yes_book.imbalance if yes_book else None,
+            "yes_bids":         yes_book.bids      if yes_book else None,
+            "yes_asks":         yes_book.asks      if yes_book else None,
+            "yes_bid_depth":    yes_book.bid_depth if yes_book else None,
+            "yes_ask_depth":    yes_book.ask_depth if yes_book else None,
+            "yes_n_levels":     (yes_book.n_bid_levels + yes_book.n_ask_levels) if yes_book else 0,
             # NO (Down) book
             "no_bid":           no_book.bid        if no_book else None,
             "no_ask":           no_book.ask        if no_book else None,
             "no_mid":           no_book.mid        if no_book else None,
             "no_spread":        no_book.spread     if no_book else None,
             "no_imbalance":     no_book.imbalance  if no_book else None,
+            "no_bids":          no_book.bids       if no_book else None,
+            "no_asks":          no_book.asks       if no_book else None,
+            "no_bid_depth":     no_book.bid_depth  if no_book else None,
+            "no_ask_depth":     no_book.ask_depth  if no_book else None,
+            "no_n_levels":      (no_book.n_bid_levels + no_book.n_ask_levels) if no_book else 0,
             # BTC realized vol
             "realized_vol_30s": vol_30s,
             "realized_vol_60s": vol_60s,

@@ -2,16 +2,67 @@ api:
   host: "https://clob.polymarket.com"
   chain_id: 137
 
+s3:
+  enabled: true                            # set false to use local files only
+  bucket: "k-polymarket-data"
+  prefix: "data"                           # S3 key prefix matching the local data/ layout
+  region: "us-west-2"
+  local_cache_dir: "/tmp/polymarket_s3"   # downloaded files are cached here locally
+
 trading:
   paper_trading: true   # flip to false for live trading
   interval: 300         # 5-minute cycles (seconds)
   exit_rule: default    # "default" (strategy-defined) or "hold_to_expiry" (settle at resolution)
 
-btc_updown_bot:
-  market_keywords: ["Bitcoin", "Up or Down"]  # title must contain all of these (case-insensitive)
+updown_bot:
+  default_asset: "BTC"              # which asset to trade when --asset is not specified
   state_file: "bot_state.json"
   perf_db_path: "perf.db"
   min_volume: 0  # 0 — don't filter by volume so brand-new markets are found immediately
+
+# Per-asset configuration for Up/Down markets.
+# slug_prefix: used to build the Gamma API slug  →  {slug_prefix}-{slot_ts}
+# market_keywords: fallback keyword search when slug lookup misses
+# chainlink_symbol: Chainlink RTDS topic symbol for settlement price
+# price_symbol / price_exchange: live price feed for feature computation
+assets:
+  BTC:
+    slug_prefix: "btc-updown-5m"
+    market_keywords: ["Bitcoin", "Up or Down"]
+    chainlink_symbol: "btc/usd"
+    price_symbol: "btcusdt"
+    price_exchange: "binance"
+  ETH:
+    slug_prefix: "eth-updown-5m"
+    market_keywords: ["Ethereum", "Up or Down"]
+    chainlink_symbol: "eth/usd"
+    price_symbol: "ethusdt"
+    price_exchange: "binance"
+  SOL:
+    slug_prefix: "sol-updown-5m"
+    market_keywords: ["Solana", "Up or Down"]
+    chainlink_symbol: "sol/usd"
+    price_symbol: "solusdt"
+    price_exchange: "binance"
+  DOGE:
+    slug_prefix: "doge-updown-5m"
+    market_keywords: ["Dogecoin", "Up or Down"]
+    chainlink_symbol: "doge/usd"
+    price_symbol: "dogeusdt"
+    price_exchange: "binance"
+  XRP:
+    slug_prefix: "xrp-updown-5m"
+    market_keywords: ["XRP", "Up or Down"]
+    chainlink_symbol: "xrp/usd"
+    price_symbol: "xrpusdt"
+    price_exchange: "binance"
+
+# Legacy alias — code reads updown_bot; keep btc_updown_bot as fallback
+btc_updown_bot:
+  market_keywords: ["Bitcoin", "Up or Down"]
+  state_file: "bot_state.json"
+  perf_db_path: "perf.db"
+  min_volume: 0
 
 strategies:
   coin_toss:
@@ -196,7 +247,7 @@ risk:
 
 chainlink_feed:
   enabled: true
-  symbol: "btc/usd"
+  symbol: "btc/usd"   # default; overridden per-asset from assets.{ASSET}.chainlink_symbol
 
 vpn:
   require_non_us: true   # abort startup if external IP is US-based; set false to skip check

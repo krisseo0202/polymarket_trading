@@ -306,7 +306,7 @@ def main() -> None:
     )
     parser.add_argument("--assets", nargs="+", default=["BTC"],
                         help="Asset tickers to collect (default: BTC). Use BTC ETH SOL DOGE XRP for all.")
-    parser.add_argument("--exchange", default="coinbase", choices=["coinbase", "binance_us"])
+    parser.add_argument("--exchange", default="binance", choices=["coinbase", "binance", "binance_us"])
     parser.add_argument("--snap-interval", type=int, default=5, help="Snapshot poll interval (seconds)")
     parser.add_argument("--history-hours", type=int, default=2, help="Hours of history per batch")
     parser.add_argument("--no-history", action="store_true", help="Skip periodic history collection")
