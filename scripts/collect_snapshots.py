@@ -38,9 +38,9 @@ import signal
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import requests
 
@@ -49,10 +49,35 @@ import requests
 # ---------------------------------------------------------------------------
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from src.engine.slot_state import SlotContext
-from src.models.feature_builder import _realized_vol
+# Import only lightweight utils — avoid src.engine/__init__.py and src.models/__init__.py
+# which eagerly load the full trading stack (strategies, indicators, XGB models).
+# SlotContext.slot_for() and _realized_vol() are inlined below to break the chain.
 from src.utils.crypto_feed import CryptoPriceFeed
 from src.utils.chainlink_feed import ChainlinkFeed
+
+import math
+import numpy as np
+from typing import Sequence
+
+_SLOT_INTERVAL_S = 300
+
+
+def _slot_for(ts: float) -> int:
+    """Return the slot-start timestamp for a given unix timestamp."""
+    return int(math.floor(ts / _SLOT_INTERVAL_S) * _SLOT_INTERVAL_S)
+
+
+def _realized_vol(prices: Sequence, now_ts: float, window_s: int) -> float:
+    """Realized volatility (std of log-returns) over a rolling window."""
+    cutoff = now_ts - window_s
+    window = [float(entry[1]) for entry in prices if float(entry[0]) >= cutoff]
+    if len(window) < 3:
+        return 0.0
+    arr = np.asarray(window, dtype=float)
+    returns = np.diff(np.log(arr))
+    if len(returns) < 2:
+        return 0.0
+    return float(np.std(returns, ddof=1))
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_API  = "https://clob.polymarket.com"
@@ -338,7 +363,7 @@ class SnapshotCollector:
         try:
             while not self._stop_evt.is_set():
                 now = time.time()
-                slot_ts = SlotContext.slot_for(now)
+                slot_ts = _slot_for(now)
 
                 if self._last_slot_ts is not None and slot_ts != self._last_slot_ts:
                     self._on_slot_rollover(self._last_slot_ts)
