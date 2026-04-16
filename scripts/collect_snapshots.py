@@ -1,5 +1,5 @@
 """
-Live intrabar snapshot collector for BTC 5-min Up/Down markets.
+Live intrabar snapshot collector for crypto 5-min Up/Down markets.
 
 Records per-snapshot ML features to data/snapshots.jsonl at configurable
 cadence (default 5s).  Runs standalone alongside or without the trading bot.
@@ -49,7 +49,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from src.engine.slot_state import SlotContext
 from src.models.feature_builder import _realized_vol
-from src.utils.btc_feed import BtcPriceFeed
+from src.utils.crypto_feed import CryptoPriceFeed
 from src.utils.chainlink_feed import ChainlinkFeed
 
 GAMMA_API = "https://gamma-api.polymarket.com"
@@ -113,10 +113,12 @@ class MarketDiscovery:
 
     def __init__(
         self,
+        slug_prefix: str = "btc-updown-5m",
         gamma_url: str = GAMMA_API,
         timeout: int = 15,
         logger: Optional[logging.Logger] = None,
     ):
+        self._slug_prefix = slug_prefix
         self._gamma_url = gamma_url
         self._timeout = timeout
         self._logger = logger or logging.getLogger("market_discovery")
@@ -144,7 +146,7 @@ class MarketDiscovery:
         self._cached_market = None
 
     def _fetch(self, slot_ts: int) -> Optional[Dict]:
-        slug = f"btc-updown-5m-{slot_ts}"
+        slug = f"{self._slug_prefix}-{slot_ts}"
         for attempt in range(3):
             try:
                 resp = requests.get(
@@ -308,9 +310,18 @@ class SnapshotCollector:
         self._interval = config.get("snapshot_interval_s", 5)
         self._logger = config.get("logger") or logging.getLogger("snapshot_collector")
 
-        self._btc_feed = BtcPriceFeed(logger=self._logger)
-        self._chainlink_feed = ChainlinkFeed(logger=self._logger)
-        self._discovery = MarketDiscovery(logger=self._logger)
+        slug_prefix = config.get("slug_prefix", "btc-updown-5m")
+        price_symbol = config.get("price_symbol", "BTC-USD")
+        price_exchange = config.get("price_exchange", "coinbase")
+        chainlink_symbol = config.get("chainlink_symbol", "btc/usd")
+
+        self._price_feed = CryptoPriceFeed(
+            symbol=price_symbol, exchange=price_exchange, logger=self._logger,
+        )
+        self._chainlink_feed = ChainlinkFeed(
+            symbol=chainlink_symbol, logger=self._logger,
+        )
+        self._discovery = MarketDiscovery(slug_prefix=slug_prefix, logger=self._logger)
         self._book_fetcher = BookFetcher(logger=self._logger)
         self._snap_logger = SnapshotLogger(config.get("output", "data/snapshots.jsonl"))
 
@@ -318,7 +329,7 @@ class SnapshotCollector:
         self._last_slot_ts: Optional[int] = None
 
     def run(self) -> None:
-        self._btc_feed.start()
+        self._price_feed.start()
         self._chainlink_feed.start()
         self._wait_for_feeds()
 
@@ -341,7 +352,7 @@ class SnapshotCollector:
 
                 self._stop_evt.wait(timeout=self._interval)
         finally:
-            self._btc_feed.stop()
+            self._price_feed.stop()
             self._chainlink_feed.stop()
             self._logger.info("Snapshot collector stopped")
 
@@ -351,14 +362,14 @@ class SnapshotCollector:
     def _wait_for_feeds(self, timeout: float = 10.0) -> None:
         deadline = time.time() + timeout
         while time.time() < deadline:
-            btc_ready = self._btc_feed.get_latest_mid() is not None
+            btc_ready = self._price_feed.get_latest_mid() is not None
             cl_ready  = self._chainlink_feed.get_latest() is not None
             if btc_ready and cl_ready:
                 self._logger.info("Feeds ready")
                 return
             time.sleep(0.5)
-        if self._btc_feed.get_latest_mid() is None:
-            self._logger.warning("BTC feed not ready after startup wait")
+        if self._price_feed.get_latest_mid() is None:
+            self._logger.warning("Price feed not ready after startup wait")
         if self._chainlink_feed.get_latest() is None:
             self._logger.warning("Chainlink feed not ready after startup wait")
 
@@ -373,16 +384,16 @@ class SnapshotCollector:
 
         yes_book, no_book = self._book_fetcher.fetch_pair(up_token, down_token)
 
-        btc_now  = self._btc_feed.get_latest_mid()
-        btc_src  = "coinbase" if btc_now is not None else None
-        btc_prices = self._btc_feed.get_recent_prices(300)
+        price_now  = self._price_feed.get_latest_mid()
+        price_src  = self._price_feed.exchange if price_now is not None else None
+        price_history = self._price_feed.get_recent_prices(300)
 
-        # If Coinbase unavailable, try Chainlink latest
-        if btc_now is None:
+        # If exchange feed unavailable, try Chainlink latest
+        if price_now is None:
             cl = self._chainlink_feed.get_latest()
             if cl is not None:
-                btc_now = cl.price
-                btc_src = "chainlink"
+                price_now = cl.price
+                price_src = "chainlink"
 
         # Strike: Chainlink slot-open for this specific slot
         strike: Optional[float] = None
@@ -392,8 +403,8 @@ class SnapshotCollector:
             strike = slot_open.price
             strike_src = "chainlink"
 
-        vol_30s = _realized_vol(btc_prices, snapshot_ts, 30) if len(btc_prices) >= 3 else None
-        vol_60s = _realized_vol(btc_prices, snapshot_ts, 60) if len(btc_prices) >= 3 else None
+        vol_30s = _realized_vol(price_history, snapshot_ts, 30) if len(price_history) >= 3 else None
+        vol_60s = _realized_vol(price_history, snapshot_ts, 60) if len(price_history) >= 3 else None
 
         record = {
             "slot_ts":          slot_ts,
@@ -402,8 +413,8 @@ class SnapshotCollector:
             "down_token":       down_token,
             "strike":           strike,
             "strike_source":    strike_src,
-            "btc_now":          btc_now,
-            "btc_source":       btc_src,
+            "btc_now":          price_now,
+            "btc_source":       price_src,
             # YES (Up) book — summary
             "yes_bid":          yes_book.bid       if yes_book else None,
             "yes_ask":          yes_book.ask       if yes_book else None,
@@ -462,23 +473,56 @@ class SnapshotCollector:
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _load_asset_config(asset: str) -> dict:
+    """Load per-asset config from config/config.yaml, with sensible BTC defaults."""
+    try:
+        import yaml
+        cfg_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config", "config.yaml")
+        with open(cfg_path) as f:
+            raw = yaml.safe_load(f) or {}
+        return raw.get("assets", {}).get(asset.upper(), {})
+    except Exception:
+        return {}
+
+
+_ASSET_DEFAULTS = {
+    "BTC":  {"slug_prefix": "btc-updown-5m",  "price_symbol": "BTC-USD",  "chainlink_symbol": "btc/usd"},
+    "ETH":  {"slug_prefix": "eth-updown-5m",  "price_symbol": "ETH-USD",  "chainlink_symbol": "eth/usd"},
+    "SOL":  {"slug_prefix": "sol-updown-5m",  "price_symbol": "SOL-USD",  "chainlink_symbol": "sol/usd"},
+    "DOGE": {"slug_prefix": "doge-updown-5m", "price_symbol": "DOGE-USD", "chainlink_symbol": "doge/usd"},
+    "XRP":  {"slug_prefix": "xrp-updown-5m",  "price_symbol": "XRP-USD",  "chainlink_symbol": "xrp/usd"},
+}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Live intrabar snapshot collector")
+    parser.add_argument("--asset", default="BTC",
+                        help="Asset to collect: BTC, ETH, SOL, DOGE, XRP (default: BTC)")
     parser.add_argument("--interval", type=int, default=5, help="Seconds between snapshots")
-    parser.add_argument("--output", default="data/snapshots.jsonl", help="Output JSONL path")
+    parser.add_argument("--output", default=None, help="Output JSONL path (default: data/snapshots_{asset}.jsonl)")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING"])
     args = parser.parse_args()
+
+    asset = args.asset.upper()
+    output = args.output or f"data/snapshots_{asset.lower()}.jsonl"
 
     logging.basicConfig(
         level=getattr(logging, args.log_level),
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     )
-    logger = logging.getLogger("collect_snapshots")
+    logger = logging.getLogger(f"collect_snapshots.{asset.lower()}")
+
+    # Merge config file + hardcoded defaults
+    asset_cfg = {**_ASSET_DEFAULTS.get(asset, _ASSET_DEFAULTS["BTC"]), **_load_asset_config(asset)}
 
     config = {
         "snapshot_interval_s": args.interval,
-        "output": args.output,
+        "output": output,
         "logger": logger,
+        "slug_prefix": asset_cfg.get("slug_prefix", f"{asset.lower()}-updown-5m"),
+        "price_symbol": asset_cfg.get("price_symbol", f"{asset}-USD"),
+        "price_exchange": asset_cfg.get("price_exchange", "coinbase"),
+        "chainlink_symbol": asset_cfg.get("chainlink_symbol", f"{asset.lower()}/usd"),
     }
     collector = SnapshotCollector(config)
 

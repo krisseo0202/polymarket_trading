@@ -1,10 +1,10 @@
 """
-Collect historical BTC 5-min Up/Down market data from Polymarket.
+Collect historical crypto 5-min Up/Down market data from Polymarket.
 
 Usage:
     python scripts/collect_history.py --hours 24
-    python scripts/collect_history.py --hours 168 --output data/btc_updown_5m.csv
-    python scripts/collect_history.py --hours 24 --ticks   # also collect intra-market prices
+    python scripts/collect_history.py --asset ETH --hours 168
+    python scripts/collect_history.py --asset SOL --hours 24 --ticks
 """
 
 import argparse
@@ -30,12 +30,12 @@ def current_slot_ts() -> int:
     return now - (now % SLOT_INTERVAL)
 
 
-def fetch_market_for_slot(slot_ts: int) -> Optional[Dict]:
+def fetch_market_for_slot(slot_ts: int, slug_prefix: str = "btc-updown-5m") -> Optional[Dict]:
     """Fetch market data for a given 5-minute slot from the gamma API.
 
     Returns dict with market metadata, or None if not found.
     """
-    slug = f"btc-updown-5m-{slot_ts}"
+    slug = f"{slug_prefix}-{slot_ts}"
     try:
         resp = requests.get(
             f"{GAMMA_API}/events",
@@ -150,7 +150,7 @@ def parse_strike_price(question: str) -> Optional[float]:
     return None
 
 
-def collect(hours_back: int, output_path: str, collect_ticks: bool = False):
+def collect(hours_back: int, output_path: str, collect_ticks: bool = False, slug_prefix: str = "btc-updown-5m"):
     """Main collection loop: iterate slots backwards and save to CSV."""
     now_slot = current_slot_ts()
     # Skip the current (potentially unclosed) slot
@@ -181,7 +181,7 @@ def collect(hours_back: int, output_path: str, collect_ticks: bool = False):
 
     slot = start_slot
     while slot > end_slot:
-        market = fetch_market_for_slot(slot)
+        market = fetch_market_for_slot(slot, slug_prefix=slug_prefix)
         if market is None:
             skipped += 1
             slot -= SLOT_INTERVAL
@@ -276,24 +276,40 @@ def collect(hours_back: int, output_path: str, collect_ticks: bool = False):
               f"Unresolved: {unresolved} | Avg volume: ${avg_vol:,.0f}")
 
 
+_SLUG_PREFIXES = {
+    "BTC": "btc-updown-5m",
+    "ETH": "eth-updown-5m",
+    "SOL": "sol-updown-5m",
+    "DOGE": "doge-updown-5m",
+    "XRP": "xrp-updown-5m",
+}
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Collect historical BTC 5-min Up/Down market data from Polymarket"
+        description="Collect historical crypto 5-min Up/Down market data from Polymarket"
+    )
+    parser.add_argument(
+        "--asset", default="BTC",
+        help="Asset ticker: BTC, ETH, SOL, DOGE, XRP (default: BTC)"
     )
     parser.add_argument(
         "--hours", type=int, default=24,
         help="Hours of history to collect (default: 24)"
     )
     parser.add_argument(
-        "--output", type=str, default="data/btc_updown_5m.csv",
-        help="Output CSV path (default: data/btc_updown_5m.csv)"
+        "--output", type=str, default=None,
+        help="Output CSV path (default: data/{asset}_updown_5m.csv)"
     )
     parser.add_argument(
         "--ticks", action="store_true",
         help="Also collect intra-market price ticks"
     )
     args = parser.parse_args()
-    collect(args.hours, args.output, args.ticks)
+    asset = args.asset.upper()
+    slug_prefix = _SLUG_PREFIXES.get(asset, f"{asset.lower()}-updown-5m")
+    output = args.output or f"data/{asset.lower()}_updown_5m.csv"
+    collect(args.hours, output, args.ticks, slug_prefix=slug_prefix)
 
 
 if __name__ == "__main__":

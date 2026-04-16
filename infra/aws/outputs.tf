@@ -1,16 +1,6 @@
-output "public_ip" {
-  description = "Static IP address of the Lightsail instance"
-  value       = aws_lightsail_static_ip.collector.ip_address
-}
-
-output "ssh_command" {
-  description = "SSH command to connect to the instance"
-  value       = "ssh -i ~/.ssh/${var.key_pair_name}.pem ec2-user@${aws_lightsail_static_ip.collector.ip_address}"
-}
-
 output "s3_bucket" {
-  description = "S3 bucket name for data backups"
-  value       = var.enable_s3_backup ? aws_s3_bucket.backup[0].bucket : "(disabled)"
+  description = "S3 bucket name for data storage"
+  value       = var.enable_s3_backup ? aws_s3_bucket.data[0].bucket : "(disabled)"
 }
 
 output "s3_access_key_id" {
@@ -32,7 +22,7 @@ output "post_boot_instructions" {
     ===== POST-BOOT SETUP =====
 
     1. SSH into the instance:
-       ssh -i ~/.ssh/${var.key_pair_name}.pem ec2-user@${aws_lightsail_static_ip.collector.ip_address}
+       ssh -i ~/.ssh/${var.key_pair_name}.pem ec2-user@<YOUR_INSTANCE_PUBLIC_IP>
 
     2. Wait for cloud-init to finish (~3-5 min on first boot):
        sudo cloud-init status --wait

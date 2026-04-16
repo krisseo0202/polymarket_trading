@@ -1,7 +1,7 @@
 variable "aws_region" {
   description = "AWS region for the Lightsail instance"
   type        = string
-  default     = "us-east-1"
+  default     = "us-west-2"
 }
 
 variable "bundle_id" {
@@ -40,7 +40,13 @@ variable "repo_branch" {
 }
 
 variable "enable_s3_backup" {
-  description = "Create an S3 bucket and IAM user for daily data backups"
+  description = "Create an IAM user scoped to the S3 data bucket"
   type        = bool
   default     = true
+}
+
+variable "s3_bucket_name" {
+  description = "Name of the existing S3 bucket used for data storage"
+  type        = string
+  default     = "k-polymarket-data"
 }
