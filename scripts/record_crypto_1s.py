@@ -60,7 +60,8 @@ CSV_COLUMNS = ["timestamp", "open", "high", "low", "close", "volume"]
 # Reuse symbol maps from CryptoPriceFeed
 SYMBOLS = {
     "coinbase": CryptoPriceFeed.COINBASE_SYMBOLS,
-    "binance_us": CryptoPriceFeed.BINANCE_SYMBOLS,
+    "binance": CryptoPriceFeed.BINANCE_SYMBOLS,
+    "binance_us": CryptoPriceFeed.BINANCE_US_SYMBOLS,
 }
 
 PRICE_DECIMALS = {
@@ -456,7 +457,7 @@ def main():
         help="Asset tickers to record (default: BTC). Use BTC ETH SOL for all three."
     )
     parser.add_argument(
-        "--exchange", default="coinbase", choices=["coinbase", "binance_us"],
+        "--exchange", default="binance", choices=["coinbase", "binance", "binance_us"],
         help="Exchange backend (default: coinbase)"
     )
     parser.add_argument(

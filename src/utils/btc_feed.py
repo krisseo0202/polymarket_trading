@@ -1,12 +1,13 @@
 """
-BTC live price feed via WebSocket — supports Coinbase and Binance.US.
+BTC live price feed via WebSocket — supports Coinbase, Binance, and Binance.US.
 
-Coinbase is the preferred exchange because Chainlink's BTC/USD oracle
-(which Polymarket uses for settlement) aggregates Coinbase as a primary
-price source, making it the most consistent data for feature engineering.
+Binance (global) is the preferred exchange for consistency with historical
+training data from data.binance.vision.  Requires a non-US server region.
 
-Binance.US is available as an alternative (US-regulated counterpart to
-Binance global).
+Coinbase is an alternative — Chainlink's BTC/USD oracle aggregates it as a
+primary source, so it's closest to settlement price.
+
+Binance.US is the US-regulated fallback (no 1s klines, limited API).
 
 Both backends expose the same thread-safe interface:
     get_latest_mid(), get_recent_prices(), is_healthy(), get_latest_book()
@@ -22,7 +23,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Deque, List, Literal, Optional, Tuple
 
-Exchange = Literal["coinbase", "binance_us"]
+Exchange = Literal["coinbase", "binance", "binance_us"]
 
 _STALE_WARN_S = 2.0
 _RECONNECT_S = 5.0
@@ -48,8 +49,9 @@ class BtcPriceFeed:
     Args:
         symbol:   Product symbol for the chosen exchange.
                   Coinbase:   "BTC-USD"  (default)
+                  Binance:    "btcusdt"
                   Binance.US: "btcusd"
-        exchange: "coinbase" (default) | "binance_us"
+        exchange: "coinbase" (default) | "binance" | "binance_us"
     """
 
     def __init__(
@@ -61,8 +63,8 @@ class BtcPriceFeed:
         reconnect_s: float = _RECONNECT_S,
         buffer_s: float = _BUFFER_S,
     ):
-        if exchange not in ("coinbase", "binance_us"):
-            raise ValueError(f"exchange must be 'coinbase' or 'binance_us', got {exchange!r}")
+        if exchange not in ("coinbase", "binance", "binance_us"):
+            raise ValueError(f"exchange must be 'coinbase', 'binance', or 'binance_us', got {exchange!r}")
 
         self._exchange: Exchange = exchange
         self._symbol = symbol
@@ -175,6 +177,8 @@ class BtcPriceFeed:
             try:
                 if self._exchange == "coinbase":
                     await self._run_coinbase()
+                elif self._exchange == "binance":
+                    await self._run_binance()
                 else:
                     await self._run_binance_us()
 
@@ -263,25 +267,17 @@ class BtcPriceFeed:
 
                 self._update(bid, ask, mid, exchange_ts)
 
-    # ── Binance.US WebSocket ──────────────────────────────────────────────
+    # ── Binance WebSocket (shared by global and US) ────────────────────────
 
-    async def _run_binance_us(self) -> None:
-        """
-        Connect to Binance.US bookTicker stream.
-
-        URL: wss://stream.binance.us:9443/ws/{symbol}@bookTicker
-
-        Tick message fields used:
-            b — best bid price
-            a — best ask price
-        """
+    async def _run_binance_ws(self, host: str, label: str) -> None:
+        """Connect to a Binance bookTicker stream at the given host."""
         import websockets
 
         symbol = self._symbol.lower()
-        uri = f"wss://stream.binance.us:9443/ws/{symbol}@bookTicker"
+        uri = f"wss://{host}:9443/ws/{symbol}@bookTicker"
 
         async with websockets.connect(uri, ping_interval=20, ping_timeout=10) as ws:
-            self._logger.info(f"[binance_us] Connected — {symbol}@bookTicker")
+            self._logger.info(f"[{label}] Connected — {symbol}@bookTicker")
 
             while not self._stop_evt.is_set():
                 try:
@@ -291,7 +287,7 @@ class BtcPriceFeed:
                         latest_ts = self._latest.local_ts if self._latest else None
                     if latest_ts is not None and (time.time() - latest_ts) > self._reconnect_s:
                         raise ConnectionError(
-                            f"[{self._exchange}] No price data for "
+                            f"[{label}] No price data for "
                             f"{self._reconnect_s:.0f}s — reconnecting"
                         )
                     continue
@@ -301,11 +297,17 @@ class BtcPriceFeed:
                     bid = float(msg["b"])
                     ask = float(msg["a"])
                 except (json.JSONDecodeError, KeyError, ValueError) as e:
-                    self._logger.debug(f"[binance_us] Bad message: {e}")
+                    self._logger.debug(f"[{label}] Bad message: {e}")
                     continue
 
                 mid = (bid + ask) / 2.0
                 self._update(bid, ask, mid, None)
+
+    async def _run_binance(self) -> None:
+        await self._run_binance_ws("stream.binance.com", "binance")
+
+    async def _run_binance_us(self) -> None:
+        await self._run_binance_ws("stream.binance.us", "binance_us")
 
     # ── Watchdog ──────────────────────────────────────────────────────────
 

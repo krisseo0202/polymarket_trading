@@ -223,30 +223,31 @@ class BookFetcher:
         if not bids and not asks:
             return None
 
-        # Top-of-book
-        top_bids = bids[: self._top_n]
-        top_asks = asks[: self._top_n]
+        # Single pass per side: build dict, top-N depth, and total depth
+        def _process_side(levels: list, top_n: int):
+            full = {}
+            sz_top = 0.0
+            sz_total = 0.0
+            for i, entry in enumerate(levels):
+                sz = float(entry.get("size", 0))
+                full[entry["price"]] = entry["size"]
+                sz_total += sz
+                if i < top_n:
+                    sz_top += sz
+            return full, sz_top, sz_total
 
-        best_bid = float(top_bids[0]["price"]) if top_bids else None
-        best_ask = float(top_asks[0]["price"]) if top_asks else None
+        full_bids, bid_sz_5, bid_sz_total = _process_side(bids, self._top_n)
+        full_asks, ask_sz_5, ask_sz_total = _process_side(asks, self._top_n)
+
+        best_bid = float(bids[0]["price"]) if bids else None
+        best_ask = float(asks[0]["price"]) if asks else None
         mid = (best_bid + best_ask) / 2 if best_bid is not None and best_ask is not None else None
         spread = (best_ask - best_bid) if best_bid is not None and best_ask is not None else None
 
-        # Depth at top-N levels
-        bid_sz_5 = sum(float(b.get("size", 0)) for b in top_bids)
-        ask_sz_5 = sum(float(a.get("size", 0)) for a in top_asks)
         denom_5 = bid_sz_5 + ask_sz_5
         imbalance = (bid_sz_5 - ask_sz_5) / denom_5 if denom_5 > 0 else None
-
-        # Total depth across all levels
-        bid_sz_total = sum(float(b.get("size", 0)) for b in bids)
-        ask_sz_total = sum(float(a.get("size", 0)) for a in asks)
         denom_total = bid_sz_total + ask_sz_total
         imbalance_total = (bid_sz_total - ask_sz_total) / denom_total if denom_total > 0 else None
-
-        # Full book as compact dict
-        full_bids = {b["price"]: b["size"] for b in bids}
-        full_asks = {a["price"]: a["size"] for a in asks}
 
         return BookSummary(
             bid=best_bid, ask=best_ask, mid=mid, spread=spread, imbalance=imbalance,
