@@ -33,6 +33,7 @@ import yaml
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+from src.utils.crypto_feed import CryptoPriceFeed
 from rich.console import Console
 from rich.live import Live
 from rich.panel import Panel
@@ -72,6 +73,9 @@ _SLOT_OUTCOME_RETRY_S = 60.0  # retry unresolved slots every 60s
 # Server-clock offset: updated from HTTP Date: headers on each market fetch.
 # Compensates for WSL clock drift vs. Polymarket server time.
 _clock_offset: float = 0.0
+
+# Multi-asset: slug prefix for market discovery (set at startup from --asset flag)
+_slug_prefix: str = "btc-updown-5m"
 
 
 def _server_now() -> float:
@@ -201,7 +205,7 @@ def _discover_market() -> Optional[Dict[str, Any]]:
         return _market_cache
 
     slot = current_slot
-    slug = f"btc-updown-5m-{slot}"
+    slug = f"{_slug_prefix}-{slot}"
     try:
         resp = requests.get(
             "https://gamma-api.polymarket.com/events",
@@ -855,7 +859,7 @@ def _fetch_slot_open_from_binance(slot_ts: int) -> Optional[Tuple[float, str]]:
 
 def _fetch_slot_outcome_bg(slot_ts: int) -> None:
     """Background thread: fetch and cache the resolved outcome for a past slot."""
-    slug = f"btc-updown-5m-{slot_ts}"
+    slug = f"{_slug_prefix}-{slot_ts}"
     result: Optional[str] = None
     try:
         resp = requests.get(
@@ -1928,6 +1932,7 @@ def main() -> None:
         description="Live BTC/USDT price feed monitor",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    parser.add_argument("--asset",    default="BTC",           help="Asset to monitor: BTC, ETH, SOL, DOGE, XRP (default: BTC)")
     parser.add_argument("--symbol",   default=None,            help="Exchange symbol (Coinbase: BTC-USD, Binance.US: btcusd). Defaults to exchange's canonical symbol.")
     parser.add_argument("--exchange", default="coinbase",     choices=["coinbase", "binance_us"],
                         help="WebSocket price feed backend: 'coinbase' (wss://ws-feed.exchange.coinbase.com) or 'binance_us' (wss://stream.binance.us:9443)")
@@ -1951,16 +1956,22 @@ def main() -> None:
     if args.config == _default_config:
         args.config = _pick_config(args.config)
 
+    # Set up multi-asset slug prefix from --asset flag
+    global _slug_prefix
+    asset = args.asset.upper()
+    _slug_prefix = f"{asset.lower()}-updown-5m"
+
     # Suppress feed internal logs so they don't interfere with the TUI
     logging.getLogger("btc_feed").setLevel(logging.WARNING)
+    logging.getLogger("crypto_feed").setLevel(logging.WARNING)
     logging.getLogger("chainlink_feed").setLevel(logging.WARNING)
 
     # Resolve default symbol per exchange if not explicitly provided
-    _default_symbols = {"coinbase": "BTC-USD", "binance_us": "btcusd"}
-    symbol = args.symbol or _default_symbols[args.exchange]
+    _sym_maps = {"coinbase": CryptoPriceFeed.COINBASE_SYMBOLS, "binance_us": CryptoPriceFeed.BINANCE_SYMBOLS}
+    symbol = args.symbol or _sym_maps.get(args.exchange, {}).get(asset, f"{asset}-USD")
 
     console = Console()
-    console.print(f"\n[bold]BTC Feed Monitor[/bold] — connecting to [cyan]{symbol}[/cyan] via [cyan]{args.exchange}[/cyan]…")
+    console.print(f"\n[bold]{asset} Feed Monitor[/bold] — connecting to [cyan]{symbol}[/cyan] via [cyan]{args.exchange}[/cyan]…")
     console.print("[dim]Starting WebSocket feed…[/dim]\n")
 
     feed = BtcPriceFeed(symbol=symbol, exchange=args.exchange)
