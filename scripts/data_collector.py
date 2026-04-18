@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import glob
 import json
 import os
 import shutil
@@ -238,12 +237,14 @@ def _launch_daemons(
     env = {**os.environ, "PYTHONUNBUFFERED": "1"}
     procs: Dict[str, subprocess.Popen] = {}
 
-    # Single multi-asset price recorder
+    # Single multi-asset price recorder — pass base data dir, NOT the hourly subdir.
+    # record_crypto_1s.py handles its own hourly rotation via CsvSink._rotate_if_needed().
+    base_data_dir = os.path.dirname(os.path.dirname(paths["dir"]))  # data/YYYY-MM-DD/HH → data/
     price_cmd = [
         sys.executable, "scripts/record_crypto_1s.py",
         "--assets", *assets,
         "--exchange", exchange,
-        "--output-dir", paths["dir"],
+        "--output-dir", base_data_dir or "data",
         "--csv-only",
     ]
     procs["price"] = subprocess.Popen(price_cmd, cwd=_PROJECT_ROOT, env=env)
@@ -339,10 +340,10 @@ def main() -> None:
     print("=" * 60)
     print(f"  Assets:  {', '.join(assets)}")
     print(f"  Layout:  {args.data_dir}/YYYY-MM-DD/HH/")
-    print(f"           {{asset}}_1s.csv | snapshots_{{asset}}.jsonl | history_{{asset}}.csv")
+    print("           {asset}_1s.csv | snapshots_{asset}.jsonl | history_{asset}.csv")
     print(f"  Current: {paths['dir']}/")
     print(f"  S3 sync: {'s3://' + args.s3_bucket + '/' if s3_enabled else 'disabled'}")
-    print(f"\n  Press Ctrl+C to stop all.\n")
+    print("\n  Press Ctrl+C to stop all.\n")
 
     # Launch daemons for current hour
     procs = _launch_daemons(

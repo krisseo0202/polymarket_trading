@@ -1,8 +1,13 @@
 """Markov transition matrix + Monte Carlo simulator for Polymarket prices.
 
-Discretizes BTC prices into N states, builds a transition matrix from
-observed historical transitions, then simulates forward paths to estimate
-P(YES) = P(BTC at expiry >= strike).
+Composite state S_t = (price_bin, tte_bin, return_bin, micro_bin) captures
+price level, time-to-expiry, short-term momentum, and realized volatility.
+The transition matrix is built from observed state transitions, then forward
+paths are simulated to estimate P(YES) = P(BTC at expiry >= strike).
+
+During simulation, time-to-expiry advances deterministically (decrements
+each tick) while the other dimensions evolve stochastically via the
+learned transition matrix.
 
 The model implements the standard predict(snapshot) -> PredictionResult
 interface so it can plug directly into LogRegEdgeStrategy.
@@ -10,18 +15,24 @@ interface so it can plug directly into LogRegEdgeStrategy.
 Usage standalone:
 
     from src.models.markov_model import (
-        discretize, build_transition_matrix, simulate_paths,
-        estimate_p_yes, MarkovModel,
+        discretize, compute_features, build_composite_states,
+        build_transition_matrix, simulate_composite_paths,
+        estimate_p_yes_composite, MarkovModel,
     )
 
-    # From raw prices
-    states, edges = discretize(prices, n_states=50)
-    T = build_transition_matrix(states, n_states=50, smoothing=1e-6)
-    paths = simulate_paths(T, start_state=states[-1], n_steps=60, n_paths=5000)
-    p_up = estimate_p_yes(paths, edges, strike=prices[-1])
+    # Compute features and composite states
+    features = compute_features(prices, timestamps, expiry_ts)
+    states, edges, dims = build_composite_states(features)
+    T = build_transition_matrix(states, n_states=np.prod(dims), smoothing=1e-4)
+
+    # Simulate with TTE correction
+    tte_schedule = ...  # TTE bin at each simulation step
+    paths = simulate_composite_paths(T, states[-1], n_steps=60,
+                                     dims=dims, tte_schedule=tte_schedule)
+    p_up = estimate_p_yes_composite(paths, edges["price"], dims, strike)
 
     # Or via the model object (live-compatible)
-    model = MarkovModel(n_states=50, n_paths=5000, smoothing=1e-6)
+    model = MarkovModel()
     result = model.predict(snapshot)
     print(result.prob_yes, result.feature_status)
 """
@@ -32,6 +43,7 @@ import logging
 from typing import Mapping, Optional
 
 import numpy as np
+import pandas as pd
 
 from .xgb_model import PredictionResult
 from .feature_builder import parse_strike_price
@@ -221,41 +233,249 @@ def estimate_p_yes(
 
 
 # ---------------------------------------------------------------------------
+# Composite state functions (multi-dimensional Markov state)
+# ---------------------------------------------------------------------------
+
+def compute_features(
+    prices: np.ndarray,
+    timestamps: np.ndarray,
+    expiry_ts: float,
+    return_lookback: int = 5,
+    vol_lookback: int = 15,
+) -> dict[str, np.ndarray]:
+    """Compute per-tick features for composite Markov state.
+
+    Args:
+        prices: 1-D array of BTC prices (one per second).
+        timestamps: 1-D array of Unix timestamps matching prices.
+        expiry_ts: Slot expiry Unix timestamp.
+        return_lookback: Number of ticks for rolling return (default 5s).
+        vol_lookback: Number of ticks for realized volatility (default 15s).
+
+    Returns:
+        Dict with keys: price, tte, returns, micro — each a 1-D array.
+    """
+    n = len(prices)
+    prices = np.asarray(prices, dtype=float)
+    timestamps = np.asarray(timestamps, dtype=float)
+
+    # Time to expiry (seconds remaining)
+    tte = np.maximum(0.0, expiry_ts - timestamps)
+
+    # Rolling returns: (price[t] - price[t - lookback]) / price[t - lookback]
+    returns = np.zeros(n)
+    if n > return_lookback:
+        past = prices[:-return_lookback]
+        returns[return_lookback:] = (
+            (prices[return_lookback:] - past) / np.maximum(past, 1e-10)
+        )
+
+    # Microstructure: rolling realized volatility (std of 1s log returns)
+    log_ret = np.zeros(n)
+    if n > 1:
+        log_ret[1:] = np.diff(np.log(np.maximum(prices, 1e-10)))
+    micro = pd.Series(log_ret).rolling(vol_lookback, min_periods=2).std().to_numpy()
+    micro = np.nan_to_num(micro, nan=0.0)
+
+    return {"price": prices, "tte": tte, "returns": returns, "micro": micro}
+
+
+def build_composite_states(
+    features: dict[str, np.ndarray],
+    n_price: int = 15,
+    n_tte: int = 4,
+    n_return: int = 5,
+    n_micro: int = 3,
+    edges: Optional[dict[str, np.ndarray]] = None,
+) -> tuple[np.ndarray, dict[str, np.ndarray], tuple[int, int, int, int]]:
+    """Discretize per-tick features into composite state indices.
+
+    Args:
+        features: Dict from compute_features() with keys price/tte/returns/micro.
+        n_price, n_tte, n_return, n_micro: Bin counts per dimension.
+        edges: Optional pre-computed bin edges (dict of arrays). If None,
+               edges are derived from the data.
+
+    Returns:
+        (states, edges_out, dims) where:
+            states: 1-D int array of flat composite state indices
+            edges_out: dict of bin edges per dimension
+            dims: (n_price, n_tte, n_return, n_micro)
+    """
+    dims = (n_price, n_tte, n_return, n_micro)
+    if edges is None:
+        edges = {}
+
+    pb, pe = discretize(features["price"], n_price, edges.get("price"))
+    tb, te = discretize(features["tte"], n_tte, edges.get("tte"))
+    rb, re = discretize(features["returns"], n_return, edges.get("returns"))
+    mb, me = discretize(features["micro"], n_micro, edges.get("micro"))
+
+    edges_out = {"price": pe, "tte": te, "returns": re, "micro": me}
+    states = encode_composite(pb, tb, rb, mb, dims)
+    return states, edges_out, dims
+
+
+def encode_composite(
+    price_bin: np.ndarray,
+    tte_bin: np.ndarray,
+    return_bin: np.ndarray,
+    micro_bin: np.ndarray,
+    dims: tuple[int, int, int, int],
+) -> np.ndarray:
+    """Encode component bins into a flat composite state index."""
+    coords = np.array([
+        np.asarray(price_bin), np.asarray(tte_bin),
+        np.asarray(return_bin), np.asarray(micro_bin),
+    ])
+    return np.ravel_multi_index(coords, dims, mode="clip")
+
+
+def decode_composite(
+    states: np.ndarray,
+    dims: tuple[int, int, int, int],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Decode flat composite index to (price_bin, tte_bin, return_bin, micro_bin)."""
+    return np.unravel_index(np.asarray(states).clip(0, np.prod(dims) - 1), dims)
+
+
+def simulate_composite_paths(
+    T: np.ndarray,
+    start_state: int,
+    n_steps: int,
+    dims: tuple[int, int, int, int],
+    tte_schedule: np.ndarray,
+    n_paths: int = 5000,
+    rng: Optional[np.random.Generator] = None,
+) -> np.ndarray:
+    """Simulate composite Markov paths with deterministic TTE progression.
+
+    At each step the chain proposes a full composite next-state, then the
+    TTE component is overridden to match the known TTE schedule (TTE
+    decreases deterministically toward 0 at expiry).
+
+    Args:
+        T: Row-stochastic transition matrix (n_total x n_total).
+        start_state: Flat composite state index to start from.
+        n_steps: Number of forward steps (≈ seconds to expiry).
+        dims: (n_price, n_tte, n_return, n_micro).
+        tte_schedule: 1-D int array of TTE bin indices at each step
+                      (length >= n_steps + 1).
+        n_paths: Number of independent paths.
+        rng: Optional numpy Generator for reproducibility.
+
+    Returns:
+        (n_paths, n_steps + 1) integer array of composite state indices.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    n_total = int(np.prod(dims))
+    n_price, n_tte, n_return, n_micro = dims
+    start_state = int(np.clip(start_state, 0, n_total - 1))
+
+    paths = np.empty((n_paths, n_steps + 1), dtype=int)
+    paths[:, 0] = start_state
+
+    cumprobs = np.cumsum(T, axis=1)
+
+    for t in range(n_steps):
+        current = paths[:, t]
+        u = rng.random(n_paths)
+        # searchsorted is O(n_paths * log(n_total)) vs boolean matrix O(n_paths * n_total)
+        next_state = np.array([
+            np.searchsorted(cumprobs[c], u_i) for c, u_i in zip(current, u)
+        ]).clip(0, n_total - 1)
+
+        # Decode, override TTE bin, re-encode
+        pb, _, rb, mb = decode_composite(next_state, dims)
+
+        tte_idx = min(t + 1, len(tte_schedule) - 1)
+        tb_val = int(np.clip(tte_schedule[tte_idx], 0, n_tte - 1))
+
+        paths[:, t + 1] = encode_composite(
+            pb, np.full(n_paths, tb_val, dtype=int), rb, mb, dims,
+        )
+
+    return paths
+
+
+def estimate_p_yes_composite(
+    paths: np.ndarray,
+    price_edges: np.ndarray,
+    dims: tuple[int, int, int, int],
+    strike: float,
+) -> float:
+    """Estimate P(YES) from composite terminal states.
+
+    Extracts the price-bin component from each terminal composite state,
+    maps it to a price midpoint, and counts what fraction >= strike.
+    """
+    n_price = dims[0]
+    terminal = paths[:, -1]
+    price_bins, _, _, _ = decode_composite(terminal, dims)
+    price_bins = np.clip(price_bins, 0, n_price - 1)
+    midpoints = 0.5 * (price_edges[:-1] + price_edges[1:])
+    terminal_prices = midpoints[price_bins]
+    return float((terminal_prices >= strike).mean())
+
+
+# ---------------------------------------------------------------------------
 # Model class — predict(snapshot) -> PredictionResult interface
 # ---------------------------------------------------------------------------
 
 class MarkovModel:
-    """Markov chain Monte Carlo model for BTC 5-minute Up/Down markets.
+    """Composite-state Markov chain Monte Carlo model for BTC 5-min markets.
 
-    Fits a transition matrix on the trailing BTC price history available in
-    the snapshot, then simulates forward paths to the slot expiry.
+    State S_t = (price_bin, tte_bin, return_bin, micro_bin) captures:
+      - price_bin:  BTC price level
+      - tte_bin:    time-to-expiry (deterministic during simulation)
+      - return_bin: short-term BTC return (momentum)
+      - micro_bin:  realized volatility (microstructure)
+
+    Fits a transition matrix on the trailing BTC history, then simulates
+    forward composite paths to the slot expiry to estimate P(YES).
 
     Parameters:
-        n_states: Number of discrete price bins (higher = finer resolution
-                  but sparser transitions; 50 is a good default for ~300
-                  1s observations in a 5-minute window).
+        n_price_bins: Discrete bins for BTC price.
+        n_tte_bins:   Discrete bins for time-to-expiry.
+        n_return_bins: Discrete bins for rolling return.
+        n_micro_bins: Discrete bins for realized volatility.
         n_paths: Number of Monte Carlo forward paths.
-        smoothing: Laplace smoothing constant for the transition matrix.
-        lookback_s: How many seconds of BTC history to use for fitting
-                    (default 600 = 10 minutes).
+        smoothing: Laplace smoothing for the transition matrix (higher
+                   values needed because composite state space is larger).
+        lookback_s: Seconds of BTC history used for fitting (default 600).
+        return_lookback: Ticks for rolling return (default 5s).
+        vol_lookback: Ticks for realized volatility (default 15s).
         seed: Random seed for reproducibility (None = non-deterministic).
     """
 
-    MODEL_VERSION = "markov_mc_v1"
+    MODEL_VERSION = "markov_mc_v2"
 
     def __init__(
         self,
-        n_states: int = 50,
+        n_price_bins: int = 15,
+        n_tte_bins: int = 4,
+        n_return_bins: int = 5,
+        n_micro_bins: int = 3,
         n_paths: int = 5000,
-        smoothing: float = 1e-6,
+        smoothing: float = 1e-4,
         lookback_s: float = 600.0,
+        return_lookback: int = 5,
+        vol_lookback: int = 15,
         seed: Optional[int] = None,
         logger: Optional[logging.Logger] = None,
     ):
-        self.n_states = n_states
+        self.n_price_bins = n_price_bins
+        self.n_tte_bins = n_tte_bins
+        self.n_return_bins = n_return_bins
+        self.n_micro_bins = n_micro_bins
+        self.dims = (n_price_bins, n_tte_bins, n_return_bins, n_micro_bins)
         self.n_paths = n_paths
         self.smoothing = smoothing
         self.lookback_s = lookback_s
+        self.return_lookback = return_lookback
+        self.vol_lookback = vol_lookback
         self._rng = np.random.default_rng(seed)
         self.logger = logger or logging.getLogger(__name__)
         self.ready = True
@@ -268,7 +488,7 @@ class MarkovModel:
         return self.MODEL_VERSION
 
     def predict(self, snapshot: Mapping[str, object]) -> PredictionResult:
-        """Estimate P(YES) using Markov chain Monte Carlo simulation.
+        """Estimate P(YES) using composite-state Markov chain MC simulation.
 
         Snapshot keys consumed:
             btc_prices: list of (ts, price[, volume]) tuples
@@ -277,7 +497,7 @@ class MarkovModel:
             now_ts: float (optional)
         """
         btc_prices: list = list(snapshot.get("btc_prices") or [])
-        if len(btc_prices) < 15:
+        if len(btc_prices) < 30:
             return PredictionResult(None, self.MODEL_VERSION, "insufficient_btc_history")
 
         now_ts = float(snapshot.get("now_ts") or btc_prices[-1][0])
@@ -298,22 +518,36 @@ class MarkovModel:
         slot_expiry_ts = snapshot.get("slot_expiry_ts")
         if slot_expiry_ts is None:
             return PredictionResult(None, self.MODEL_VERSION, "missing_expiry")
-        tte = max(0.0, float(slot_expiry_ts) - now_ts)
+        slot_expiry_ts = float(slot_expiry_ts)
+        tte = max(0.0, slot_expiry_ts - now_ts)
 
-        # Extract price series within lookback window.
+        # Extract price/timestamp series within lookback window.
         ts_arr = np.array([float(p[0]) for p in btc_prices])
         px_arr = np.array([float(p[1]) for p in btc_prices])
         mask = ts_arr >= (now_ts - self.lookback_s)
+        ts_window = ts_arr[mask]
         px_window = px_arr[mask]
-        if len(px_window) < 10:
+        if len(px_window) < 30:
             return PredictionResult(None, self.MODEL_VERSION, "insufficient_window")
 
         try:
-            # Discretize
-            states, edges = discretize(px_window, n_states=self.n_states)
+            # Compute per-tick features
+            features = compute_features(
+                px_window, ts_window, slot_expiry_ts,
+                self.return_lookback, self.vol_lookback,
+            )
 
-            # Build transition matrix
-            T = build_transition_matrix(states, self.n_states, self.smoothing)
+            # Build composite states
+            states, edges, dims = build_composite_states(
+                features,
+                self.n_price_bins, self.n_tte_bins,
+                self.n_return_bins, self.n_micro_bins,
+            )
+
+            # Build transition matrix on composite state space
+            T = build_transition_matrix(
+                states, int(np.prod(self.dims)), self.smoothing,
+            )
 
             # Validate
             warnings = validate_transition_matrix(T)
@@ -321,30 +555,44 @@ class MarkovModel:
                 for w in warnings:
                     self.logger.warning("Markov T matrix: %s", w)
 
-            # Number of forward steps ≈ seconds remaining (1s per BTC tick).
+            # TTE schedule: bin the decreasing TTE at each simulation step
             n_steps = max(1, int(round(tte)))
+            tte_values = np.maximum(0.0, tte - np.arange(n_steps + 1))
+            tte_schedule = np.clip(
+                np.digitize(tte_values, edges["tte"]) - 1,
+                0, self.n_tte_bins - 1,
+            )
 
-            # Simulate
-            paths = simulate_paths(
-                T, start_state=states[-1],
-                n_steps=n_steps, n_paths=self.n_paths,
-                rng=self._rng,
+            # Simulate composite paths
+            paths = simulate_composite_paths(
+                T, start_state=int(states[-1]),
+                n_steps=n_steps, dims=dims,
+                tte_schedule=tte_schedule,
+                n_paths=self.n_paths, rng=self._rng,
             )
 
             # Estimate P(YES)
-            p_yes = estimate_p_yes(paths, edges, strike_price)
+            p_yes = estimate_p_yes_composite(
+                paths, edges["price"], dims, strike_price,
+            )
 
-            # Populate observability features.
-            midpoints = 0.5 * (edges[:-1] + edges[1:])
-            terminal_prices = midpoints[np.clip(paths[:, -1], 0, len(midpoints) - 1)]
+            # Observability: terminal price distribution
+            price_bins, _, _, _ = decode_composite(paths[:, -1], dims)
+            price_bins = np.clip(price_bins, 0, self.n_price_bins - 1)
+            midpoints = 0.5 * (edges["price"][:-1] + edges["price"][1:])
+            terminal_prices = midpoints[price_bins]
+
             self.last_features = {
                 "n_observations": int(len(px_window)),
+                "dims": self.dims,
+                "n_total_states": int(np.prod(self.dims)),
                 "n_states_occupied": int(len(np.unique(states))),
                 "n_steps": n_steps,
                 "n_paths": self.n_paths,
                 "smoothing": self.smoothing,
                 "strike": strike_price,
                 "current_price": btc_mid,
+                "current_tte": round(tte, 1),
                 "p_yes": p_yes,
                 "terminal_mean": float(terminal_prices.mean()),
                 "terminal_std": float(terminal_prices.std()),

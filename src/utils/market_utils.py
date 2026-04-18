@@ -175,16 +175,17 @@ def parse_event_market(event: dict) -> Optional[Dict]:
     return None
 
 
-def find_btc_updown_market(
+def find_updown_market(
     keywords: List[str],
     min_volume: int,
     logger,
+    slug_prefix: str = "btc-updown-5m",
 ) -> Optional[Dict]:
     """
-    Discover the current BTC Up/Down 5-minute market.
+    Discover the current Up/Down 5-minute market for any asset.
 
     Discovery order:
-      1. Slug-based lookup: gamma-api /events?slug=btc-updown-5m-{slot}
+      1. Slug-based lookup: gamma-api /events?slug={slug_prefix}-{slot}
       2. Keyword search across gamma-api events (min_volume filter).
       3. Keyword search across gamma-api /markets endpoint.
 
@@ -195,7 +196,7 @@ def find_btc_updown_market(
 
     # 1. Slug-based lookup (fastest, most precise)
     slot = int(math.floor(get_server_time() / 300) * 300)
-    slug = f"btc-updown-5m-{slot}"
+    slug = f"{slug_prefix}-{slot}"
     try:
         resp = requests.get(
             "https://gamma-api.polymarket.com/events",
@@ -277,7 +278,7 @@ def find_btc_updown_market(
     except Exception as e:
         logger.warning(f"gamma-api/markets search failed: {e}")
 
-    logger.warning("BTC Up/Down market not found this cycle")
+    logger.warning(f"Up/Down market not found this cycle (slug_prefix={slug_prefix})")
     return None
 
 
