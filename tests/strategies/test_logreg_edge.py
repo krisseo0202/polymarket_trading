@@ -3,12 +3,10 @@
 import time
 from unittest.mock import MagicMock
 
-import numpy as np
-import pytest
 
-from src.api.types import OrderBook, OrderBookEntry, Position
-from src.models.logreg_model import LogRegModel, LR_FEATURES
-from src.models.xgb_model import PredictionResult
+from src.api.types import OrderBook, OrderBookEntry
+from src.models.logreg_model import LogRegModel
+from src.models.prediction import PredictionResult
 from src.strategies.logreg_edge import LogRegEdgeStrategy
 
 

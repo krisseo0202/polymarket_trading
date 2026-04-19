@@ -20,14 +20,17 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Deque, List, Literal, Optional, Tuple
 
 Exchange = Literal["coinbase", "binance", "binance_us"]
 
 _STALE_WARN_S = 2.0
 _RECONNECT_S = 5.0
-_BUFFER_S = 300.0
+# Buffer window: sized to cover the 4-hour multi-TF indicator warmup (needs
+# ~3 days for 4h TD Sequential setup + countdown). Prior to multi-TF this was
+# 300s; the bump adds ~6 MB of memory per feed and is O(1) for append/trim.
+_BUFFER_S = 3 * 86400.0
 _BACKOFF_INIT = 1.0
 _BACKOFF_MAX = 60.0
 
@@ -148,6 +151,53 @@ class BtcPriceFeed:
             cutoff = now - self._buffer_s
             while self._buffer and self._buffer[0][0] < cutoff:
                 self._buffer.popleft()
+
+    def warmup_from_binance(self, days: int = 3) -> int:
+        """Pre-populate the rolling buffer with Binance 1s klines.
+
+        Multi-timeframe indicators (4h TD/UT/RSI) need ≥2 days of history
+        before they produce meaningful values. Call this after ``start()``
+        and before trading begins. Safe to call on feeds that were just
+        started — the warmup entries carry their Binance exchange timestamps,
+        so live WebSocket ticks arriving afterward append in chronological
+        order.
+
+        Args:
+            days: days of history to fetch.
+
+        Returns:
+            Number of bars loaded into the buffer.
+        """
+        # Deferred import: binance_historical depends on pandas; keep btc_feed
+        # import-cheap for modules that don't need warmup.
+        from .binance_historical import fetch_btc_klines
+
+        end_ts = time.time()
+        start_ts = end_ts - days * 86400
+        self._logger.info("Binance warmup: fetching %d days of 1s BTC klines", days)
+        df = fetch_btc_klines(start_ts, end_ts, interval="1s", logger=self._logger)
+        if df.empty:
+            self._logger.warning("Binance warmup returned no bars")
+            return 0
+
+        # Buffer must stay ordered. We append warmup entries under the lock,
+        # drop any that fall outside the rolling window, and tolerate live
+        # ticks that may have arrived concurrently.
+        with self._lock:
+            warmup_cutoff = time.time() - self._buffer_s
+            existing = list(self._buffer)
+            self._buffer.clear()
+            for row in df.itertuples(index=False):
+                ts = float(row.timestamp)
+                if ts >= warmup_cutoff:
+                    self._buffer.append((ts, float(row.close), 1.0))
+            # Re-append any live ticks that raced in during the fetch.
+            for tick in existing:
+                if tick[0] > (self._buffer[-1][0] if self._buffer else 0):
+                    self._buffer.append(tick)
+
+        self._logger.info("Binance warmup loaded %d bars into buffer", len(self._buffer))
+        return len(self._buffer)
 
     # ── WebSocket loop ────────────────────────────────────────────────────
 

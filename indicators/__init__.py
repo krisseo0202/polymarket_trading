@@ -9,7 +9,9 @@ from .base import (
     SignalType,
 )
 from .fvg import FVGIndicator, FVGRecord
+from .rsi import RSIIndicator
 from .td_sequential import TDSequentialIndicator
+from .ut_bot import UTBotIndicator
 
 __all__ = [
     "Indicator",
@@ -20,5 +22,7 @@ __all__ = [
     "SignalType",
     "FVGIndicator",
     "FVGRecord",
+    "RSIIndicator",
     "TDSequentialIndicator",
+    "UTBotIndicator",
 ]

@@ -3,7 +3,7 @@
 import logging
 import os
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import yaml
@@ -14,25 +14,21 @@ from ..engine.execution import ExecutionTracker
 from ..engine.inventory import InventoryState
 from ..engine.performance_store import PerformanceStore
 from ..engine.risk_manager import RiskLimits, RiskManager
-from ..engine.slot_state import SLOT_INTERVAL_S, SlotStateManager
+from ..engine.slot_state import SlotStateManager
 from ..engine.state_store import BotState, StateStore
 from ..models import BTCSigmoidModel
 from ..models.logreg_model import LogRegModel
 from ..models.logreg_v4_model import LogRegV4Model
-from ..strategies.btc_updown import BTCUpDownStrategy
-from ..strategies.btc_updown_xgb import BTCUpDownXGBStrategy
-from ..strategies.btc_vol_reversion import BTCVolatilityReversionStrategy
 from ..strategies.coin_toss import CoinTossStrategy
 from ..strategies.logreg_edge import LogRegEdgeStrategy
 from ..strategies.prob_edge import ProbEdgeStrategy
-from ..strategies.td_rsi import TDRSIStrategy
 from ..utils.btc_feed import BtcPriceFeed
 from ..utils.chainlink_feed import ChainlinkFeed
 from ..utils.config import load_config
 from ..utils.logger import setup_logger
 from ..utils.market_utils import get_server_time
 
-STRATEGIES = ["btc_updown", "btc_updown_xgb", "btc_vol_reversion", "coin_toss", "logreg_edge", "logreg", "prob_edge", "td_rsi"]
+STRATEGIES = ["coin_toss", "logreg_edge", "logreg", "prob_edge"]
 
 # The `logreg` strategy loads the v4 model (18 features + isotonic calibration)
 # from models/logreg_v4 via LogRegV4Model. This is the single supported live
@@ -70,6 +66,10 @@ class Services:
     # on a rolling window of live data. None if disabled or not applicable
     # to the active strategy.
     retrainer: Optional[Any] = None
+    # Multi-asset support: slug prefix for market discovery (e.g. "btc-updown-5m")
+    slug_prefix: str = "btc-updown-5m"
+    # Active asset ticker (e.g. "BTC", "ETH", "SOL", "DOGE", "XRP")
+    asset: str = "BTC"
 
 
 def init_services(args) -> Services:
@@ -81,11 +81,26 @@ def init_services(args) -> Services:
         with open("config/config.yaml", "r") as f:
             raw_yaml = yaml.safe_load(f) or {}
 
-    bot_cfg = raw_yaml.get("btc_updown_bot", {})
-    market_keywords: List[str] = bot_cfg.get("market_keywords", ["Bitcoin", "Up or Down"])
+    bot_cfg = raw_yaml.get("updown_bot", raw_yaml.get("btc_updown_bot", {}))
     state_file: str = bot_cfg.get("state_file", "bot_state.json")
     min_volume: int = int(bot_cfg.get("min_volume", 1_000_000))
     interval: int = int(raw_yaml.get("trading", {}).get("interval", 300))
+
+    # Resolve active asset from CLI --asset flag or config default
+    asset: str = (getattr(args, "asset", None) or bot_cfg.get("default_asset", "BTC")).upper()
+    all_assets: dict = raw_yaml.get("assets", {})
+    asset_cfg: dict = all_assets.get(asset, {})
+    if not asset_cfg:
+        # Fallback defaults for BTC when assets section is missing
+        asset_cfg = {
+            "slug_prefix": "btc-updown-5m",
+            "market_keywords": ["Bitcoin", "Up or Down"],
+            "chainlink_symbol": "btc/usd",
+            "price_symbol": "BTC-USD",
+            "price_exchange": "coinbase",
+        }
+    slug_prefix: str = asset_cfg.get("slug_prefix", "btc-updown-5m")
+    market_keywords: List[str] = asset_cfg.get("market_keywords", bot_cfg.get("market_keywords", ["Bitcoin", "Up or Down"]))
 
     paper_trading: bool = cfg.paper_trading
     if getattr(args, "live", False):
@@ -96,11 +111,11 @@ def init_services(args) -> Services:
     strategy_name: str
     if args.strategy is None and sys.stdin.isatty() and not getattr(args, "no_confirm", False):
         strategy_name, paper_trading = prompt_strategy_and_mode(
-            default_strategy="btc_updown_xgb",
+            default_strategy="logreg_edge",
             default_paper=paper_trading,
         )
     else:
-        strategy_name = args.strategy or "btc_updown_xgb"
+        strategy_name = args.strategy or "logreg_edge"
 
     strategy_cfg: dict = cfg.strategies.get(strategy_name, {})
 
@@ -158,8 +173,15 @@ def init_services(args) -> Services:
     if price_tick_path:
         os.makedirs(os.path.dirname(price_tick_path), exist_ok=True)
 
+    # Apply asset-level defaults for price symbol/exchange into strategy config
+    # so strategies don't need to know about the asset layer — they just read btc_symbol / btc_exchange.
+    if "btc_symbol" not in strategy_cfg:
+        strategy_cfg["btc_symbol"] = asset_cfg.get("price_symbol", "BTC-USD")
+    if "btc_exchange" not in strategy_cfg:
+        strategy_cfg["btc_exchange"] = asset_cfg.get("price_exchange", "coinbase")
+
     logger.info(
-        f"Starting bot | strategy={strategy_name} | paper_trading={paper_trading} | interval={interval}s"
+        f"Starting bot | asset={asset} | strategy={strategy_name} | paper_trading={paper_trading} | interval={interval}s"
     )
 
     from ..utils.vpn import check_vpn
@@ -196,23 +218,28 @@ def init_services(args) -> Services:
         positions_sync_interval_s=10.0,
     )
 
+    def _maybe_warmup(feed: BtcPriceFeed) -> None:
+        """Seed the BTC feed buffer with 3 days of Binance 1s klines so
+        multi-timeframe indicator features (rsi_*, ut_*_, td_*_) are live
+        from the first cycle rather than zero-filled."""
+        try:
+            feed.warmup_from_binance(days=3)
+        except Exception as e:
+            # Warmup is opportunistic — a transient Binance outage shouldn't
+            # block the bot from starting.
+            logger.warning("Binance warmup skipped: %s", e)
+
     btc_feed: Optional[BtcPriceFeed] = None
     _retrainer: Optional[Any] = None  # set only by the `logreg` branch when enabled
     if strategy_name == "coin_toss":
         strategy = CoinTossStrategy(config=strategy_cfg)
-    elif strategy_name == "btc_updown_xgb":
-        btc_feed = BtcPriceFeed(
-            symbol=str(strategy_cfg.get("btc_symbol", "BTC-USD")),
-            exchange=str(strategy_cfg.get("btc_exchange", "coinbase")),
-            logger=logger,
-        ).start()
-        strategy = BTCUpDownXGBStrategy(config=strategy_cfg, btc_feed=btc_feed, logger=logger)
     elif strategy_name == "logreg_edge":
         btc_feed = BtcPriceFeed(
             symbol=str(strategy_cfg.get("btc_symbol", "BTC-USD")),
             exchange=str(strategy_cfg.get("btc_exchange", "coinbase")),
             logger=logger,
         ).start()
+        _maybe_warmup(btc_feed)
         model_dir = str(strategy_cfg.get("model_dir", "models/logreg"))
         logreg_model = LogRegModel.load(model_dir, logger=logger)
         if not logreg_model.ready:
@@ -229,6 +256,7 @@ def init_services(args) -> Services:
             exchange=str(strategy_cfg.get("btc_exchange", "coinbase")),
             logger=logger,
         ).start()
+        _maybe_warmup(btc_feed)
         model_dir = str(strategy_cfg.get("model_dir", LOGREG_MODEL_DIR))
         v4_model = LogRegV4Model.load(model_dir, logger=logger)
         if not v4_model.ready:
@@ -259,33 +287,28 @@ def init_services(args) -> Services:
             exchange=str(strategy_cfg.get("btc_exchange", "coinbase")),
             logger=logger,
         ).start()
+        _maybe_warmup(btc_feed)
         strategy = ProbEdgeStrategy(
             config=strategy_cfg,
             btc_feed=btc_feed,
             model_service=BTCSigmoidModel(logger=logger),
             logger=logger,
         )
-    elif strategy_name == "td_rsi":
-        btc_feed = BtcPriceFeed(
-            symbol=str(strategy_cfg.get("btc_symbol", "BTC-USD")),
-            exchange=str(strategy_cfg.get("btc_exchange", "coinbase")),
-            logger=logger,
-        ).start()
-        strategy = TDRSIStrategy(config=strategy_cfg, btc_feed=btc_feed, logger=logger)
-    elif strategy_name == "btc_vol_reversion":
-        strategy = BTCVolatilityReversionStrategy(config=strategy_cfg)
     else:
-        strategy = BTCUpDownStrategy(config=strategy_cfg)
+        raise ValueError(
+            f"Unknown strategy '{strategy_name}'. Valid: {', '.join(STRATEGIES)}"
+        )
 
     chainlink_cfg = raw_yaml.get("chainlink_feed", {})
+    chainlink_symbol = asset_cfg.get("chainlink_symbol", chainlink_cfg.get("symbol", "btc/usd"))
     chainlink_feed: Optional[ChainlinkFeed] = None
     if chainlink_cfg.get("enabled", True):
         chainlink_feed = ChainlinkFeed(
-            symbol=chainlink_cfg.get("symbol", "btc/usd"),
+            symbol=chainlink_symbol,
             slot_interval_s=interval,
             logger=logger,
         ).start()
-        logger.info("Chainlink reference price feed started")
+        logger.info(f"Chainlink reference price feed started (symbol={chainlink_symbol})")
 
     slot_mgr = SlotStateManager(clock_fn=get_server_time, logger=logger)
 
@@ -331,6 +354,8 @@ def init_services(args) -> Services:
         price_tick_path=price_tick_path,
         bot_start_ts=time.time(),
         retrainer=_retrainer,
+        slug_prefix=slug_prefix,
+        asset=asset,
     )
 
 

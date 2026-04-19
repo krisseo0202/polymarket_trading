@@ -704,8 +704,6 @@ def _build_pnl_panel(
     session_wins = bot_state.get("session_wins", 0)
     session_losses = bot_state.get("session_losses", 0)
 
-    rpnl_style = "green" if daily_pnl >= 0 else "red"
-
     total_trades = session_wins + session_losses
     if total_trades > 0:
         win_rate = session_wins / total_trades
@@ -716,29 +714,26 @@ def _build_pnl_panel(
         wr_style = "dim"
 
     slot_pnl = bot_state.get("slot_realized_pnl", 0.0)
-    slot_style = "green" if slot_pnl >= 0 else "red"
     last_slot_pnl = bot_state.get("last_slot_pnl", 0.0)
     last_slot_outcome = bot_state.get("last_slot_outcome", "")
 
     tbl = Table(show_header=False, box=None, padding=(0, 1), expand=True)
     tbl.add_column(style="dim", width=10)
     tbl.add_column(justify="right")
-    tbl.add_row("Slot PnL", Text(f"{slot_pnl:+.4f}", style=f"bold {slot_style}"))
+    tbl.add_row("Slot PnL", _fmt_pnl(slot_pnl))
     # Show the just-settled slot's PnL so the user sees the result of a
     # hold-to-expiry resolution immediately after rollover, when
     # slot_realized_pnl has already been reset to 0.0 for the new slot.
     if last_slot_pnl != 0.0 or last_slot_outcome:
-        ls_style = "green" if last_slot_pnl >= 0 else "red"
-        outcome_tag = f" ({last_slot_outcome})" if last_slot_outcome else ""
-        tbl.add_row("Last Slot", Text(f"{last_slot_pnl:+.4f}{outcome_tag}", style=ls_style))
-    tbl.add_row("Daily", Text(f"{daily_pnl:+.4f}", style=f"bold {rpnl_style}"))
+        ls_cell = _fmt_pnl(last_slot_pnl)
+        if last_slot_outcome:
+            ls_cell.append(f" ({last_slot_outcome})", style="dim")
+        tbl.add_row("Last Slot", ls_cell)
+    tbl.add_row("Daily", _fmt_pnl(daily_pnl))
 
     if total_upnl is not None:
-        upnl_style = "green" if total_upnl >= 0 else "red"
-        tbl.add_row("Unreal.", Text(f"{total_upnl:+.4f}", style=f"bold {upnl_style}"))
-        combined = daily_pnl + total_upnl
-        comb_style = "green" if combined >= 0 else "red"
-        tbl.add_row("Total", Text(f"{combined:+.4f}", style=f"bold {comb_style}"))
+        tbl.add_row("Unreal.", _fmt_pnl(total_upnl))
+        tbl.add_row("Total", _fmt_pnl(daily_pnl + total_upnl))
 
     tbl.add_row("Trades", Text(str(total_trades), style="white"))
     tbl.add_row("Win Rate", Text(wr_str, style=wr_style))
@@ -1044,7 +1039,7 @@ def _build_market_cycle_panel(
         tbl.add_row("BTC Now", Text("–", style="dim"))
         tbl.add_row("Delta", Text("–", style="dim"))
 
-    return Panel(tbl, title="[dim]Market Cycle[/dim]", border_style="dim")
+    return Panel(tbl, title="[bold]Market Cycle[/bold]", border_style="cyan")
 
 
 # ── Strategy panel ────────────────────────────────────────────────────────────
@@ -1193,7 +1188,8 @@ def _build_strategy_panel(
 
     model_version = _pick("strategy_model_version", "")
     if model_version:
-        tbl.add_row("Model", Text(model_version[-18:], style="white"))
+        shown = "…" + model_version[-17:] if len(model_version) > 18 else model_version
+        tbl.add_row("Model", Text(shown, style="white"))
 
     feature_status = _pick("strategy_feature_status", "")
     if feature_status:
@@ -1210,7 +1206,7 @@ def _build_strategy_panel(
     else:
         tbl.add_row("Last sig", Text("–", style="dim"))
 
-    return Panel(tbl, title="[dim]Strategy[/dim]", border_style="dim")
+    return Panel(tbl, title="[bold]Strategy[/bold]", border_style="cyan")
 
 
 # ── Trades panel helpers ──────────────────────────────────────────────────────
@@ -1271,10 +1267,10 @@ def _fmt_tte(seconds: Optional[float]) -> str:
 
 
 def _fmt_slot(slot_expiry_ts: Optional[float]) -> str:
-    """Render a slot expiry timestamp as a local HH:MM label."""
+    """Render a slot expiry timestamp as a UTC HH:MM label (matches Slot History + Market Cycle)."""
     if not slot_expiry_ts:
         return "—"
-    return datetime.fromtimestamp(float(slot_expiry_ts)).strftime("%H:%M")
+    return datetime.fromtimestamp(float(slot_expiry_ts), tz=timezone.utc).strftime("%H:%M")
 
 
 def _build_trade_log_panel(
@@ -1493,7 +1489,7 @@ def _build_log_panel(log_file: str, n: int = 18) -> Panel:
         elif " - WARNING - " in line:
             style = "bold yellow"
         elif " - INFO - " in line:
-            style = "cyan"
+            style = "white"
         else:
             style = "dim"
         text.append(line + "\n", style=style)

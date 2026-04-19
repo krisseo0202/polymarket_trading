@@ -1,12 +1,28 @@
-"""Shared schema and defaults for the BTC Up/Down XGBoost model."""
+"""Shared feature schema and default thresholds for BTC Up/Down models."""
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from typing import Dict, List
 
+# Timeframe tokens used by multi-TF indicator features. Source of truth:
+# src/models/multi_tf_features.TIMEFRAMES. Kept in sync manually — if you add
+# a timeframe there, append it here too (order preserves column ordering).
+_MULTI_TF_TOKENS = ("1m", "3m", "5m", "15m", "30m", "60m", "240m")
 
-MODEL_NAME = "btc_updown_xgb"
+
+def _multi_tf_columns() -> List[str]:
+    cols: List[str] = []
+    for tf in _MULTI_TF_TOKENS:
+        cols.append(f"rsi_{tf}")
+        for suffix in ("trend", "distance_pct", "buy_signal", "sell_signal"):
+            cols.append(f"ut_{tf}_{suffix}")
+        for suffix in (
+            "bull_setup", "bear_setup", "buy_cd", "sell_cd",
+            "buy_9", "sell_9", "buy_13", "sell_13",
+        ):
+            cols.append(f"td_{tf}_{suffix}")
+    return cols
+
 
 FEATURE_COLUMNS: List[str] = [
     "btc_mid",
@@ -42,6 +58,24 @@ FEATURE_COLUMNS: List[str] = [
     "no_spread_pct",
     "no_book_imbalance",
     "no_ret_30s",
+    # Family A — full-depth book features (from collected bids/asks dicts)
+    "yes_microprice",
+    "yes_depth_slope",
+    "yes_depth_concentration",
+    "no_microprice",
+    "no_depth_slope",
+    "no_depth_concentration",
+    # Family B — YES/NO coherence (cross-book residuals and asymmetries)
+    "mid_sum_residual",
+    "mid_sum_residual_abs",
+    "spread_asymmetry",
+    "depth_asymmetry",
+    # Family C — within-slot path (stateful across the 5-min window)
+    "slot_high_excursion_bps",
+    "slot_low_excursion_bps",
+    "slot_drift_bps",
+    "slot_time_above_strike_pct",
+    "slot_strike_crosses",
     # FVG indicator
     "active_bull_gap",
     "active_bear_gap",
@@ -60,6 +94,11 @@ FEATURE_COLUMNS: List[str] = [
     "ut_bot_distance_pct",
     "ut_bot_buy_signal",
     "ut_bot_sell_signal",
+    # Multi-timeframe macro features (7 TFs × 13 per TF = 91 cols).
+    # Order: 1m, 3m, 5m, 15m, 30m, 60m, 240m; within each TF:
+    # rsi_{tf}, ut_{tf}_{trend,distance_pct,buy_signal,sell_signal},
+    # td_{tf}_{bull_setup,bear_setup,buy_cd,sell_cd,buy_9,sell_9,buy_13,sell_13}.
+    *_multi_tf_columns(),
 ]
 
 DEFAULT_FEATURE_VALUES: Dict[str, float] = {name: 0.0 for name in FEATURE_COLUMNS}
@@ -73,19 +112,3 @@ DEFAULT_THRESHOLDS: Dict[str, float] = {
     "min_seconds_to_expiry": 20.0,
     "max_seconds_to_expiry": 240.0,
 }
-
-
-def build_default_metadata() -> Dict[str, object]:
-    """Return default model metadata used before training artifacts exist."""
-    return {
-        "model_name": MODEL_NAME,
-        "model_version": f"{MODEL_NAME}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}",
-        "feature_columns": FEATURE_COLUMNS,
-        "thresholds": DEFAULT_THRESHOLDS,
-        "calibration": {
-            "bin_edges": [0.0, 1.0],
-            "bin_values": [0.5],
-        },
-        "metrics": {},
-    }
-

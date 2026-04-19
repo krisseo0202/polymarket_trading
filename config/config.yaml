@@ -73,45 +73,6 @@ strategies:
     stop_loss_pct: 0.05        # 5% stop-loss
     min_confidence: 0.5        # coin flip always has confidence=0.5
 
-  btc_updown:
-    # Directional bias seeded from config; overridden at runtime via set_bias().
-    # LONG = buy YES (BTC up), SHORT = buy NO (BTC down), NONE = flat.
-    default_bias: "LONG"
-
-    # Momentum confirmation: require this much upward return over the lookback window.
-    confirmation_pct: 0.02              # 2% move required
-    confirmation_window_seconds: 5      # compare mid_now vs mid 5s ago (range 3–8 s)
-
-    # Exit thresholds
-    profit_target_pct: 0.20   # take profit at +20% (range 10–30%)
-    stop_loss_pct: 0.12        # stop loss at -12%
-    max_hold_seconds: 240      # force-exit after 4 minutes regardless of PnL
-
-    # Sizing
-    position_size_usdc: 20.0   # spend ~$20 USDC per trade
-    min_confidence: 0.7
-
-  btc_updown_xgb:
-    enabled: true
-    btc_symbol: "BTC-USD"      # Coinbase product ID (aligns with Chainlink oracle source)
-    btc_exchange: "coinbase"   # "coinbase" (default) | "binance_us"
-    model_path: "models/btc_updown_xgb.json"
-    feature_schema_path: "models/btc_updown_xgb_features.json"
-    metadata_path: "models/btc_updown_xgb_meta.json"
-
-    position_size_usdc: 20.0
-    min_confidence: 0.54
-    stop_loss_pct: 0.12
-    max_hold_seconds: 240
-
-    min_edge: 0.03
-    min_prob_yes: 0.54
-    max_prob_yes_for_no: 0.46
-    max_spread_pct: 0.06
-    exit_edge: -0.01
-    min_seconds_to_expiry: 20
-    max_seconds_to_expiry: 240
-
   prob_edge:
     # Probability-native edge strategy — production strategy path.
     # Decision: BUY YES/NO only when model edge exceeds threshold.
@@ -220,23 +181,6 @@ strategies:
       history_path: "data/retrain_history.jsonl"
       output_parent: "models"
       model_prefix: "logreg_v4"
-
-  btc_vol_reversion:
-    enabled: true
-    # Z-score mean-reversion: fade overreactions by monitoring price volatility
-    window_seconds: 90           # rolling window for mean/std computation
-    min_samples: 20              # warmup guard: need at least 20 price samples
-    zscore_threshold: 1.8        # trigger signal when |z| >= this value
-    min_vol_threshold: 0.005     # skip if price std < half-cent (market too flat)
-
-    # Exit thresholds — quick snapback is the expected behavior
-    profit_target_pct: 0.03      # take profit at +3% (tight, mean-reversion is small)
-    stop_loss_pct: 0.07          # stop loss at -7% (2:1+ R/R with >60% win rate)
-    max_hold_seconds: 90         # force-exit after 90s (window = hold max)
-
-    # Sizing
-    position_size_usdc: 20.0
-    min_confidence: 0.55
 
 risk:
   max_position_pct: 0.05          # 5% of balance per position

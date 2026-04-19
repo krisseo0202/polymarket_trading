@@ -26,14 +26,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.evaluation.agent import EvaluationAgent, EvaluationConfig
-from src.strategies.btc_updown import BTCUpDownStrategy
-from src.strategies.btc_vol_reversion import BTCVolReversionStrategy
 from src.strategies.coin_toss import CoinTossStrategy
 
 STRATEGY_REGISTRY = {
     "coin_toss": lambda: CoinTossStrategy({"enabled": True, "position_size_usdc": 20.0}),
-    "btc_updown": lambda: BTCUpDownStrategy({"enabled": True, "position_size_usdc": 20.0}),
-    "btc_vol_reversion": lambda: BTCVolReversionStrategy({"enabled": True, "position_size_usdc": 20.0}),
 }
 
 

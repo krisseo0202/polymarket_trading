@@ -26,6 +26,7 @@ _ROOT = str(Path(__file__).resolve().parent.parent)
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
+from src.backtest.period_split import add_period_arguments, resolve_split_from_args
 from src.backtest.snapshot_dataset import build_btc_decision_dataset, load_btc_prices
 
 try:
@@ -59,9 +60,13 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--orderbook-path", default=ORDERBOOK_PATH)
     p.add_argument("--bet-size", type=float, default=20.0, help="USDC per trade")
     p.add_argument("--delta", type=float, default=0.05, help="Min margin of safety")
-    p.add_argument("--valid-fraction", type=float, default=0.20)
+    p.add_argument(
+        "--valid-fraction", type=float, default=0.20,
+        help="Legacy fallback when no --training-period/--test-period given.",
+    )
     p.add_argument("--row-interval", type=int, default=15, help="Decision row spacing (s)")
     p.add_argument("--output-dir", default=os.path.join(_ROOT, "data"))
+    add_period_arguments(p)
     return p.parse_args()
 
 
@@ -131,19 +136,29 @@ def build_merged_dataset(
     """Build BTC decision dataset and merge with orderbook snapshots."""
     ds = build_btc_decision_dataset(markets_df, btc_df, row_interval_sec=row_interval_sec)
 
-    # Prepare up-side orderbook
+    # Prepare up-side orderbook. Carry forward depth + spread for slippage models.
     ob_up = ob_df[ob_df["side"] == "up"].copy()
     ob_up["ob_ts"] = ob_up["slot_ts"] + ob_up["elapsed_s"]
-    ob_up = ob_up.rename(columns={
-        "best_bid": "up_bid", "best_ask": "up_ask", "mid": "up_mid",
-    })[["slot_ts", "ob_ts", "up_bid", "up_ask", "up_mid"]].sort_values("ob_ts")
+    _up_cols = {"best_bid": "up_bid", "best_ask": "up_ask", "mid": "up_mid"}
+    if "ask_depth_3" in ob_up.columns:
+        _up_cols["ask_depth_3"] = "up_ask_depth_3"
+    if "spread" in ob_up.columns:
+        _up_cols["spread"] = "up_spread"
+    ob_up = ob_up.rename(columns=_up_cols)
+    keep_up = ["slot_ts", "ob_ts"] + [v for v in _up_cols.values()]
+    ob_up = ob_up[keep_up].sort_values("ob_ts")
 
     # Prepare down-side orderbook
     ob_down = ob_df[ob_df["side"] == "down"].copy()
     ob_down["ob_ts"] = ob_down["slot_ts"] + ob_down["elapsed_s"]
-    ob_down = ob_down.rename(columns={
-        "best_bid": "down_bid", "best_ask": "down_ask", "mid": "down_mid",
-    })[["slot_ts", "ob_ts", "down_bid", "down_ask", "down_mid"]].sort_values("ob_ts")
+    _dn_cols = {"best_bid": "down_bid", "best_ask": "down_ask", "mid": "down_mid"}
+    if "ask_depth_3" in ob_down.columns:
+        _dn_cols["ask_depth_3"] = "down_ask_depth_3"
+    if "spread" in ob_down.columns:
+        _dn_cols["spread"] = "down_spread"
+    ob_down = ob_down.rename(columns=_dn_cols)
+    keep_down = ["slot_ts", "ob_ts"] + [v for v in _dn_cols.values()]
+    ob_down = ob_down[keep_down].sort_values("ob_ts")
 
     # Asof-merge per contract
     merged_parts: List[pd.DataFrame] = []
@@ -187,22 +202,44 @@ def build_merged_dataset(
 # ── Phase 3+4: split & train ────────────────────────────────────────────────
 
 def train_model(
-    df: pd.DataFrame, valid_fraction: float
+    df: pd.DataFrame,
+    valid_fraction: float = 0.20,
+    args: Optional[argparse.Namespace] = None,
 ) -> Tuple[LogisticRegression, StandardScaler, pd.DataFrame, pd.DataFrame, np.ndarray]:
     """Walk-forward train/test split at contract level, train logistic regression.
 
+    Split selection:
+      * If ``args`` carries any period flags, use them via ``resolve_split_from_args``.
+        A provided ``--valid-period`` is folded into the training set (this
+        backtest has no separate validation step — no calibrator, no early stop).
+      * Otherwise, fall back to ``valid_fraction`` on unique contract_ids.
+
     Returns (model, scaler, train_df, test_df, p_hat_test).
     """
-    contracts = sorted(df["contract_id"].unique())
-    n_train = max(1, int(len(contracts) * (1.0 - valid_fraction)))
-    train_contracts = set(contracts[:n_train])
-    test_contracts = set(contracts[n_train:])
+    if args is not None and getattr(args, "training_period", None):
+        split = resolve_split_from_args(args, df, val_ratio=valid_fraction, ts_col="contract_id")
+        if "test" not in split.frames:
+            raise SystemExit(
+                "backtest_logreg_edge requires --test-period when --training-period is used."
+            )
+        train_df = split.frames["training"].copy()
+        if "validation" in split.frames:
+            # Fold validation into training — this script has no val step.
+            print("Note: --valid-period folded into training (no separate validation phase).")
+            train_df = pd.concat([train_df, split.frames["validation"]], ignore_index=True)
+        test_df = split.frames["test"].copy()
+        print(f"Periods: train={split.config.training.humanize()} | "
+              f"test={split.config.test.humanize()}")
+    else:
+        contracts = sorted(df["contract_id"].unique())
+        n_train = max(1, int(len(contracts) * (1.0 - valid_fraction)))
+        train_contracts = set(contracts[:n_train])
+        test_contracts = set(contracts[n_train:])
+        train_df = df[df["contract_id"].isin(train_contracts)].copy()
+        test_df = df[df["contract_id"].isin(test_contracts)].copy()
 
-    train_df = df[df["contract_id"].isin(train_contracts)].copy()
-    test_df = df[df["contract_id"].isin(test_contracts)].copy()
-
-    print(f"Split: {len(train_contracts)} train contracts ({len(train_df)} rows), "
-          f"{len(test_contracts)} test contracts ({len(test_df)} rows)")
+    print(f"Split: {train_df['contract_id'].nunique()} train contracts ({len(train_df)} rows), "
+          f"{test_df['contract_id'].nunique()} test contracts ({len(test_df)} rows)")
 
     X_train = train_df[FEATURES].to_numpy(dtype=float)
     y_train = train_df["target_up"].to_numpy(dtype=float)
@@ -481,7 +518,7 @@ def main() -> None:
     merged = build_merged_dataset(btc_df, markets_df, ob_df, args.row_interval)
 
     # Phase 3+4
-    model, scaler, train_df, test_df, p_hat = train_model(merged, args.valid_fraction)
+    model, scaler, train_df, test_df, p_hat = train_model(merged, args.valid_fraction, args=args)
 
     # Phase 5+6
     trades, skipped = find_trades(test_df, args.delta, args.bet_size)

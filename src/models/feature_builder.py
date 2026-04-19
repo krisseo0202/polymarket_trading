@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import math
 import re
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -15,6 +14,7 @@ from indicators.fvg import FVGIndicator
 from indicators.td_sequential import TDSequentialIndicator
 from indicators.ut_bot import UTBotIndicator
 from src.api.types import OrderBook
+from .multi_tf_features import compute_multi_tf_features
 from .schema import DEFAULT_FEATURE_VALUES, FEATURE_COLUMNS
 
 
@@ -100,8 +100,19 @@ def build_live_features(snapshot: Mapping[str, object]) -> FeatureBuildResult:
     no_history = list(snapshot.get("no_history") or [])
     _add_book_features(features, yes_book, yes_history, now_ts, prefix="yes")
     _add_book_features(features, no_book, no_history, now_ts, prefix="no")
+    _add_depth_features(features, yes_book, prefix="yes")
+    _add_depth_features(features, no_book, prefix="no")
+    _add_coherence_features(features, yes_book, no_book)
+    _merge_slot_path_features(features, snapshot.get("slot_path_features"))
 
     indicator_status = _add_indicator_features(features, btc_prices, btc_mid)
+
+    # Multi-timeframe macro features (91 cols). Warming TFs emit status but
+    # leave features at their 0.0 defaults, so partial warmup still returns a
+    # usable feature vector for short-TF-only models.
+    mtf_features, mtf_status = compute_multi_tf_features(btc_prices, now_ts)
+    features.update(mtf_features)
+
     status = "ready" if indicator_status == "ready" else indicator_status
     return FeatureBuildResult(features=features, ready=True, status=status)
 
@@ -237,6 +248,141 @@ def _add_book_features(
     features[f"{prefix}_spread_pct"] = spread_pct
     features[f"{prefix}_book_imbalance"] = imbalance
     features[f"{prefix}_ret_30s"] = _safe_return(history, now_ts, 30)
+
+
+_DEPTH_SLOPE_LEVELS = 10
+
+
+def _add_depth_features(
+    features: Dict[str, float],
+    book: OrderBook,
+    prefix: str,
+) -> None:
+    """Compute full-depth book features (Family A).
+
+    Requires book.bids sorted descending by price, book.asks ascending.
+    Safe when either side is empty or has only a single synthetic level:
+    all outputs default to 0.0.
+    """
+    bids = list(book.bids or [])
+    asks = list(book.asks or [])
+
+    bid_l1_price = float(bids[0].price) if bids else 0.0
+    ask_l1_price = float(asks[0].price) if asks else 0.0
+    bid_l1_size = float(bids[0].size) if bids else 0.0
+    ask_l1_size = float(asks[0].size) if asks else 0.0
+
+    denom = bid_l1_size + ask_l1_size
+    if denom > 0 and bid_l1_price > 0 and ask_l1_price > 0:
+        features[f"{prefix}_microprice"] = (
+            bid_l1_size * ask_l1_price + ask_l1_size * bid_l1_price
+        ) / denom
+
+    mid = (bid_l1_price + ask_l1_price) / 2.0 if bid_l1_price > 0 and ask_l1_price > 0 else 0.0
+
+    bid_slope = _side_depth_slope(bids, mid, _DEPTH_SLOPE_LEVELS)
+    ask_slope = _side_depth_slope(asks, mid, _DEPTH_SLOPE_LEVELS)
+    if bid_slope != 0.0 or ask_slope != 0.0:
+        features[f"{prefix}_depth_slope"] = (bid_slope + ask_slope) / 2.0
+
+    total_depth = sum(float(e.size) for e in bids) + sum(float(e.size) for e in asks)
+    l1_depth = bid_l1_size + ask_l1_size
+    if total_depth > 0:
+        features[f"{prefix}_depth_concentration"] = l1_depth / total_depth
+
+
+def _merge_slot_path_features(
+    features: Dict[str, float],
+    slot_path_features: Optional[Mapping[str, object]],
+) -> None:
+    """Merge caller-supplied Family C features into the output dict.
+
+    When ``slot_path_features`` is None (default), the Family C columns stay
+    at their schema defaults (0.0). Keeps the feature builder stateless; slot
+    state is managed by the live strategy or the backtest loader.
+    """
+    if not slot_path_features:
+        return
+    for name in (
+        "slot_high_excursion_bps",
+        "slot_low_excursion_bps",
+        "slot_drift_bps",
+        "slot_time_above_strike_pct",
+        "slot_strike_crosses",
+    ):
+        value = slot_path_features.get(name)
+        if value is None:
+            continue
+        try:
+            features[name] = float(value)
+        except (TypeError, ValueError):
+            continue
+
+
+def _add_coherence_features(
+    features: Dict[str, float],
+    yes_book: OrderBook,
+    no_book: OrderBook,
+) -> None:
+    """Compute cross-book coherence features (Family B).
+
+    ``yes_mid``, ``no_mid``, ``yes_spread``, ``no_spread`` must already be
+    populated by ``_add_book_features``. Depth totals come straight from the
+    books so the feature works correctly even when the book is single-level.
+    """
+    yes_mid = float(features.get("yes_mid") or 0.0)
+    no_mid = float(features.get("no_mid") or 0.0)
+    yes_spread = float(features.get("yes_spread") or 0.0)
+    no_spread = float(features.get("no_spread") or 0.0)
+
+    if yes_mid > 0 and no_mid > 0:
+        residual = (yes_mid + no_mid) - 1.0
+        features["mid_sum_residual"] = residual
+        features["mid_sum_residual_abs"] = abs(residual)
+
+    spread_denom = yes_spread + no_spread
+    if spread_denom > 0:
+        features["spread_asymmetry"] = (yes_spread - no_spread) / spread_denom
+
+    yes_total_depth = sum(float(e.size) for e in (yes_book.bids or [])) + sum(
+        float(e.size) for e in (yes_book.asks or [])
+    )
+    no_total_depth = sum(float(e.size) for e in (no_book.bids or [])) + sum(
+        float(e.size) for e in (no_book.asks or [])
+    )
+    depth_denom = yes_total_depth + no_total_depth
+    if depth_denom > 0:
+        features["depth_asymmetry"] = (yes_total_depth - no_total_depth) / depth_denom
+
+
+def _side_depth_slope(
+    levels: Sequence,
+    mid: float,
+    top_n: int,
+) -> float:
+    """Slope of cumulative size vs |price - mid| over the top-N levels.
+
+    Returns 0.0 when the fit is degenerate (fewer than 2 levels, zero mid,
+    or zero variance in x). Higher slope = thicker book beneath L1.
+    """
+    if mid <= 0 or len(levels) < 2:
+        return 0.0
+    x_vals: List[float] = []
+    y_vals: List[float] = []
+    cum = 0.0
+    for entry in levels[:top_n]:
+        cum += float(entry.size)
+        x_vals.append(abs(float(entry.price) - mid))
+        y_vals.append(cum)
+    if len(x_vals) < 2:
+        return 0.0
+    x_arr = np.asarray(x_vals, dtype=float)
+    y_arr = np.asarray(y_vals, dtype=float)
+    denom = float(np.var(x_arr))
+    if denom <= 0:
+        return 0.0
+    cov = float(np.mean((x_arr - x_arr.mean()) * (y_arr - y_arr.mean())))
+    return cov / denom
 
 
 def _add_indicator_features(

@@ -32,7 +32,7 @@ from ..engine.slot_state import (
 )
 from ..engine.state_store import snapshot_chainlink_state, snapshot_strategy_state
 from ..strategies.base import Signal
-from ..utils.market_utils import find_btc_updown_market
+from ..utils.market_utils import find_updown_market
 
 if TYPE_CHECKING:
     from ..utils.startup import Services
@@ -93,8 +93,9 @@ class CycleRunner:
         svc = self.svc
         logger = svc.logger
 
-        market_info = find_btc_updown_market(
-            svc.market_keywords, svc.min_volume, logger
+        market_info = find_updown_market(
+            svc.market_keywords, svc.min_volume, logger,
+            slug_prefix=svc.slug_prefix,
         )
         if not market_info:
             logger.warning("Skipping cycle: market not found")
@@ -1126,7 +1127,6 @@ def _write_trade_log(
         "prob_yes": state.strategy_prob_yes,
         "edge_yes": state.strategy_edge_yes, "edge_no": state.strategy_edge_no,
         "bias": state.strategy_bias,
-        "momentum_pct": state.strategy_momentum_pct, "zscore": state.strategy_zscore,
         "model_version": state.strategy_model_version or None,
         "feature_status": state.strategy_feature_status or None,
         "chainlink_ref_price": state.chainlink_ref_price,
