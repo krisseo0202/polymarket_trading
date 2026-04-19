@@ -1,10 +1,9 @@
 """Tests for LogRegModel — training, prediction, save/load."""
 
 import numpy as np
-import pytest
 
 from src.models.logreg_model import LogRegModel, LR_FEATURES
-from src.models.xgb_model import PredictionResult
+from src.models.prediction import PredictionResult
 
 
 def _make_snapshot(btc_prices, strike_price=50000.0, expiry_offset=300.0):

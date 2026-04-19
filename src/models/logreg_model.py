@@ -16,13 +16,13 @@ import logging
 import math
 import os
 import pickle
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
 
 from src.api.types import OrderBook
 from .feature_builder import _safe_return, parse_strike_price
-from .xgb_model import PredictionResult
+from .prediction import PredictionResult
 
 
 LR_FEATURES = [

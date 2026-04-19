@@ -2,7 +2,6 @@
 
 import json
 import os
-import time
 from dataclasses import dataclass, field, asdict
 from datetime import date
 from typing import Dict, List, Optional
@@ -25,8 +24,6 @@ class BotState:
     # Strategy snapshot fields (written every cycle + every 30s intra-cycle)
     strategy_name: str = ""
     strategy_bias: str = ""                     # "LONG" | "SHORT" | "NONE"
-    strategy_zscore: Optional[float] = None     # btc_vol_reversion only
-    strategy_momentum_pct: Optional[float] = None  # btc_updown only
     strategy_prob_yes: Optional[float] = None
     strategy_prob_no: Optional[float] = None
     strategy_edge_yes: Optional[float] = None
@@ -108,8 +105,6 @@ class StateStore:
                 inventories=data.get("inventories", {}),
                 strategy_name=data.get("strategy_name", ""),
                 strategy_bias=data.get("strategy_bias", ""),
-                strategy_zscore=data.get("strategy_zscore"),
-                strategy_momentum_pct=data.get("strategy_momentum_pct"),
                 strategy_prob_yes=data.get("strategy_prob_yes"),
                 strategy_prob_no=data.get("strategy_prob_no"),
                 strategy_edge_yes=data.get("strategy_edge_yes"),
@@ -163,31 +158,6 @@ def snapshot_strategy_state(strategy, state: BotState) -> None:
 
     bias_obj = getattr(strategy, "current_bias", None)
     state.strategy_bias = bias_obj.value if bias_obj is not None else ""
-
-    yes_tid = getattr(strategy, "_yes_token_id", None)
-    lookback_fn = getattr(strategy, "_lookback_mid", None)
-    price_history = getattr(strategy, "_price_history", {})
-    if yes_tid and lookback_fn and yes_tid in price_history:
-        now_mono = time.monotonic()
-        window = getattr(strategy, "confirmation_window_seconds", 60)
-        hist = price_history.get(yes_tid, [])
-        mid_now = hist[-1][1] if hist else None
-        mid_prev = lookback_fn(yes_tid, now_mono, window)
-        if mid_now and mid_prev and mid_prev > 0:
-            state.strategy_momentum_pct = (mid_now - mid_prev) / mid_prev
-        else:
-            state.strategy_momentum_pct = None
-    else:
-        state.strategy_momentum_pct = None
-
-    compute_z = getattr(strategy, "_compute_zscore", None)
-    if compute_z and yes_tid:
-        try:
-            state.strategy_zscore = compute_z(yes_tid, time.monotonic())
-        except Exception:
-            state.strategy_zscore = None
-    else:
-        state.strategy_zscore = None
 
     state.strategy_prob_yes = getattr(strategy, "last_prob_yes", None)
     state.strategy_prob_no = getattr(strategy, "last_prob_no", None)

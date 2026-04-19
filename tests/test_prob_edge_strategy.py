@@ -10,14 +10,12 @@ and the exit rules:
 """
 
 import time
-from dataclasses import dataclass
-from typing import Any, Mapping, Optional
-from unittest.mock import MagicMock
+from typing import Any, Mapping
 
 import pytest
 
 from src.api.types import OrderBook, OrderBookEntry, Position
-from src.models.xgb_model import PredictionResult
+from src.models.prediction import PredictionResult
 from src.strategies.prob_edge import ProbEdgeStrategy
 from src.utils.market_utils import spread_pct as _spread_pct
 

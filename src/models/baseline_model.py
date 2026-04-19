@@ -9,8 +9,8 @@ from typing import Mapping, Optional, Sequence, Tuple
 from src.api.types import OrderBook
 
 from .feature_builder import parse_strike_price
+from .prediction import PredictionResult
 from .schema import DEFAULT_THRESHOLDS
-from .xgb_model import PredictionResult
 
 
 _SECONDS_PER_YEAR = 365.25 * 24 * 60 * 60

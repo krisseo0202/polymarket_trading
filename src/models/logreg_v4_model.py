@@ -32,7 +32,7 @@ import numpy as np
 
 from ..api.types import OrderBook
 from .feature_builder import parse_strike_price
-from .xgb_model import PredictionResult
+from .prediction import PredictionResult
 
 
 # Default feature set used when a loaded meta.json has no `features` list

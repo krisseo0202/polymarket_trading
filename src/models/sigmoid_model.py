@@ -18,8 +18,8 @@ import math
 from typing import Mapping, Optional, Sequence, Tuple
 
 from .feature_builder import parse_strike_price
+from .prediction import PredictionResult
 from .schema import DEFAULT_THRESHOLDS
-from .xgb_model import PredictionResult
 
 _EPS = 1e-12
 

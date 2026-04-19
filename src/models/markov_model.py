@@ -45,7 +45,7 @@ from typing import Mapping, Optional
 import numpy as np
 import pandas as pd
 
-from .xgb_model import PredictionResult
+from .prediction import PredictionResult
 from .feature_builder import parse_strike_price
 
 
