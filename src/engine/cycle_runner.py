@@ -375,9 +375,15 @@ class CycleRunner:
                 logger.info(f"Intra-cycle: {len(signals)} signal(s)")
                 self._execute(signals, balance, positions,
                               book_summary=_book_summary(yes_book, no_book))
-                snapshot_strategy_state(svc.strategy, svc.state)
-                snapshot_chainlink_state(svc.state, svc.chainlink_feed, slot_mgr=svc.slot_mgr)
-                svc.state_store.save(svc.state)
+
+            # Always persist strategy snapshot so dashboard sees fresh TTE,
+            # skip reason, edges, etc. on every intra-cycle (not just when
+            # a signal fires). Previously the `if signals:` guard froze
+            # bot_state for the entire 5-min slot once the strategy started
+            # skipping.
+            snapshot_strategy_state(svc.strategy, svc.state)
+            snapshot_chainlink_state(svc.state, svc.chainlink_feed, slot_mgr=svc.slot_mgr)
+            svc.state_store.save(svc.state)
         except Exception as e:
             logger.error(f"Intra-cycle analyze error: {e}", exc_info=True)
 
