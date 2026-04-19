@@ -131,19 +131,29 @@ def build_merged_dataset(
     """Build BTC decision dataset and merge with orderbook snapshots."""
     ds = build_btc_decision_dataset(markets_df, btc_df, row_interval_sec=row_interval_sec)
 
-    # Prepare up-side orderbook
+    # Prepare up-side orderbook. Carry forward depth + spread for slippage models.
     ob_up = ob_df[ob_df["side"] == "up"].copy()
     ob_up["ob_ts"] = ob_up["slot_ts"] + ob_up["elapsed_s"]
-    ob_up = ob_up.rename(columns={
-        "best_bid": "up_bid", "best_ask": "up_ask", "mid": "up_mid",
-    })[["slot_ts", "ob_ts", "up_bid", "up_ask", "up_mid"]].sort_values("ob_ts")
+    _up_cols = {"best_bid": "up_bid", "best_ask": "up_ask", "mid": "up_mid"}
+    if "ask_depth_3" in ob_up.columns:
+        _up_cols["ask_depth_3"] = "up_ask_depth_3"
+    if "spread" in ob_up.columns:
+        _up_cols["spread"] = "up_spread"
+    ob_up = ob_up.rename(columns=_up_cols)
+    keep_up = ["slot_ts", "ob_ts"] + [v for v in _up_cols.values()]
+    ob_up = ob_up[keep_up].sort_values("ob_ts")
 
     # Prepare down-side orderbook
     ob_down = ob_df[ob_df["side"] == "down"].copy()
     ob_down["ob_ts"] = ob_down["slot_ts"] + ob_down["elapsed_s"]
-    ob_down = ob_down.rename(columns={
-        "best_bid": "down_bid", "best_ask": "down_ask", "mid": "down_mid",
-    })[["slot_ts", "ob_ts", "down_bid", "down_ask", "down_mid"]].sort_values("ob_ts")
+    _dn_cols = {"best_bid": "down_bid", "best_ask": "down_ask", "mid": "down_mid"}
+    if "ask_depth_3" in ob_down.columns:
+        _dn_cols["ask_depth_3"] = "down_ask_depth_3"
+    if "spread" in ob_down.columns:
+        _dn_cols["spread"] = "down_spread"
+    ob_down = ob_down.rename(columns=_dn_cols)
+    keep_down = ["slot_ts", "ob_ts"] + [v for v in _dn_cols.values()]
+    ob_down = ob_down[keep_down].sort_values("ob_ts")
 
     # Asof-merge per contract
     merged_parts: List[pd.DataFrame] = []
