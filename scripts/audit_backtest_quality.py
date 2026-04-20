@@ -24,9 +24,10 @@ _ROOT = str(Path(__file__).resolve().parent.parent)
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
+from sklearn.metrics import brier_score_loss, log_loss
+
 from scripts.backtest_logreg_edge import (
     FEATURES, build_merged_dataset, load_and_derive, train_model,
-    _brier, _log_loss,
 )
 from scripts.sweep_backtest_logreg import find_trades_first_eligible
 
@@ -94,8 +95,8 @@ def main():
         if n < 5:
             print(f"     {label:>32}  {n:>5}  (too few)")
             continue
-        b = _brier(y[mask], p_hat[mask])
-        ll = _log_loss(y[mask], p_hat[mask])
+        b = brier_score_loss(y[mask], p_hat[mask])
+        ll = log_loss(y[mask], p_hat[mask], labels=[0.0, 1.0])
         a = _safe_auc(y[mask], p_hat[mask])
         acc = float(((p_hat[mask] >= 0.5).astype(int) == y[mask].astype(int)).mean())
         print(f"     {label:>32}  {n:>5}  {b:>7.4f}  {ll:>7.4f}  {a:>6.3f}  {acc:>5.1%}")

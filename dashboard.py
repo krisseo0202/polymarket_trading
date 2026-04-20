@@ -1129,9 +1129,7 @@ def _build_strategy_panel(
             suffix = f" ({distance_bps:+.0f} bps)"
         tbl.add_row("Px vs K", Text(f"{distance_pct * 100:+.2f}%{suffix}", style=distance_style))
 
-    # TTE: compute live from the current slot so it counts down in real time,
-    # matching Market Cycle's "Remaining". The cached strategy_tte_seconds is
-    # only refreshed at intra-cycle cadence (~30s) and goes stale between ticks.
+    # Live so countdown matches Market Cycle's Remaining at render cadence.
     slot_expiry = _current_slot_ts() + SLOT_INTERVAL_S
     tte_live = max(0, int(slot_expiry - _server_now()))
     tbl.add_row("TTE", Text(f"{tte_live}s", style="dim"))
