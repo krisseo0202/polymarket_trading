@@ -96,12 +96,21 @@ def apply_fill_to_state(
     state: "BotState",
     risk_manager: "RiskManager",
 ) -> float:
-    """Apply a fill to inventory + state PnL. Returns realized PnL."""
+    """Apply a fill to inventory + state PnL. Returns realized PnL.
+
+    Updates daily/slot PnL and session_wins/session_losses whenever the fill
+    closes inventory at a nonzero realized delta. Live mode's execution
+    tracker path handles its own counting separately (see cycle_runner).
+    """
     realized = inv.apply_fill(side, price, size)
     state.daily_realized_pnl += realized
     state.slot_realized_pnl += realized
     if realized != 0.0:
         risk_manager.record_trade(realized)
+        if realized > 0:
+            state.session_wins = getattr(state, "session_wins", 0) + 1
+        else:
+            state.session_losses = getattr(state, "session_losses", 0) + 1
     return realized
 
 
