@@ -323,10 +323,7 @@ def apply_slot_settlement(
         size = inv.position
         entry_cost = inv.avg_cost
         realized = apply_fill_to_state(inv, "SELL", price, size, state, risk_manager)
-        if realized > 0:
-            state.session_wins += 1
-        elif realized < 0:
-            state.session_losses += 1
+        # Win/loss counting happens inside apply_fill_to_state now.
 
         # Record settlement in the trade log so the dashboard and post-hoc
         # analysis can show the full lifecycle: BUY entry → settlement result.

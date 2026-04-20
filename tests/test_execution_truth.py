@@ -9,9 +9,8 @@ Covers two bugs that existed before the fix:
 """
 
 from datetime import datetime
-from typing import Dict, Optional
+from typing import Dict
 
-import pytest
 
 from src.api.types import Fill, Order, Position
 from src.engine.execution import ExecutionTracker
@@ -26,6 +25,8 @@ class _FakeState:
     def __init__(self):
         self.daily_realized_pnl = 0.0
         self.slot_realized_pnl = 0.0
+        self.session_wins = 0
+        self.session_losses = 0
 
 
 class _FakeRiskManager:
@@ -273,13 +274,60 @@ class TestPaperTradingNoDuplicate:
 
 
 # ---------------------------------------------------------------------------
+# Paper mode: win/loss counting on mid-slot closes
+# ---------------------------------------------------------------------------
+
+class TestPaperWinLossCounting:
+    """
+    Paper-mode strategy exits (stop-loss, take-profit, edge-reprice) route
+    through execute_signals → apply_fill_to_state. Before the fix, only
+    daily/slot PnL updated — session_wins/session_losses stayed 0, making
+    the dashboard's win-rate row show "—" no matter how many trades closed.
+    Hold-to-expiry settlements (settle_expiring_positions) count correctly
+    via the same helper now.
+    """
+
+    def test_winning_close_increments_session_wins(self):
+        state = _FakeState()
+        rm = _FakeRiskManager()
+        inv = InventoryState(token_id="tok_yes", position=10.0, avg_cost=0.50)
+
+        realized = apply_fill_to_state(inv, "SELL", 0.60, 10.0, state, rm)
+
+        assert realized > 0
+        assert state.session_wins == 1
+        assert state.session_losses == 0
+
+    def test_losing_close_increments_session_losses(self):
+        state = _FakeState()
+        rm = _FakeRiskManager()
+        inv = InventoryState(token_id="tok_yes", position=10.0, avg_cost=0.50)
+
+        realized = apply_fill_to_state(inv, "SELL", 0.40, 10.0, state, rm)
+
+        assert realized < 0
+        assert state.session_wins == 0
+        assert state.session_losses == 1
+
+    def test_open_fill_does_not_touch_counters(self):
+        """A pure BUY open (no realized PnL) must not bump win/loss."""
+        state = _FakeState()
+        rm = _FakeRiskManager()
+        inv = InventoryState(token_id="tok_yes", position=0.0, avg_cost=0.0)
+
+        apply_fill_to_state(inv, "BUY", 0.50, 10.0, state, rm)
+
+        assert state.session_wins == 0
+        assert state.session_losses == 0
+
+
+# ---------------------------------------------------------------------------
 # Held side tracking
 # ---------------------------------------------------------------------------
 
 class TestHeldSide:
 
     def test_yes_position_gives_yes(self):
-        from src.engine.cycle_snapshot import build_cycle_snapshot
         from src.engine.inventory import InventoryState
 
         inv_yes = InventoryState(token_id="tok_yes", position=10.0, avg_cost=0.50)
