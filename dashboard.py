@@ -1129,11 +1129,10 @@ def _build_strategy_panel(
             suffix = f" ({distance_bps:+.0f} bps)"
         tbl.add_row("Px vs K", Text(f"{distance_pct * 100:+.2f}%{suffix}", style=distance_style))
 
-    tte_seconds = _pick("strategy_tte_seconds")
-    if tte_seconds is None:
-        tte_seconds = _pick("tte_seconds")
-    if tte_seconds is not None:
-        tbl.add_row("TTE", Text(f"{tte_seconds:.0f}s", style="dim"))
+    # Live so countdown matches Market Cycle's Remaining at render cadence.
+    slot_expiry = _current_slot_ts() + SLOT_INTERVAL_S
+    tte_live = max(0, int(slot_expiry - _server_now()))
+    tbl.add_row("TTE", Text(f"{tte_live}s", style="dim"))
 
     edge_yes = _pick("strategy_edge_yes")
     if edge_yes is not None:

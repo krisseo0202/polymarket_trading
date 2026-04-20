@@ -19,7 +19,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score
 
 _ROOT = str(Path(__file__).resolve().parent.parent)
 if _ROOT not in sys.path:
@@ -27,7 +27,6 @@ if _ROOT not in sys.path:
 
 from scripts.backtest_logreg_edge import (
     build_merged_dataset, load_and_derive, train_model,
-    _brier, _log_loss,
 )
 
 
@@ -54,40 +53,45 @@ def _polymarket_taker_fee(shares: float, price: float, rate: float) -> float:
     return float(rate) * float(shares) * p * (1.0 - p)
 
 
+_SIDE_COLS = {
+    "YES": ("edge_yes", "up_ask",   "up_spread",   "up_ask_depth_3",   1),
+    "NO":  ("edge_no",  "down_ask", "down_spread", "down_ask_depth_3", 0),
+}
+
+
 def find_trades_first_eligible(test_df, delta: float, bet_size: float,
                                taker_fee_rate: float = 0.072,
                                slippage: str = "linear"):
     """Pick the FIRST moment per contract where edge ≥ delta — what a live bot does.
 
     Applies taker fee + depth-aware slippage at entry. Holds to settlement.
+    Assumes test_df is pre-sorted by (contract_id, timestamp), which
+    build_merged_dataset guarantees.
     """
     trades, skipped = [], []
     for cid, g in test_df.groupby("contract_id", sort=True):
-        g = g.sort_values("timestamp").reset_index(drop=True)
-        yes_hit = g[g["edge_yes"] >= delta]
-        no_hit = g[g["edge_no"] >= delta]
-        yes_ts = yes_hit["timestamp"].min() if not yes_hit.empty else float("inf")
-        no_ts = no_hit["timestamp"].min() if not no_hit.empty else float("inf")
-        if yes_ts == float("inf") and no_ts == float("inf"):
+        # Pick the side that triggers earliest (YES and NO evaluated in parallel).
+        best_side, best_ts, best_row = None, float("inf"), None
+        for side, (edge_col, *_rest) in _SIDE_COLS.items():
+            hit = g[g[edge_col] >= delta]
+            if hit.empty:
+                continue
+            ts = hit["timestamp"].min()
+            if ts < best_ts:
+                best_side, best_ts, best_row = side, ts, hit.iloc[0]
+        if best_row is None:
             skipped.append(int(cid))
             continue
-        if yes_ts <= no_ts:
-            row = yes_hit.iloc[0]
-            side = "YES"
-            top_ask = float(row["up_ask"])
-            spread = float(row.get("up_spread", 0.0) or 0.0)
-            depth_3 = float(row.get("up_ask_depth_3", 0.0) or 0.0)
-            payout = 1.0 if int(row["target_up"]) == 1 else 0.0
-        else:
-            row = no_hit.iloc[0]
-            side = "NO"
-            top_ask = float(row["down_ask"])
-            spread = float(row.get("down_spread", 0.0) or 0.0)
-            depth_3 = float(row.get("down_ask_depth_3", 0.0) or 0.0)
-            payout = 1.0 if int(row["target_up"]) == 0 else 0.0
+
+        _, ask_col, spread_col, depth_col, win_target = _SIDE_COLS[best_side]
+        top_ask = float(best_row[ask_col])
         if top_ask <= 0:
             skipped.append(int(cid))
             continue
+        spread = float(best_row.get(spread_col, 0.0) or 0.0)
+        depth_3 = float(best_row.get(depth_col, 0.0) or 0.0)
+        payout = 1.0 if int(best_row["target_up"]) == win_target else 0.0
+
         shares_wanted = bet_size / top_ask
         fill_price, shares_filled = _apply_slippage(
             top_ask, spread, depth_3, shares_wanted, slippage,
@@ -99,7 +103,7 @@ def find_trades_first_eligible(test_df, delta: float, bet_size: float,
         fee = _polymarket_taker_fee(shares_filled, fill_price, taker_fee_rate)
         pnl = shares_filled * (payout - fill_price) - fee
         trades.append({
-            "contract_id": int(cid), "side": side,
+            "contract_id": int(cid), "side": best_side,
             "entry_price": fill_price, "top_ask": top_ask,
             "shares_wanted": shares_wanted, "shares_filled": shares_filled,
             "capital_used": capital_used, "payout": payout,
@@ -154,8 +158,8 @@ def main() -> None:
     _model, _scaler, train_df, test_df, p_hat = train_model(merged, args.valid_fraction)
 
     y = test_df["target_up"].to_numpy(dtype=float)
-    brier = _brier(y, p_hat)
-    logloss = _log_loss(y, p_hat)
+    brier = brier_score_loss(y, p_hat)
+    logloss = log_loss(y, p_hat, labels=[0.0, 1.0])
     auc = _safe_auc(y, p_hat)
     acc = float(((p_hat >= 0.5).astype(int) == y.astype(int)).mean())
     ece = _ece(y, p_hat)

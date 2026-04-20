@@ -124,7 +124,14 @@ class CycleRunner:
             + (f" | chainlink age={cl_age_s:.1f}s" if cl_age_s is not None else "")
             + (f" | btc age={btc_age_s:.3f}s" if btc_age_s is not None else "")
         )
-        if slot_ctx.strike_source != "chainlink" and svc.chainlink_feed is not None:
+        # Chainlink sources, in order of preference:
+        #   chainlink              — fresh tick in the current slot
+        #   chainlink_carryforward — last-known Chainlink price (still the
+        #                            settlement-correct value when BTC hasn't
+        #                            moved 0.5% since slot open)
+        #   regex / btc_feed       — genuinely degraded (venue drift risk)
+        chainlink_sources = {"chainlink", "chainlink_carryforward"}
+        if slot_ctx.strike_source not in chainlink_sources and svc.chainlink_feed is not None:
             cl_status = "connecting" if svc.chainlink_feed.is_connecting() else "stale"
             logger.warning(f"Chainlink {cl_status} — trading with degraded strike price source")
 
@@ -361,6 +368,15 @@ class CycleRunner:
             signals = svc.strategy.analyze(market_data)
             _log_decision(svc.strategy, signals, market_data, cycle_type="intra")
 
+            # Mirror the main-cycle Calc/Decision lines so intra-cycle
+            # decisions aren't silent. Without this, skip reasons (edge_low,
+            # confidence_low, tte, spread_wide, etc.) were only written to
+            # the JSONL decision log via _log_decision above — not visible
+            # in the live terminal output. The prefix [intra] distinguishes
+            # these from main-cycle logs.
+            logger.info(f"  [intra @ tte={time_remaining:.0f}s]")
+            _log_strategy_calc(svc.strategy, signals, logger, self)
+
             if time_remaining < min_entry_window:
                 buy_count = sum(1 for s in signals if s.action == "BUY")
                 signals = [s for s in signals if s.action == "SELL"]
@@ -375,9 +391,12 @@ class CycleRunner:
                 logger.info(f"Intra-cycle: {len(signals)} signal(s)")
                 self._execute(signals, balance, positions,
                               book_summary=_book_summary(yes_book, no_book))
-                snapshot_strategy_state(svc.strategy, svc.state)
-                snapshot_chainlink_state(svc.state, svc.chainlink_feed, slot_mgr=svc.slot_mgr)
-                svc.state_store.save(svc.state)
+
+            # Persist every tick so dashboard sees fresh TTE/skip reason/edges
+            # during watching phases, not just on signal events.
+            snapshot_strategy_state(svc.strategy, svc.state)
+            snapshot_chainlink_state(svc.state, svc.chainlink_feed, slot_mgr=svc.slot_mgr)
+            svc.state_store.save(svc.state)
         except Exception as e:
             logger.error(f"Intra-cycle analyze error: {e}", exc_info=True)
 

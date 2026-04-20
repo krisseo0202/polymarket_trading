@@ -136,29 +136,22 @@ def build_merged_dataset(
     """Build BTC decision dataset and merge with orderbook snapshots."""
     ds = build_btc_decision_dataset(markets_df, btc_df, row_interval_sec=row_interval_sec)
 
-    # Prepare up-side orderbook. Carry forward depth + spread for slippage models.
-    ob_up = ob_df[ob_df["side"] == "up"].copy()
-    ob_up["ob_ts"] = ob_up["slot_ts"] + ob_up["elapsed_s"]
-    _up_cols = {"best_bid": "up_bid", "best_ask": "up_ask", "mid": "up_mid"}
-    if "ask_depth_3" in ob_up.columns:
-        _up_cols["ask_depth_3"] = "up_ask_depth_3"
-    if "spread" in ob_up.columns:
-        _up_cols["spread"] = "up_spread"
-    ob_up = ob_up.rename(columns=_up_cols)
-    keep_up = ["slot_ts", "ob_ts"] + [v for v in _up_cols.values()]
-    ob_up = ob_up[keep_up].sort_values("ob_ts")
+    def _prep_side(side: str, prefix: str) -> pd.DataFrame:
+        """Filter + rename one side's orderbook, carrying depth/spread when present."""
+        frame = ob_df[ob_df["side"] == side].copy()
+        frame["ob_ts"] = frame["slot_ts"] + frame["elapsed_s"]
+        renames = {"best_bid": f"{prefix}_bid", "best_ask": f"{prefix}_ask",
+                   "mid": f"{prefix}_mid"}
+        if "ask_depth_3" in frame.columns:
+            renames["ask_depth_3"] = f"{prefix}_ask_depth_3"
+        if "spread" in frame.columns:
+            renames["spread"] = f"{prefix}_spread"
+        frame = frame.rename(columns=renames)
+        keep = ["slot_ts", "ob_ts"] + list(renames.values())
+        return frame[keep].sort_values("ob_ts")
 
-    # Prepare down-side orderbook
-    ob_down = ob_df[ob_df["side"] == "down"].copy()
-    ob_down["ob_ts"] = ob_down["slot_ts"] + ob_down["elapsed_s"]
-    _dn_cols = {"best_bid": "down_bid", "best_ask": "down_ask", "mid": "down_mid"}
-    if "ask_depth_3" in ob_down.columns:
-        _dn_cols["ask_depth_3"] = "down_ask_depth_3"
-    if "spread" in ob_down.columns:
-        _dn_cols["spread"] = "down_spread"
-    ob_down = ob_down.rename(columns=_dn_cols)
-    keep_down = ["slot_ts", "ob_ts"] + [v for v in _dn_cols.values()]
-    ob_down = ob_down[keep_down].sort_values("ob_ts")
+    ob_up = _prep_side("up", "up")
+    ob_down = _prep_side("down", "down")
 
     # Asof-merge per contract
     merged_parts: List[pd.DataFrame] = []
