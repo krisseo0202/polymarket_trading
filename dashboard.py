@@ -1129,11 +1129,10 @@ def _build_strategy_panel(
             suffix = f" ({distance_bps:+.0f} bps)"
         tbl.add_row("Px vs K", Text(f"{distance_pct * 100:+.2f}%{suffix}", style=distance_style))
 
-    tte_seconds = _pick("strategy_tte_seconds")
-    if tte_seconds is None:
-        tte_seconds = _pick("tte_seconds")
-    if tte_seconds is not None:
-        tbl.add_row("TTE", Text(f"{tte_seconds:.0f}s", style="dim"))
+    # Live so countdown matches Market Cycle's Remaining at render cadence.
+    slot_expiry = _current_slot_ts() + SLOT_INTERVAL_S
+    tte_live = max(0, int(slot_expiry - _server_now()))
+    tbl.add_row("TTE", Text(f"{tte_live}s", style="dim"))
 
     edge_yes = _pick("strategy_edge_yes")
     if edge_yes is not None:
@@ -1550,13 +1549,20 @@ def _build_runtime_summary(raw: dict, active_strategy: Optional[str]) -> Dict[st
     else:
         max_position = None
 
-    def _pct(x: Any) -> Optional[str]:
+    def _pct(x: Any, hide_if_ge: Optional[float] = None) -> Optional[str]:
+        """Percentage formatter. When hide_if_ge is set, values ≥ that threshold
+        return None — used to suppress "disabled" sentinels (max_daily_loss=1.0,
+        max_total_exposure=1.0) that would otherwise look like meaningful caps.
+        """
         if x is None:
             return None
         try:
-            return f"{float(x) * 100:.0f}%"
+            v = float(x)
         except (TypeError, ValueError):
             return None
+        if hide_if_ge is not None and v >= hide_if_ge:
+            return None
+        return f"{v * 100:.0f}%"
 
     def _money(x: Any) -> Optional[str]:
         if x is None:
@@ -1574,20 +1580,62 @@ def _build_runtime_summary(raw: dict, active_strategy: Optional[str]) -> Dict[st
         except (TypeError, ValueError):
             return None
 
-    # Values of None mean "not configured" — _build_config_panel drops those
-    # rows entirely rather than rendering a meaningless "—".
+    # Dashboard's active asset; config's default_asset is the fallback.
+    asset_name: Optional[str] = None
+    if _slug_prefix and isinstance(_slug_prefix, str):
+        asset_name = _slug_prefix.split("-", 1)[0].upper() or None
+    if not asset_name:
+        updown_bot = raw.get("updown_bot", {}) or raw.get("btc_updown_bot", {}) or {}
+        asset_name = updown_bot.get("default_asset")
+
+    # Wrong exchange shifts feature distribution vs training (logreg uses
+    # coinbase, logreg_fb uses binance), so surface the mismatch risk.
+    feed_sym = strat_cfg.get("btc_symbol")
+    feed_ex = strat_cfg.get("btc_exchange")
+    feed_str = f"{feed_sym} · {feed_ex}" if (feed_sym and feed_ex) else (feed_sym or feed_ex or None)
+
+    tte_lo = strat_cfg.get("min_seconds_to_expiry")
+    tte_hi = strat_cfg.get("max_seconds_to_expiry")
+    if tte_lo is not None and tte_hi is not None:
+        tte_window: Optional[str] = f"{int(tte_lo)}–{int(tte_hi)}s"
+    else:
+        tte_window = None
+
+    if strat_cfg.get("fee_enabled") is True:
+        rate_str = _fnum(strat_cfg.get("taker_fee_rate"), ".1%")
+        fee_str: Optional[str] = f"taker {rate_str}" if rate_str else "taker on"
+    elif strat_cfg.get("fee_enabled") is False:
+        fee_str = "off"
+    else:
+        fee_str = None
+
+    retrain_block = strat_cfg.get("retrain") or {}
+    if isinstance(retrain_block, dict) and "enabled" in retrain_block:
+        retrain_enabled: Optional[bool] = bool(retrain_block.get("enabled"))
+    else:
+        retrain_enabled = None
+
     return {
         "mode": "PAPER" if trading.get("paper_trading", True) else "LIVE",
+        "asset": asset_name or None,
         "interval": f"{int(trading.get('interval', 300))}s "
                     f"({int(trading.get('interval', 300)) // 60}m)",
+        "exit_rule": trading.get("exit_rule") or None,
         "strategy": strat_name or "—",
         "model_dir": strat_cfg.get("model_dir") or None,
+        "feed": feed_str,
         "max_position": max_position,
         "kelly": _fnum(strat_cfg.get("kelly_fraction"), ".2f"),
         "min_edge": _fnum(strat_cfg.get("delta") or strat_cfg.get("min_edge"), ".3f"),
         "min_conf": _fnum(strat_cfg.get("min_confidence"), ".2f"),
-        "max_exposure": _pct(risk.get("max_total_exposure")),
-        "daily_loss": _pct(risk.get("max_daily_loss")),
+        "tte_window": tte_window,
+        "spread_cap": _pct(strat_cfg.get("max_spread_pct")),
+        "fee": fee_str,
+        "retrain_enabled": retrain_enabled,
+        # ≥ 1.0 means "disabled" per config comment — hide to avoid looking
+        # like a meaningful cap when max_session_loss_usdc is the real stop.
+        "max_exposure": _pct(risk.get("max_total_exposure"), hide_if_ge=1.0),
+        "daily_loss": _pct(risk.get("max_daily_loss"), hide_if_ge=1.0),
         "session_loss": _money(risk.get("max_session_loss_usdc")),
     }
 
@@ -1636,15 +1684,30 @@ def _build_config_panel(
         tbl.add_row(label, Text(str(val), style=style))
 
     tbl.add_row("mode",      Text(summary["mode"], style=mode_style))
+    _add("asset",     "asset", style="bold white")
     _add("interval",  "interval")
+    _add("exit rule", "exit_rule")
     tbl.add_row("", "")
 
     _add("strategy",  "strategy",     style="bold white")
     _add("model",     "model_dir")
+    _add("feed",      "feed")
     _add("position",  "max_position")
     _add("kelly",     "kelly")
     _add("min edge",  "min_edge")
     _add("min conf",  "min_conf")
+    tbl.add_row("", "")
+
+    _add("tte",       "tte_window")
+    _add("spread",    "spread_cap")
+    _add("fee",       "fee")
+    retrain_on = summary.get("retrain_enabled")
+    if retrain_on is not None:
+        tbl.add_row(
+            "retrain",
+            Text("ON" if retrain_on else "off",
+                 style="bold green" if retrain_on else "dim"),
+        )
     tbl.add_row("", "")
 
     _add("exposure",  "max_exposure")
