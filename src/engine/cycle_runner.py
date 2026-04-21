@@ -20,6 +20,7 @@ from ..engine.cycle_snapshot import build_cycle_snapshot
 from ..engine.inventory import (
     InventoryState,
     apply_fill_to_state,
+    record_realized_pnl,
     sync_inventories_to_state,
     sync_strategy_from_inventories,
 )
@@ -161,15 +162,10 @@ class CycleRunner:
         # inventory.  Paper trading handles fills immediately in execute_signals() so we
         # must NOT apply them again here (that would double-count).
         if not svc.paper_trading:
-            realized = svc.execution_tracker.realized_pnl_from_fills
-            if realized != 0.0:
-                svc.state.daily_realized_pnl += realized
-                svc.state.slot_realized_pnl += realized
-                svc.risk_manager.record_trade(realized)
-                if realized > 0:
-                    svc.state.session_wins += 1
-                elif realized < 0:
-                    svc.state.session_losses += 1
+            record_realized_pnl(
+                svc.state, svc.risk_manager,
+                svc.execution_tracker.realized_pnl_from_fills,
+            )
         sync_inventories_to_state(svc.state, svc.inventories)
         sync_strategy_from_inventories(
             svc.strategy, svc.inventories, (self._yes_tid, self._no_tid)
@@ -320,15 +316,10 @@ class CycleRunner:
                     if svc.state.active_order_ids.get(tid) == order.order_id:
                         svc.state.active_order_ids[tid] = None
                 if not svc.paper_trading:
-                    realized = svc.execution_tracker.realized_pnl_from_fills
-                    if realized != 0.0:
-                        svc.state.daily_realized_pnl += realized
-                        svc.state.slot_realized_pnl += realized
-                        svc.risk_manager.record_trade(realized)
-                        if realized > 0:
-                            svc.state.session_wins += 1
-                        elif realized < 0:
-                            svc.state.session_losses += 1
+                    record_realized_pnl(
+                        svc.state, svc.risk_manager,
+                        svc.execution_tracker.realized_pnl_from_fills,
+                    )
                 sync_inventories_to_state(svc.state, svc.inventories)
                 sync_strategy_from_inventories(
                     svc.strategy, svc.inventories, (self._yes_tid, self._no_tid)
