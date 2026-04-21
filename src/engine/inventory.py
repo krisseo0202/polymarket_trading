@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Tuple, TYPE_CHECKING
 from ..api.types import Side
+from .state_store import record_realized_pnl
 
 if TYPE_CHECKING:
     from .state_store import BotState
@@ -86,31 +87,6 @@ class InventoryState:
 
         self._normalize()
         return realized
-
-
-def record_realized_pnl(
-    state: "BotState",
-    risk_manager: "RiskManager",
-    realized: float,
-) -> None:
-    """Single source of truth for applying a realized-PnL delta to BotState.
-
-    Updates daily / slot PnL, session_wins / session_losses, and notifies
-    RiskManager. Zero is a no-op so callers don't have to pre-guard.
-
-    Called from every path that produces a realized-PnL delta:
-      - paper fills and hold-to-expiry settlements via apply_fill_to_state
-      - live fills via cycle_runner's reconcile path
-    """
-    if realized == 0.0:
-        return
-    state.daily_realized_pnl += realized
-    state.slot_realized_pnl += realized
-    risk_manager.record_trade(realized)
-    if realized > 0:
-        state.session_wins += 1
-    else:
-        state.session_losses += 1
 
 
 def apply_fill_to_state(

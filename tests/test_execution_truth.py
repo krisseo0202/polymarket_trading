@@ -330,7 +330,7 @@ class TestRecordRealizedPnl:
     """
 
     def test_positive_realized_updates_everything(self):
-        from src.engine.inventory import record_realized_pnl
+        from src.engine.state_store import record_realized_pnl
         state = _FakeState()
         rm = _FakeRiskManager()
 
@@ -343,7 +343,7 @@ class TestRecordRealizedPnl:
         assert rm.trades == [2.50]
 
     def test_negative_realized_increments_losses(self):
-        from src.engine.inventory import record_realized_pnl
+        from src.engine.state_store import record_realized_pnl
         state = _FakeState()
         rm = _FakeRiskManager()
 
@@ -356,7 +356,7 @@ class TestRecordRealizedPnl:
 
     def test_zero_realized_is_noop(self):
         """Guard lets callers pass a fill's delta without pre-checking."""
-        from src.engine.inventory import record_realized_pnl
+        from src.engine.state_store import record_realized_pnl
         state = _FakeState()
         rm = _FakeRiskManager()
 

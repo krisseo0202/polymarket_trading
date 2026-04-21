@@ -20,7 +20,6 @@ from ..engine.cycle_snapshot import build_cycle_snapshot
 from ..engine.inventory import (
     InventoryState,
     apply_fill_to_state,
-    record_realized_pnl,
     sync_inventories_to_state,
     sync_strategy_from_inventories,
 )
@@ -31,7 +30,7 @@ from ..engine.slot_state import (
     fetch_slot_market,
     settle_expiring_positions,
 )
-from ..engine.state_store import snapshot_chainlink_state, snapshot_strategy_state
+from ..engine.state_store import record_realized_pnl, snapshot_chainlink_state, snapshot_strategy_state
 from ..strategies.base import Signal
 from ..utils.market_utils import find_updown_market
 
