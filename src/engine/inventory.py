@@ -108,9 +108,9 @@ def apply_fill_to_state(
     if realized != 0.0:
         risk_manager.record_trade(realized)
         if realized > 0:
-            state.session_wins = getattr(state, "session_wins", 0) + 1
+            state.session_wins += 1
         else:
-            state.session_losses = getattr(state, "session_losses", 0) + 1
+            state.session_losses += 1
     return realized
 
 
