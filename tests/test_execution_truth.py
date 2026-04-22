@@ -321,6 +321,53 @@ class TestPaperWinLossCounting:
         assert state.session_losses == 0
 
 
+class TestRecordRealizedPnl:
+    """Direct tests for the shared record_realized_pnl helper.
+
+    Called from three sites: paper fills (apply_fill_to_state), live fills
+    (cycle_runner reconcile), and hold-to-expiry settlements. All three
+    must see identical counter + PnL behavior.
+    """
+
+    def test_positive_realized_updates_everything(self):
+        from src.engine.state_store import record_realized_pnl
+        state = _FakeState()
+        rm = _FakeRiskManager()
+
+        record_realized_pnl(state, rm, 2.50)
+
+        assert state.daily_realized_pnl == 2.50
+        assert state.slot_realized_pnl == 2.50
+        assert state.session_wins == 1
+        assert state.session_losses == 0
+        assert rm.trades == [2.50]
+
+    def test_negative_realized_increments_losses(self):
+        from src.engine.state_store import record_realized_pnl
+        state = _FakeState()
+        rm = _FakeRiskManager()
+
+        record_realized_pnl(state, rm, -1.25)
+
+        assert state.daily_realized_pnl == -1.25
+        assert state.session_wins == 0
+        assert state.session_losses == 1
+        assert rm.trades == [-1.25]
+
+    def test_zero_realized_is_noop(self):
+        """Guard lets callers pass a fill's delta without pre-checking."""
+        from src.engine.state_store import record_realized_pnl
+        state = _FakeState()
+        rm = _FakeRiskManager()
+
+        record_realized_pnl(state, rm, 0.0)
+
+        assert state.daily_realized_pnl == 0.0
+        assert state.session_wins == 0
+        assert state.session_losses == 0
+        assert rm.trades == []
+
+
 # ---------------------------------------------------------------------------
 # Held side tracking
 # ---------------------------------------------------------------------------

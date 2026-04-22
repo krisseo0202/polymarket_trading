@@ -131,6 +131,8 @@ class StateStore:
                 last_slot_pnl=float(data.get("last_slot_pnl", 0.0)),
                 last_slot_outcome=data.get("last_slot_outcome", ""),
                 trade_log=data.get("trade_log", []),
+                session_wins=int(data.get("session_wins", 0)),
+                session_losses=int(data.get("session_losses", 0)),
             )
         except Exception:
             # Corrupt / unreadable — start fresh rather than crashing
@@ -197,3 +199,20 @@ def snapshot_chainlink_state(
         state.chainlink_ref_price = None
         state.chainlink_ref_slot_ts = None
     state.chainlink_healthy = chainlink_feed.is_healthy() if chainlink_feed else False
+
+
+def record_realized_pnl(
+    state: BotState,
+    risk_manager,
+    realized: float,
+) -> None:
+    """Apply a realized-PnL delta to BotState. Zero is a no-op."""
+    if realized == 0.0:
+        return
+    state.daily_realized_pnl += realized
+    state.slot_realized_pnl += realized
+    risk_manager.record_trade(realized)
+    if realized > 0:
+        state.session_wins += 1
+    else:
+        state.session_losses += 1
