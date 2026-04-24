@@ -1,0 +1,94 @@
+run_id: signed-v1-trim-2026-04-22
+probe_dataset: experiments/signed-v1/dataset.parquet
+
+# Trimmed selection based on experiments/signed-v1/probe/report.md.
+#
+# Keeps the 45 features with xgb_perm_importance strictly above the random
+# sentinel on the 2026-04-16..21 training window. Categories:
+#   - [old] 12 survivors from experiments/full-s3-broad/selection.yaml
+#   - [new] 11 of 96 newly-added signed indicator features
+#   - [oth] 22 columns outside the prior selection (includes known
+#           collinear pairs like yes_mid/no_mid/no_bid — L1 LogReg and the
+#           XGB tree splitter will resolve the redundancy; we trust the
+#           sentinel test over the prior hand-curated exclusion list for
+#           this A/B).
+#
+# A/B vs experiments/signed-v1/selection.yaml (114 features):
+# both run on identical periods — training 04-16..21, val 04-21..22,
+# test 04-22..23. Compares the "scouting pass" Brier/Sharpe/PnL against
+# a probe-disciplined selection of the same pool.
+#
+# Old-selection features rejected by this probe (retired here):
+#   yes_top3_bid_depth, yes_bid_residual, microprice_residual,
+#   slot_low_excursion_bps, yes_book_imbalance, yes_depth_concentration.
+# `microprice_residual` was the top LogReg coef on the earlier probe —
+# its absence here is notable.
+
+active_features:
+  # --- Old-selection survivors (12) ---
+  - moneyness
+  - yes_bid
+  - yes_microprice
+  - yes_spread_pct
+  - fair_value_p_up
+  - slot_high_excursion_bps
+  - moneyness_x_tte
+  - microprice_x_tte
+  - btc_vol_60s
+  - yes_bid_slope
+  - btc_ret_180s
+  - seconds_to_expiry
+
+  # --- New indicator survivors (11) ---
+  - ut_3m_bars_since_signal
+  - td_3m_tdst_distance_pct
+  - ut_1m_distance_pct
+  - td_3m_cd
+  - td_3m_setup
+  - td_1m_tdst_distance_pct
+  - ut_3m_distance_pct
+  - td_tdst_distance_pct
+  - ut_5m_distance_pct
+  - td_5m_signal_9
+  - rsi_3m
+
+  # --- Other above-sentinel features (22) — trust the probe ---
+  - yes_mid
+  - no_microprice
+  - no_mid
+  - no_bid
+  - slot_drift_bps
+  - btc_ret_1800s
+  - slot_time_above_strike_pct
+  - no_depth_concentration
+  - yes_ask
+  - strike_crosses_x_vol
+  - no_top3_ask_depth
+  - no_ask
+  - no_ask_slope
+  - no_spread_pct
+  - no_ret_30s
+  - yes_depth_slope
+  - strike_price
+  - slot_strike_crosses
+  - no_bid_slope
+  - yes_ret_30s
+  - yes_ask_slope
+  - no_depth_slope
+
+rejected_features:
+  - {name: yes_top3_bid_depth, reason: "below random sentinel on 04-16..21 probe"}
+  - {name: yes_bid_residual, reason: "below random sentinel"}
+  - {name: microprice_residual, reason: "below random sentinel — the former LogReg champion; surprise drop"}
+  - {name: slot_low_excursion_bps, reason: "below random sentinel"}
+  - {name: yes_book_imbalance, reason: "below random sentinel"}
+  - {name: yes_depth_concentration, reason: "below random sentinel"}
+  - {name: "<85 newly-added indicator features>", reason: "below random sentinel — see probe/report.md; most of the multi-TF bank is noise on 5 training days"}
+
+rationale: |
+  Disciplined trim of the 114-feature scouting pass. Selects only features
+  with permutation importance strictly above the random sentinel on the
+  training window. 45 features / ~40% of the scouting pass. Retains
+  collinear duplicates from the "other" category intentionally — we're
+  deferring their pruning to L1 LogReg so the A/B cleanly measures the
+  effect of the sentinel cut, not the sentinel cut + collinearity choices.

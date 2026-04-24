@@ -4,24 +4,7 @@ from __future__ import annotations
 
 from typing import Dict, List
 
-# Timeframe tokens used by multi-TF indicator features. Source of truth:
-# src/models/multi_tf_features.TIMEFRAMES. Kept in sync manually — if you add
-# a timeframe there, append it here too (order preserves column ordering).
-_MULTI_TF_TOKENS = ("1m", "3m", "5m", "15m", "30m", "60m", "240m")
-
-
-def _multi_tf_columns() -> List[str]:
-    cols: List[str] = []
-    for tf in _MULTI_TF_TOKENS:
-        cols.append(f"rsi_{tf}")
-        for suffix in ("trend", "distance_pct", "buy_signal", "sell_signal"):
-            cols.append(f"ut_{tf}_{suffix}")
-        for suffix in (
-            "bull_setup", "bear_setup", "buy_cd", "sell_cd",
-            "buy_9", "sell_9", "buy_13", "sell_13",
-        ):
-            cols.append(f"td_{tf}_{suffix}")
-    return cols
+from .multi_tf_features import multi_tf_feature_names
 
 
 FEATURE_COLUMNS: List[str] = [
@@ -31,6 +14,9 @@ FEATURE_COLUMNS: List[str] = [
     "btc_ret_30s",
     "btc_ret_60s",
     "btc_ret_180s",
+    "btc_ret_600s",
+    "btc_ret_1800s",
+    "btc_ret_3600s",
     "btc_vol_15s",
     "btc_vol_30s",
     "btc_vol_60s",
@@ -65,6 +51,17 @@ FEATURE_COLUMNS: List[str] = [
     "no_microprice",
     "no_depth_slope",
     "no_depth_concentration",
+    # Family A+ — top-N cumulative depth & side-split slopes
+    "yes_top3_bid_depth",
+    "yes_top3_ask_depth",
+    "yes_top3_imbalance",
+    "yes_bid_slope",
+    "yes_ask_slope",
+    "no_top3_bid_depth",
+    "no_top3_ask_depth",
+    "no_top3_imbalance",
+    "no_bid_slope",
+    "no_ask_slope",
     # Family B — YES/NO coherence (cross-book residuals and asymmetries)
     "mid_sum_residual",
     "mid_sum_residual_abs",
@@ -76,29 +73,37 @@ FEATURE_COLUMNS: List[str] = [
     "slot_drift_bps",
     "slot_time_above_strike_pct",
     "slot_strike_crosses",
+    # Family D — interaction terms (LogReg cannot synthesize these internally)
+    "moneyness_x_tte",
+    "microprice_x_tte",
+    "strike_crosses_x_vol",
+    # Family E — fair-value residuals (closed-form Brownian proxy)
+    "fair_value_p_up",
+    "yes_bid_residual",
+    "microprice_residual",
     # FVG indicator
     "active_bull_gap",
     "active_bear_gap",
     "latest_gap_distance_pct",
-    # TD Sequential indicator
-    "bull_setup",
-    "bear_setup",
-    "buy_cd",
-    "sell_cd",
-    "buy_9",
-    "sell_9",
-    "buy_13",
-    "sell_13",
-    # UT Bot indicator
+    # TD Sequential (5s bars) — signed: + bullish / − bearish / 0 inactive.
+    # td_cd is only meaningful in classic mode; in pine_simple it still
+    # computes but the chart ignores it and the model should too.
+    "td_setup",
+    "td_cd",
+    "td_signal_9",
+    "td_signal_13",
+    "td_display",
+    "td_tdst_distance_pct",
+    "td_tdst_side",
+    # UT Bot (5s bars) — signed.
     "ut_bot_trend",
     "ut_bot_distance_pct",
-    "ut_bot_buy_signal",
-    "ut_bot_sell_signal",
-    # Multi-timeframe macro features (7 TFs × 13 per TF = 91 cols).
-    # Order: 1m, 3m, 5m, 15m, 30m, 60m, 240m; within each TF:
-    # rsi_{tf}, ut_{tf}_{trend,distance_pct,buy_signal,sell_signal},
-    # td_{tf}_{bull_setup,bear_setup,buy_cd,sell_cd,buy_9,sell_9,buy_13,sell_13}.
-    *_multi_tf_columns(),
+    "ut_bot_signal",
+    "ut_bot_bars_since_signal",
+    # Single-TF RSI-14 on ticks (warm in ~15 ticks; the multi-TF RSI bank
+    # needs bar-level history and takes longer).
+    "rsi_14",
+    *multi_tf_feature_names(),
 ]
 
 DEFAULT_FEATURE_VALUES: Dict[str, float] = {name: 0.0 for name in FEATURE_COLUMNS}

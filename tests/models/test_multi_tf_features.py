@@ -21,18 +21,20 @@ def _synth_ticks(n_hours: int, seed: int = 0):
     return list(zip(ts.tolist(), price.tolist())), ts_base, n
 
 
-def test_feature_names_has_91_unique_columns():
+def test_feature_names_has_84_unique_columns():
+    # 7 TFs × 12 features = 84 (signed encoding: bull/bear collapsed).
     names = multi_tf_feature_names()
-    assert len(names) == 91
-    assert len(set(names)) == 91
+    assert len(names) == 84
+    assert len(set(names)) == 84
 
 
 def test_feature_names_follow_convention():
     names = set(multi_tf_feature_names())
     # Spot-check a handful from each family across the TF range.
     for col in ("rsi_1m", "rsi_240m", "ut_5m_trend", "ut_60m_distance_pct",
-                "ut_30m_buy_signal", "td_15m_bull_setup", "td_240m_buy_13",
-                "td_3m_sell_9"):
+                "ut_30m_signal", "ut_15m_bars_since_signal",
+                "td_15m_setup", "td_240m_signal_13", "td_3m_signal_9",
+                "td_5m_display", "td_60m_tdst_distance_pct", "td_1m_tdst_side"):
         assert col in names, f"missing {col}"
 
 

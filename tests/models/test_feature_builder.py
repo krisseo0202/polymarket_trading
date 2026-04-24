@@ -37,7 +37,7 @@ def test_build_live_features_ready_with_indicator_warmup():
     assert result.features["yes_spread"] > 0
     assert result.features["no_spread"] > 0
     assert result.features["active_bull_gap"] == 0.0
-    assert result.features["bull_setup"] == 0.0
+    assert result.features["td_setup"] == 0.0
 
 
 def test_build_live_features_fails_closed_without_strike():
