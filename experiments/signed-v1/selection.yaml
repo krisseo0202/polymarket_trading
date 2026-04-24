@@ -1,0 +1,171 @@
+run_id: signed-v1-2026-04-22
+probe_dataset: experiments/signed-v1/dataset.parquet
+
+# Selection for the first training run under the new signed-indicator schema.
+#
+# Starts from the 18 features kept in experiments/full-s3-broad/selection.yaml
+# (still valid — none of those 18 were renamed) and adds the newly-added TD /
+# UT Bot / multi-TF-RSI features. Sign convention across all new indicator
+# cols: + bullish / − bearish / 0 inactive. Only one direction is ever active
+# at a given bar, so the signed value carries both direction and magnitude
+# without losing information.
+#
+# Total active_features: 114 (18 existing + 96 new indicator cols).
+# No probe was run for this selection — train.py's promote-gate will report
+# N/A on both models. The meta.json still records Brier/Sharpe/PnL on val
+# (2026-04-21) and test (2026-04-22).
+
+active_features:
+  # --- Price / moneyness ---
+  - yes_bid
+  - moneyness
+
+  # --- YES-book microstructure (Family A / A+) ---
+  - yes_microprice
+  - yes_spread_pct
+  - yes_book_imbalance
+  - yes_depth_concentration
+  - yes_top3_bid_depth
+  - yes_bid_slope
+
+  # --- Within-slot path (Family C) ---
+  - slot_high_excursion_bps
+  - slot_low_excursion_bps
+
+  # --- BTC dynamics (survivors from the broad probe) ---
+  - btc_vol_60s
+  - btc_ret_180s
+
+  # --- Time-to-expiry + interactions (Family D) ---
+  - seconds_to_expiry
+  - moneyness_x_tte
+  - microprice_x_tte
+
+  # --- Fair-value residuals (Family E) ---
+  - fair_value_p_up
+  - yes_bid_residual
+  - microprice_residual
+
+  # --- NEW: single-TF TD Sequential (5s bars), signed encoding ---
+  - td_setup                 # bull_setup − bear_setup
+  - td_cd                    # buy_cd − sell_cd  (classic mode only)
+  - td_signal_9              # {−1, 0, +1} setup-complete pulse
+  - td_signal_13             # {−1, 0, +1} countdown-complete pulse
+  - td_display               # chart digit: + bullish, − bearish
+  - td_tdst_distance_pct     # (close − active_tdst_level) / close
+  - td_tdst_side             # {−1 resistance, 0 none, +1 support}
+
+  # --- NEW: single-TF UT Bot (5s bars), signed encoding ---
+  - ut_bot_trend
+  - ut_bot_distance_pct
+  - ut_bot_signal            # {−1, 0, +1}
+  - ut_bot_bars_since_signal # +bars since last buy, −bars since last sell
+
+  # --- Single-TF RSI (tick-level, warm from ~15 ticks) ---
+  - rsi_14
+
+  # --- NEW: multi-TF bank (7 TFs × 12 cols = 84 features) ---
+  # Order follows src.models.multi_tf_features.TIMEFRAMES.
+  # 1-minute
+  - rsi_1m
+  - ut_1m_trend
+  - ut_1m_distance_pct
+  - ut_1m_signal
+  - ut_1m_bars_since_signal
+  - td_1m_setup
+  - td_1m_cd
+  - td_1m_signal_9
+  - td_1m_signal_13
+  - td_1m_display
+  - td_1m_tdst_distance_pct
+  - td_1m_tdst_side
+  # 3-minute
+  - rsi_3m
+  - ut_3m_trend
+  - ut_3m_distance_pct
+  - ut_3m_signal
+  - ut_3m_bars_since_signal
+  - td_3m_setup
+  - td_3m_cd
+  - td_3m_signal_9
+  - td_3m_signal_13
+  - td_3m_display
+  - td_3m_tdst_distance_pct
+  - td_3m_tdst_side
+  # 5-minute
+  - rsi_5m
+  - ut_5m_trend
+  - ut_5m_distance_pct
+  - ut_5m_signal
+  - ut_5m_bars_since_signal
+  - td_5m_setup
+  - td_5m_cd
+  - td_5m_signal_9
+  - td_5m_signal_13
+  - td_5m_display
+  - td_5m_tdst_distance_pct
+  - td_5m_tdst_side
+  # 15-minute
+  - rsi_15m
+  - ut_15m_trend
+  - ut_15m_distance_pct
+  - ut_15m_signal
+  - ut_15m_bars_since_signal
+  - td_15m_setup
+  - td_15m_cd
+  - td_15m_signal_9
+  - td_15m_signal_13
+  - td_15m_display
+  - td_15m_tdst_distance_pct
+  - td_15m_tdst_side
+  # 30-minute
+  - rsi_30m
+  - ut_30m_trend
+  - ut_30m_distance_pct
+  - ut_30m_signal
+  - ut_30m_bars_since_signal
+  - td_30m_setup
+  - td_30m_cd
+  - td_30m_signal_9
+  - td_30m_signal_13
+  - td_30m_display
+  - td_30m_tdst_distance_pct
+  - td_30m_tdst_side
+  # 60-minute
+  - rsi_60m
+  - ut_60m_trend
+  - ut_60m_distance_pct
+  - ut_60m_signal
+  - ut_60m_bars_since_signal
+  - td_60m_setup
+  - td_60m_cd
+  - td_60m_signal_9
+  - td_60m_signal_13
+  - td_60m_display
+  - td_60m_tdst_distance_pct
+  - td_60m_tdst_side
+  # 240-minute (4h)
+  - rsi_240m
+  - ut_240m_trend
+  - ut_240m_distance_pct
+  - ut_240m_signal
+  - ut_240m_bars_since_signal
+  - td_240m_setup
+  - td_240m_cd
+  - td_240m_signal_9
+  - td_240m_signal_13
+  - td_240m_display
+  - td_240m_tdst_distance_pct
+  - td_240m_tdst_side
+
+rejected_features: []
+
+rationale: |
+  First training run under the signed-indicator schema. Starts from the
+  18 anchor features in experiments/full-s3-broad/selection.yaml (still
+  valid — none of those were renamed) and adds all newly-added TD/UT/RSI
+  indicator columns across single-TF (5s) and the 7-TF macro bank. No
+  pre-training probe was run; this is a scouting pass to see whether the
+  signed collapse + chart-aligned additions (td_display, td_tdst_*,
+  ut_bars_since_signal) buy any Brier/Sharpe over the prior 18-feature
+  baseline.

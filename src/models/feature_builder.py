@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
@@ -14,6 +15,7 @@ from indicators.fvg import FVGIndicator
 from indicators.td_sequential import TDSequentialIndicator
 from indicators.ut_bot import UTBotIndicator
 from src.api.types import OrderBook
+from ._indicator_utils import signed_bars_since, signed_flag, tdst_distance_and_side
 from .multi_tf_features import compute_multi_tf_features
 from .schema import DEFAULT_FEATURE_VALUES, FEATURE_COLUMNS
 
@@ -76,12 +78,19 @@ def build_live_features(snapshot: Mapping[str, object]) -> FeatureBuildResult:
     features["moneyness"] = (btc_mid - strike_price) / strike_price
     features["distance_to_strike_bps"] = features["moneyness"] * 10_000.0
 
-    # Momentum at multiple horizons
+    # Momentum at multiple horizons. Long-horizon returns (10m, 30m, 60m)
+    # give the model macro trend context the short horizons can't provide.
+    # They require btc_prices with at least that much history (see the
+    # caller's BTC window constant; default raised to 14400s to make these
+    # computable + warm up short-TF multi-TF RSI).
     features["btc_ret_5s"] = _safe_return(btc_prices, now_ts, 5)
     features["btc_ret_15s"] = _safe_return(btc_prices, now_ts, 15)
     features["btc_ret_30s"] = _safe_return(btc_prices, now_ts, 30)
     features["btc_ret_60s"] = _safe_return(btc_prices, now_ts, 60)
     features["btc_ret_180s"] = _safe_return(btc_prices, now_ts, 180)
+    features["btc_ret_600s"] = _safe_return(btc_prices, now_ts, 600)
+    features["btc_ret_1800s"] = _safe_return(btc_prices, now_ts, 1800)
+    features["btc_ret_3600s"] = _safe_return(btc_prices, now_ts, 3600)
 
     # Realized volatility at multiple horizons + ratio
     vol_15 = _realized_vol(btc_prices, now_ts, 15)
@@ -104,6 +113,9 @@ def build_live_features(snapshot: Mapping[str, object]) -> FeatureBuildResult:
     _add_depth_features(features, no_book, prefix="no")
     _add_coherence_features(features, yes_book, no_book)
     _merge_slot_path_features(features, snapshot.get("slot_path_features"))
+    _add_rsi14(features, btc_prices)
+    _add_fair_value_features(features)
+    _add_interaction_features(features)
 
     indicator_status = _add_indicator_features(features, btc_prices, btc_mid)
 
@@ -284,11 +296,93 @@ def _add_depth_features(
     ask_slope = _side_depth_slope(asks, mid, _DEPTH_SLOPE_LEVELS)
     if bid_slope != 0.0 or ask_slope != 0.0:
         features[f"{prefix}_depth_slope"] = (bid_slope + ask_slope) / 2.0
+    # Side-split slopes give the model the bid/ask asymmetry the averaged
+    # depth_slope hides.
+    features[f"{prefix}_bid_slope"] = bid_slope
+    features[f"{prefix}_ask_slope"] = ask_slope
 
     total_depth = sum(float(e.size) for e in bids) + sum(float(e.size) for e in asks)
     l1_depth = bid_l1_size + ask_l1_size
     if total_depth > 0:
         features[f"{prefix}_depth_concentration"] = l1_depth / total_depth
+
+    # Top-N cumulative depth (Family A+).
+    top3_bid = sum(float(e.size) for e in bids[:3])
+    top3_ask = sum(float(e.size) for e in asks[:3])
+    features[f"{prefix}_top3_bid_depth"] = top3_bid
+    features[f"{prefix}_top3_ask_depth"] = top3_ask
+    top3_total = top3_bid + top3_ask
+    if top3_total > 0:
+        features[f"{prefix}_top3_imbalance"] = (top3_bid - top3_ask) / top3_total
+
+
+_NORMAL_CDF_FACTOR = 1.0 / math.sqrt(2.0)
+_RSI_PERIOD = 14
+
+
+def _add_rsi14(
+    features: Dict[str, float],
+    btc_prices: Sequence[Tuple[float, float]],
+) -> None:
+    """Classic RSI-14 on tick-level prices. Returns 50 (neutral) when warming.
+
+    Note: this is a short-memory momentum oscillator on raw ticks, not a 1-min
+    resampled RSI. For a 5-min binary horizon, responsiveness matters more
+    than smoothing — and the tick version warms within ~15 ticks instead of
+    15 minutes.
+    """
+    if len(btc_prices) < _RSI_PERIOD + 1:
+        features["rsi_14"] = 50.0
+        return
+    seg = np.asarray([float(p[1]) for p in btc_prices[-(_RSI_PERIOD + 1):]], dtype=float)
+    diffs = np.diff(seg)
+    gains = float(diffs[diffs > 0].sum()) / _RSI_PERIOD
+    losses = float(-diffs[diffs < 0].sum()) / _RSI_PERIOD
+    if losses == 0.0:
+        features["rsi_14"] = 100.0 if gains > 0 else 50.0
+        return
+    rs = gains / losses
+    features["rsi_14"] = 100.0 - 100.0 / (1.0 + rs)
+
+
+def _add_fair_value_features(features: Dict[str, float]) -> None:
+    """Brownian closed-form fair value for the 5-min binary, plus residuals.
+
+    P(BTC_T >= strike | spot_t) ≈ Φ(moneyness / (σ · √(tte_seconds)))
+    with σ taken from realized-vol on the same horizon scale as tte.
+
+    Residuals tell the model "is YES rich or cheap given BTC state and time
+    left?" — the standard tradable signal a residual model exposes.
+    Defaults to fair=0.5 (uninformative prior) when σ or tte is degenerate.
+    """
+    moneyness = features["moneyness"]
+    tte = features["seconds_to_expiry"]
+    sigma = features["btc_vol_30s"]
+    if sigma > 0 and tte > 0:
+        z = moneyness / (sigma * math.sqrt(tte))
+        fair = 0.5 * (1.0 + math.erf(z * _NORMAL_CDF_FACTOR))
+    else:
+        fair = 0.5
+    features["fair_value_p_up"] = fair
+    features["yes_bid_residual"] = features["yes_bid"] - fair
+    features["microprice_residual"] = features["yes_microprice"] - fair
+
+
+def _add_interaction_features(features: Dict[str, float]) -> None:
+    """Pairwise products the LogReg cannot synthesize linearly.
+
+    moneyness_x_tte:    magnitude of moneyness weighted by time remaining —
+                        a small edge early in the slot matters more than the
+                        same edge with 10s left.
+    microprice_x_tte:   market's own forecast weighted by how much reversal
+                        room it still has.
+    strike_crosses_x_vol: choppy slots with high vol are where the outcome is
+                          genuinely a coin flip; quiet slots with few crosses
+                          already committed.
+    """
+    features["moneyness_x_tte"] = features["moneyness"] * features["seconds_to_expiry"]
+    features["microprice_x_tte"] = features["yes_microprice"] * features["seconds_to_expiry"]
+    features["strike_crosses_x_vol"] = features["slot_strike_crosses"] * features["btc_vol_30s"]
 
 
 def _merge_slot_path_features(
@@ -414,29 +508,41 @@ def _add_indicator_features(
         features["latest_gap_distance_pct"] = abs(btc_mid - gap_mid) / btc_mid
 
     vals = tds_result.values
-    features["bull_setup"] = float(_last_scalar(vals.get("bullish_setup_count")))
-    features["bear_setup"] = float(_last_scalar(vals.get("bearish_setup_count")))
-    features["buy_cd"] = float(_last_scalar(vals.get("buy_cd_count")))
-    features["sell_cd"] = float(_last_scalar(vals.get("sell_cd_count")))
-    features["buy_9"] = float(bool(_last_scalar(vals.get("buy_9"))))
-    features["sell_9"] = float(bool(_last_scalar(vals.get("sell_9"))))
-    features["buy_13"] = float(bool(_last_scalar(vals.get("buy_13"))))
-    features["sell_13"] = float(bool(_last_scalar(vals.get("sell_13"))))
-
-    # UT Bot — ATR trailing stop trend filter
-    utb_vals = utb_result.values
-    trail = utb_vals.get("trail")
-    buy_sig = utb_vals.get("buy")
-    sell_sig = utb_vals.get("sell")
-
     last_close = float(ohlc["close"].iloc[-1])
-    last_trail = float(_last_scalar(trail))
+
+    features["td_setup"] = float(_last_scalar(vals.get("bullish_setup_count"))) - float(
+        _last_scalar(vals.get("bearish_setup_count"))
+    )
+    features["td_cd"] = float(_last_scalar(vals.get("buy_cd_count"))) - float(
+        _last_scalar(vals.get("sell_cd_count"))
+    )
+    features["td_signal_9"] = signed_flag(
+        bool(_last_scalar(vals.get("buy_9"))), bool(_last_scalar(vals.get("sell_9"))),
+    )
+    features["td_signal_13"] = signed_flag(
+        bool(_last_scalar(vals.get("buy_13"))), bool(_last_scalar(vals.get("sell_13"))),
+    )
+    features["td_display"] = float(_last_scalar(vals.get("td_dn"))) - float(
+        _last_scalar(vals.get("td_up"))
+    )
+
+    tdst_dist, tdst_side = tdst_distance_and_side(vals, last_close)
+    features["td_tdst_distance_pct"] = tdst_dist
+    features["td_tdst_side"] = tdst_side
+
+    utb_vals = utb_result.values
+    last_trail = float(_last_scalar(utb_vals.get("trail")))
     features["ut_bot_trend"] = 1.0 if last_close > last_trail else -1.0
     features["ut_bot_distance_pct"] = (
         (last_close - last_trail) / last_close if last_close > 0 else 0.0
     )
-    features["ut_bot_buy_signal"] = float(bool(_last_scalar(buy_sig)))
-    features["ut_bot_sell_signal"] = float(bool(_last_scalar(sell_sig)))
+    features["ut_bot_signal"] = signed_flag(
+        bool(_last_scalar(utb_vals.get("buy"))),
+        bool(_last_scalar(utb_vals.get("sell"))),
+    )
+    features["ut_bot_bars_since_signal"] = signed_bars_since(
+        utb_vals.get("buy"), utb_vals.get("sell"),
+    )
 
     return "ready"
 
