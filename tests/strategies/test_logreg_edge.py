@@ -108,6 +108,8 @@ def test_no_trade_when_edge_below_delta():
 
 def test_no_trade_when_already_in_position():
     """Once holding, no new signals (hold to expiry)."""
+    from src.api.types import Position
+
     model = _mock_model(prob_yes=0.70)
     strategy = _make_strategy(model, delta=0.05)
     data = _market_data(yes_bid=0.49, yes_ask=0.51, no_bid=0.49, no_ask=0.51)
@@ -115,8 +117,23 @@ def test_no_trade_when_already_in_position():
     # First call: enters
     signals = strategy.analyze(data)
     assert len(signals) == 1
+    sig = signals[0]
 
-    # Second call: already holding → no signals
+    # Simulate the fill — populate `positions` with what would be there after
+    # the order lands. Without this the strategy's _auto_recover_position
+    # correctly clears the optimistic in-flight state and re-evaluates entry.
+    token_id = "yes_token" if sig.outcome == "YES" else "no_token"
+    data["positions"] = [
+        Position(
+            market_id=strategy._market_id,
+            token_id=token_id,
+            outcome=sig.outcome,
+            size=sig.size,
+            average_price=sig.price,
+        )
+    ]
+
+    # Second call: already holding (per inventory) → no signals
     signals = strategy.analyze(data)
     assert len(signals) == 0
 

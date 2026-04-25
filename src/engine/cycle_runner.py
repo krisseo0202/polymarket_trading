@@ -757,7 +757,16 @@ def execute_signals(
     for sig in signals:
         if sig.action == "BUY":
             if not strategy.should_enter(sig):
-                logger.debug(f"BUY rejected by strategy: {sig.reason}")
+                # Visible INFO — a silent DEBUG here once masked an
+                # `enabled: false` config (validate_signal short-circuits
+                # on enabled), producing "TRADED" decision-log records
+                # but zero actual fills.
+                logger.info(
+                    f"BUY rejected by strategy.should_enter "
+                    f"(enabled={strategy.enabled}, "
+                    f"min_conf={strategy.min_confidence}, "
+                    f"sig.conf={sig.confidence:.3f}): {sig.reason}"
+                )
                 continue
             # Clip to risk limits instead of rejecting outright. The
             # strategy's Kelly sizing is a suggestion; the risk manager
