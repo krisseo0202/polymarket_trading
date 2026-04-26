@@ -100,6 +100,23 @@ class LogRegEdgeStrategy(Strategy):
         self.last_f_ret_30s: Optional[float] = None
         self.last_f_delta: Optional[float] = None
 
+        # Late-slot snipe — opt-in microstructure path. Bypasses the normal
+        # min_seconds_to_expiry / min_entry_price / max_entry_price gates;
+        # has its own (different-shape) gates instead. Does NOT consult the
+        # model — thesis is microstructure mispricing harvest, not prediction.
+        snipe_cfg = dict(config.get("late_snipe") or {})
+        self.late_snipe_enabled: bool = bool(snipe_cfg.get("enabled", False))
+        self.late_snipe_max_tte_s: float = float(snipe_cfg.get("max_tte_s", 30.0))
+        self.late_snipe_min_entry_price: float = float(snipe_cfg.get("min_entry_price", 0.90))
+        self.late_snipe_max_entry_price: float = float(snipe_cfg.get("max_entry_price", 0.95))
+        self.late_snipe_min_moneyness_bps: float = float(snipe_cfg.get("min_moneyness_bps", 50.0))
+        self.late_snipe_max_spread_pct: float = float(snipe_cfg.get("max_spread_pct", 0.03))
+        self.late_snipe_size_usdc: float = float(snipe_cfg.get("size_usdc", 5.0))
+        # Once-per-slot guard, keyed by slot_ts (slot_expiry_ts − 300). Slot
+        # rollover changes slot_ts → comparison naturally lets the next slot
+        # snipe again without an explicit reset hook.
+        self._snipe_fired_for_slot: Optional[int] = None
+
     # ------------------------------------------------------------------
     # Core interface
     # ------------------------------------------------------------------
@@ -151,7 +168,10 @@ class LogRegEdgeStrategy(Strategy):
             self.last_skip_reason = "in_position"
             return []
 
-        return self._check_entry(order_books, by_token, market_data, now_wall, now_mono, balance)
+        signals = self._check_entry(order_books, by_token, market_data, now_wall, now_mono, balance)
+        if signals or not self.late_snipe_enabled:
+            return signals
+        return self._check_late_snipe(order_books, by_token, market_data, now_wall, now_mono)
 
     def should_enter(self, signal: Signal) -> bool:
         return self.validate_signal(signal) and signal.confidence >= self.min_confidence
@@ -278,6 +298,27 @@ class LogRegEdgeStrategy(Strategy):
             self.last_skip_reason = f"edge_low: best={best:+.3f} < delta={effective_delta:.3f} (tte={tte:.0f}s)"
             return []
 
+        # Model-side probability floors. If the loaded model_service exposes a
+        # `thresholds` dict with `min_prob_yes` / `max_prob_yes_for_no`,
+        # enforce them as additional gates on top of `delta`. Catches cases
+        # where one side of the calibrator is unreliable in a region the
+        # global delta gate doesn't cover. See tasks/postmortem_2026-04-25.md.
+        model_thresholds = getattr(self.model_service, "thresholds", None)
+        if not isinstance(model_thresholds, dict):
+            model_thresholds = {}
+        min_prob_yes = float(model_thresholds.get("min_prob_yes", 0.0))
+        max_prob_yes_for_no = float(model_thresholds.get("max_prob_yes_for_no", 1.0))
+        if side == "YES" and p_hat < min_prob_yes:
+            self.last_skip_reason = (
+                f"model_prob_yes_low: p_hat={p_hat:.3f} < min_prob_yes={min_prob_yes:.3f}"
+            )
+            return []
+        if side == "NO" and p_hat > max_prob_yes_for_no:
+            self.last_skip_reason = (
+                f"model_prob_yes_high_for_no: p_hat={p_hat:.3f} > max_prob_yes_for_no={max_prob_yes_for_no:.3f}"
+            )
+            return []
+
         # Spread filter
         if side == "YES" and spread_pct(yes_bid, yes_ask) > self.max_spread_pct:
             self.last_skip_reason = f"spread_wide: YES {spread_pct(yes_bid, yes_ask)*100:.1f}% > {self.max_spread_pct*100:.0f}%"
@@ -328,6 +369,139 @@ class LogRegEdgeStrategy(Strategy):
                 f"edge_{side.lower()}={edge:+.3f} delta={self.delta} tte={tte:.0f}s"
             ),
         )]
+
+    # ------------------------------------------------------------------
+    # Late-slot snipe — microstructure path, model-agnostic
+    # ------------------------------------------------------------------
+
+    def _check_late_snipe(
+        self,
+        order_books: Dict[str, OrderBook],
+        by_token: Dict[str, Position],
+        market_data: Dict[str, Any],
+        now_wall: float,
+        now_mono: float,
+    ) -> List[Signal]:
+        """Late-slot, near-resolution sniping. Fires at most once per slot;
+        gated by tte, market price, |moneyness|, and spread."""
+        slot_expiry_ts = float(market_data.get("slot_expiry_ts") or 0.0)
+        tte = max(0.0, slot_expiry_ts - now_wall)
+        if tte > self.late_snipe_max_tte_s:
+            self.last_skip_reason = (
+                f"snipe_tte: {tte:.0f}s > {self.late_snipe_max_tte_s:.0f}s"
+            )
+            return []
+
+        slot_ts = int(slot_expiry_ts) - 300
+        if self._snipe_fired_for_slot == slot_ts:
+            self.last_skip_reason = "snipe_already_fired_this_slot"
+            return []
+
+        if not self.is_flat(by_token):
+            self.last_skip_reason = "snipe_in_position"
+            return []
+
+        strike = float(market_data.get("strike_price") or 0.0)
+        if strike <= 0:
+            self.last_skip_reason = "snipe_missing_strike"
+            return []
+        # Prefer caller-provided btc_mid (lets tests inject a value); fall
+        # back to the live feed when the bot is wired up to one.
+        btc_mid = market_data.get("btc_mid")
+        if btc_mid is None:
+            btc_mid = self._latest_btc_mid()
+        if btc_mid is None or float(btc_mid) <= 0:
+            self.last_skip_reason = "snipe_missing_btc"
+            return []
+        btc_mid = float(btc_mid)
+        moneyness_bps = (btc_mid - strike) / strike * 10_000.0
+
+        yes_book = order_books.get(self._yes_token_id)
+        no_book = order_books.get(self._no_token_id)
+        if yes_book is None or no_book is None:
+            self.last_skip_reason = "snipe_missing_orderbook"
+            return []
+
+        yes_bid = float(yes_book.bids[0].price) if yes_book.bids else 0.0
+        yes_ask = float(yes_book.asks[0].price) if yes_book.asks else 0.0
+        no_bid = float(no_book.bids[0].price) if no_book.bids else 0.0
+        no_ask = float(no_book.asks[0].price) if no_book.asks else 0.0
+
+        # YES snipe needs BTC above strike (positive moneyness) AND the YES
+        # ask in the snipe band. NO snipe is the mirror.
+        side: Optional[str] = None
+        entry_ask = 0.0
+        book: Optional[OrderBook] = None
+        if (
+            moneyness_bps >= self.late_snipe_min_moneyness_bps
+            and self.late_snipe_min_entry_price <= yes_ask <= self.late_snipe_max_entry_price
+        ):
+            side = "YES"
+            entry_ask = yes_ask
+            book = yes_book
+        elif (
+            moneyness_bps <= -self.late_snipe_min_moneyness_bps
+            and self.late_snipe_min_entry_price <= no_ask <= self.late_snipe_max_entry_price
+        ):
+            side = "NO"
+            entry_ask = no_ask
+            book = no_book
+        else:
+            self.last_skip_reason = (
+                f"snipe_no_match: moneyness={moneyness_bps:+.0f}bps "
+                f"yes_ask={yes_ask:.3f} no_ask={no_ask:.3f}"
+            )
+            return []
+
+        side_bid = yes_bid if side == "YES" else no_bid
+        sp_pct = spread_pct(side_bid, entry_ask)
+        if sp_pct > self.late_snipe_max_spread_pct:
+            self.last_skip_reason = (
+                f"snipe_spread_wide: {side} {sp_pct*100:.1f}% > "
+                f"{self.late_snipe_max_spread_pct*100:.1f}%"
+            )
+            return []
+
+        # Size: small fixed USDC notional, converted to shares. Bypasses
+        # Kelly entirely — Kelly on near-certain trades is huge, and we
+        # don't want to dominate the position book if conditions are unusual.
+        shares = round(self.late_snipe_size_usdc / entry_ask, 2)
+        if shares <= 0:
+            self.last_skip_reason = "snipe_size_zero"
+            return []
+
+        # Mark the slot as sniped so we don't double-fire within the same
+        # intra-cycle pass. Reset is implicit: when slot_ts changes on
+        # rollover, the equality check above lets the next slot fire again.
+        # We do NOT optimistically set active_token_id/entry_*: that pattern
+        # caused phantom positions when orders were rejected downstream.
+        # _auto_recover_position picks up the real position from inventory
+        # after the fill lands.
+        self._snipe_fired_for_slot = slot_ts
+
+        tick = book.tick_size or 0.001
+        return [Signal(
+            market_id=self._market_id,
+            outcome=side,
+            action="BUY",
+            confidence=entry_ask,  # market-implied probability of the chosen side
+            price=round_to_tick(entry_ask, tick),
+            size=shares,
+            reason=(
+                f"late_snipe {side} ask={entry_ask:.3f} "
+                f"moneyness={moneyness_bps:+.0f}bps tte={tte:.0f}s "
+                f"spread={sp_pct*100:.1f}% size=${self.late_snipe_size_usdc:.2f}"
+            ),
+        )]
+
+    def _latest_btc_mid(self) -> Optional[float]:
+        """Return the freshest BTC mid from the strategy's BtcPriceFeed."""
+        if self.btc_feed is None:
+            return None
+        try:
+            return self.btc_feed.get_latest_mid()
+        except AttributeError:
+            return None
 
     # ------------------------------------------------------------------
     # Prediction (delegates to model_service)

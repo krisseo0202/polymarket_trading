@@ -204,9 +204,9 @@ def init_services(args) -> Services:
         paper_balance=paper_balance,
     )
 
-    session_loss_cap: float = raw_yaml.get("risk", {}).get("max_session_loss_usdc", float("inf"))
+    risk_yaml = raw_yaml.get("risk", {})
+    session_loss_cap: float = risk_yaml.get("max_session_loss_usdc", float("inf"))
     risk_limits = RiskLimits(
-        max_position_size=cfg.risk_limits.get("max_position_size", 200.0),
         max_position_pct=cfg.risk_limits.get("max_position_pct", 0.05),
         max_total_exposure=cfg.risk_limits.get("max_total_exposure", 0.15),
         max_daily_loss=cfg.risk_limits.get("max_daily_loss", 0.05),
@@ -214,6 +214,9 @@ def init_services(args) -> Services:
         circuit_breaker_enabled=cfg.risk_limits.get("circuit_breaker_enabled", True),
         circuit_breaker_threshold=cfg.risk_limits.get("circuit_breaker_threshold", 0.20),
         max_session_loss_usdc=session_loss_cap,
+        rolling_window_n=int(risk_yaml.get("rolling_window_n", 0)),
+        rolling_pnl_floor_usdc=float(risk_yaml.get("rolling_pnl_floor_usdc", float("-inf"))),
+        rolling_winrate_floor=float(risk_yaml.get("rolling_winrate_floor", 0.0)),
     )
     risk_manager = RiskManager(limits=risk_limits)
 

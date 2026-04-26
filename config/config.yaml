@@ -109,6 +109,12 @@ strategies:
     re_entry_size_mult: 0.5      # 2nd+ entry uses 50% Kelly size (correlation haircut)
     slot_loss_limit_usdc: 15.0   # halt slot trading if cumulative loss exceeds this
 
+    # Edge-stability debounce: require net_edge to clear the required
+    # threshold for this many consecutive ticks in the same slot before
+    # firing. Counters reset at rollover. 1 = no debouncing (legacy). Bump
+    # to 2–3 to filter single-tick orderbook flickers / feature blips.
+    min_stable_ticks: 1
+
   logreg_edge:
     # Legacy logistic regression edge strategy (uses old LogRegModel class).
     # Kept for backwards compatibility. New runs should use --strategy logreg
@@ -126,6 +132,9 @@ strategies:
     kelly_fraction: 0.15
     position_size_usdc: 30.0
     min_confidence: 0.51
+
+    # Edge-stability debounce — see prob_edge.min_stable_ticks for rationale.
+    min_stable_ticks: 1
 
   logreg:
     # Active logistic-regression strategy. Loads the v4 model
@@ -182,12 +191,130 @@ strategies:
       output_parent: "models"
       model_prefix: "logreg_v4"
 
+    # Late-slot snipe — opt-in microstructure path that fires once per slot
+    # when the market price is already near a resolution corner AND BTC has
+    # cleared the strike by enough that a 20-second reversal is implausible.
+    # Bypasses the normal min_seconds_to_expiry / min_entry_price gates;
+    # has its own (stricter, different-shape) gates instead. Does NOT
+    # consult the model — thesis is microstructure mispricing harvest, not
+    # prediction. Cycle-level min_entry_window_s must be ≤ max_tte_s for
+    # the snipe to actually reach place_order. See `tasks/lessons.md`
+    # entry "late-slot snipe" for the trade thesis.
+    #
+    # The same defaults are used by logreg_fb and xgb_fb — anchored here,
+    # referenced via `*late_snipe_defaults` below.
+    late_snipe: &late_snipe_defaults
+      enabled: false
+      max_tte_s: 30                # only consider when ≤30s left
+      min_entry_price: 0.90        # market price floor (chosen-side ask)
+      max_entry_price: 0.95        # market price ceiling
+      min_moneyness_bps: 50        # |BTC − strike| / strike in bps
+      max_spread_pct: 0.03         # tighter than normal entry — no time to wait
+      size_usdc: 5.0               # small fixed size; bypasses Kelly
+
+  logreg_fb:
+    # Feature-builder-driven LogReg strategy. Loads artifacts produced by
+    # scripts/train.py (schema.json + logreg_model.pkl + scaler + calibrator).
+    # Uses the main feature builder (Family A/B/C included), and the loader
+    # owns its SlotPathState so Family C path features are live.
+    #
+    # Exchange MUST match the training data source. S3 snapshots record
+    # btc_source="binance" — using any other venue would shift the feature
+    # distribution vs training.
+    # Symbol format is exchange-specific: Binance uses "btcusdt", Coinbase
+    # uses "BTC-USD". BtcPriceFeed subscribes to {symbol}@bookTicker for
+    # binance, so the wrong format causes silent zero-tick stream.
+    enabled: false
+    btc_symbol: "btcusdt"
+    btc_exchange: "binance"
+    # Tuned model: 11 features selected via random-sentinel probe on 4 days
+    # of S3 data (2026-04-16..19), then Optuna (60 LogReg + 60 XGB trials).
+    # 14f = 11 baseline + 3 Family D interactions (moneyness_x_tte,
+    # microprice_x_tte, strike_crosses_x_vol). LogReg Brier 0.1522 /
+    # Sharpe 1.88 / PnL 4.24 on val; XGB Brier 0.1493. Both PROMOTE vs probe.
+    # Prior 11f artifact preserved at models/full_week_tuned.
+    # Full selection rationale: experiments/full-week/selection_interactions.yaml.
+    model_dir: "models/full_week_interactions_tuned"
+
+    # Entry filters — same shape as logreg; thresholds live in the model's
+    # LogRegFBModel.thresholds property.
+    #
+    # Entry window: TTE in [120, 240] → trade only between 60s and 180s into
+    # the slot. The main cycle at slot-open (TTE≈298) correctly skips — we
+    # don't want to trade while the book and BTC feed are still settling.
+    # Intra-cycle analysis fires every 30s inside ticker_until_next_cycle
+    # (see src/engine/cycle_runner.py:run_intra_cycle) and calls the same
+    # strategy.analyze() path, so ticks at TTE=240, 210, 180, 150, 120 all
+    # get a chance to fire an entry. The strategy's is_flat guard ensures at
+    # most one entry per slot. exit_rule is hardcoded to "hold_to_expiry" so
+    # the position is carried through to settlement.
+    delta: 0.015
+    max_spread_pct: 0.05
+    min_seconds_to_expiry: 30
+    max_seconds_to_expiry: 290
+    min_entry_price: 0.2
+    max_entry_price: 0.8
+    min_entry_window_s: 10
+    max_hold_seconds: 300
+
+    # Kelly sizing
+    kelly_fraction: 0.10
+    min_position_size_usdc: 5.0
+    max_position_size_usdc: 20.0
+
+    # Confidence gate
+    min_confidence: 0
+
+    late_snipe: *late_snipe_defaults
+
+  xgb_fb:
+    # Feature-builder-driven XGB strategy. Same strategy class as logreg_fb
+    # (LogRegEdgeStrategy), just swaps in XGBFBModel. Expects artifacts
+    # produced by scripts/train.py with model_type=xgb (schema.json +
+    # xgb_model.json + scaler + calibrator).
+    enabled: true
+    btc_symbol: "btcusdt"
+    btc_exchange: "binance"
+    model_dir: "models/signed_v1_trim"
+
+    # Entry filters — current values reflect the post-diagnose tuning.
+    # See tasks/postmortem_2026-04-25.md for the bucket analysis that
+    # picked these thresholds.
+    delta: 0.04
+    max_spread_pct: 0.04
+    min_seconds_to_expiry: 50
+    max_seconds_to_expiry: 290
+    min_entry_price: 0.3
+    max_entry_price: 0.7
+    min_entry_window_s: 10
+    max_hold_seconds: 300
+    min_stable_ticks: 2          # require edge to persist 2 consecutive ticks
+
+    # Kelly sizing
+    kelly_fraction: 0.05
+    min_position_size_usdc: 5.0
+    max_position_size_usdc: 10.0
+
+    # Confidence gate. XGBFBModel clamps signal.confidence up to this floor
+    # before should_enter sees it, so this value must match the model's
+    # min_prob_yes threshold to be effective.
+    min_confidence: 0.55
+
+    late_snipe: *late_snipe_defaults
+
 risk:
   max_position_pct: 0.05          # 5% of balance per position
-  max_position_size: 200          # hard cap on shares per position
   max_total_exposure: 1.0         # total open notional as fraction of balance
-  max_daily_loss: 1.0             # pct-based daily loss (1.0 = disabled; use max_session_loss_usdc instead)
-  max_session_loss_usdc: 50       # absolute session loss cap in USDC — the real stop-loss
+  max_daily_loss: 0.3             # pct-based daily loss (1.0 = disabled; use max_session_loss_usdc instead)
+  max_session_loss_usdc: 200       # absolute session loss cap in USDC — the real stop-loss
+
+  # Rolling kill switches — halt new entries when recent performance is bad
+  # enough that we should stop and look. These are strict short-window
+  # versions of max_session_loss_usdc; they catch a bad streak before it
+  # eats the day's allowance.
+  rolling_window_n: 20             # how many recent trades to evaluate
+  rolling_pnl_floor_usdc: -100     # halt if last N trades sum to less than this
+  rolling_winrate_floor: 0.30      # halt if last N trades win rate < this
 
 chainlink_feed:
   enabled: true
