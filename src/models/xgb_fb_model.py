@@ -31,7 +31,9 @@ from .slot_path_state import SlotPathState, advance_from_snapshot, features_from
 _DEFAULT_THRESHOLDS: Dict[str, float] = {
     "min_edge": 0.05,
     "min_prob_yes": 0.54,
-    "max_prob_yes_for_no": 0.46,
+    # Asymmetric: NO-side calibration was anti-calibrated and the only
+    # profitable bucket was p_hat ≤ 0.32. See tasks/postmortem_2026-04-25.md.
+    "max_prob_yes_for_no": 0.32,
     "max_spread_pct": 0.06,
     "exit_edge": -0.01,
     "min_seconds_to_expiry": 10.0,
