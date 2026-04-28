@@ -116,6 +116,8 @@ def build_live_features(snapshot: Mapping[str, object]) -> FeatureBuildResult:
     _add_rsi14(features, btc_prices)
     _add_fair_value_features(features)
     _add_interaction_features(features)
+    _add_calendar_features(features, slot_expiry_ts)
+    _add_recent_outcome_features(features, snapshot.get("recent_slot_outcomes"))
 
     indicator_status = _add_indicator_features(features, btc_prices, btc_mid)
 
@@ -124,6 +126,7 @@ def build_live_features(snapshot: Mapping[str, object]) -> FeatureBuildResult:
     # usable feature vector for short-TF-only models.
     mtf_features, mtf_status = compute_multi_tf_features(btc_prices, now_ts)
     features.update(mtf_features)
+    _add_ut_trend_disagreement(features)
 
     status = "ready" if indicator_status == "ready" else indicator_status
     return FeatureBuildResult(features=features, ready=True, status=status)
@@ -383,6 +386,67 @@ def _add_interaction_features(features: Dict[str, float]) -> None:
     features["moneyness_x_tte"] = features["moneyness"] * features["seconds_to_expiry"]
     features["microprice_x_tte"] = features["yes_microprice"] * features["seconds_to_expiry"]
     features["strike_crosses_x_vol"] = features["slot_strike_crosses"] * features["btc_vol_30s"]
+
+
+def _add_calendar_features(features: Dict[str, float], slot_expiry_ts: float) -> None:
+    """Cyclical hour-of-day + weekday flag.
+
+    Markets show intraday regime patterns (US open vs Asia quiet; weekday
+    vs weekend volume). Cyclical encoding via sin/cos lets a tree learn
+    "around 14:00 UTC" without needing dummy variables and without the
+    23→0 boundary discontinuity.
+    """
+    from datetime import datetime, timezone
+    import math
+    dt = datetime.fromtimestamp(float(slot_expiry_ts or 0.0), tz=timezone.utc)
+    hour = dt.hour + dt.minute / 60.0  # fractional hour
+    features["hour_sin"] = math.sin(2.0 * math.pi * hour / 24.0)
+    features["hour_cos"] = math.cos(2.0 * math.pi * hour / 24.0)
+    features["is_weekend"] = 1.0 if dt.weekday() >= 5 else 0.0
+
+
+def _add_recent_outcome_features(
+    features: Dict[str, float],
+    recent_slot_outcomes: Optional[Sequence] = None,
+) -> None:
+    """Up-rate over the last N resolved slots before the current decision.
+
+    Caller supplies a sequence of "Up"/"Down" strings ordered oldest →
+    newest, covering only slots that resolved BEFORE the current slot
+    (no peeking ahead). When the supplied sequence is empty or None,
+    the features default to 0.5 (uninformative prior) — matches what
+    the model would learn for the early-bot case.
+
+    Why this matters: the 04-25 disaster had a 56% Up week, and the
+    model had no way to learn "this is an Up-skewed regime, dampen NO
+    predictions." With recent_up_rate features, it can.
+    """
+    outcomes = list(recent_slot_outcomes or [])
+    for n in (5, 10, 20):
+        col = f"recent_up_rate_{n}"
+        if not outcomes:
+            features[col] = 0.5
+            continue
+        window = outcomes[-n:]
+        ups = sum(1 for o in window if str(o).strip().lower() == "up")
+        features[col] = ups / len(window)
+
+
+def _add_ut_trend_disagreement(features: Dict[str, float]) -> None:
+    """1.0 when the 1m and 5m UT-Bot trends disagree, else 0.0.
+
+    Disagreement → choppy regime where the model's predictions are less
+    reliable. Reuses the multi-TF UT trends already computed; no new
+    indicator runs.
+    """
+    t1 = features.get("ut_1m_trend", 0.0)
+    t5 = features.get("ut_5m_trend", 0.0)
+    # ut_*_trend is signed: +1 (close > trail), -1 (close < trail), 0 (cold).
+    # Disagreement only counts when both are non-zero AND opposite signs.
+    if t1 != 0.0 and t5 != 0.0 and t1 * t5 < 0.0:
+        features["ut_trend_disagreement"] = 1.0
+    else:
+        features["ut_trend_disagreement"] = 0.0
 
 
 def _merge_slot_path_features(

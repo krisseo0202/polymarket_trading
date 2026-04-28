@@ -1,0 +1,91 @@
+run_id: signed-v2-2026-04-27
+probe_dataset: experiments/signed-v2/dataset.parquet
+
+# Selection for signed-v2: signed-v1's 45 trimmed features + the 7 new
+# regime-aware features (hour-of-day cyclical encoding, recent slot
+# win-rate, UT-trend cross-TF disagreement). These were added to address
+# the model's known UP-bias documented in
+# tasks/postmortem_2026-04-25.md — the calibrator inherited a Up-skewed
+# week's outcome distribution from the original validation period and
+# now skews predictions UP (64% of cycles produce p_yes ≥ 0.55, only
+# 22% produce p_yes ≤ 0.32).
+
+active_features:
+  # === Inherited from signed_v1_trim (post-probe survivors) ===
+  - moneyness
+  - yes_bid
+  - yes_microprice
+  - yes_spread_pct
+  - fair_value_p_up
+  - slot_high_excursion_bps
+  - moneyness_x_tte
+  - microprice_x_tte
+  - btc_vol_60s
+  - yes_bid_slope
+  - btc_ret_180s
+  - seconds_to_expiry
+  - ut_3m_bars_since_signal
+  - td_3m_tdst_distance_pct
+  - ut_1m_distance_pct
+  - td_3m_cd
+  - td_3m_setup
+  - td_1m_tdst_distance_pct
+  - ut_3m_distance_pct
+  - td_tdst_distance_pct
+  - ut_5m_distance_pct
+  - td_5m_signal_9
+  - rsi_3m
+  - yes_mid
+  - no_microprice
+  - no_mid
+  - no_bid
+  - slot_drift_bps
+  - btc_ret_1800s
+  - slot_time_above_strike_pct
+  - no_depth_concentration
+  - yes_ask
+  - strike_crosses_x_vol
+  - no_top3_ask_depth
+  - no_ask
+  - no_ask_slope
+  - no_spread_pct
+  - no_ret_30s
+  - yes_depth_slope
+  - strike_price
+  - slot_strike_crosses
+  - no_bid_slope
+  - yes_ret_30s
+  - yes_ask_slope
+  - no_depth_slope
+
+  # === New for v2: regime-aware features ===
+  - hour_sin                # cyclical encoding of UTC hour
+  - hour_cos
+  - is_weekend              # Sat/Sun flag
+  - recent_up_rate_5        # outcome rate, last 5 resolved slots (25 min)
+  - recent_up_rate_10       # last 10 resolved slots (~50 min)
+  - recent_up_rate_20       # last 20 resolved slots (~100 min)
+  - ut_trend_disagreement   # 1 when 1m and 5m UT trends point opposite ways
+
+rejected_features:
+  - {name: ut_1m_signal,   reason: "rare, ~95% zero in dataset"}
+  - {name: ut_5m_signal,   reason: "rare, ~95% zero in dataset"}
+  - {name: rsi_60m,        reason: "needs 25h+ warmup; mostly zero in production"}
+  - {name: rsi_240m,       reason: "needs 100h+ warmup; mostly zero in production"}
+
+rationale: |
+  v2 takes the proven 45-feature signed-v1 trim (cleared random sentinel
+  on 04-16..21 probe) and adds 7 regime-aware features that target the
+  bias documented in the 04-25 postmortem. The hour-of-day pair gives
+  the model intraday regime context. The recent-up-rate trio gives it
+  short-horizon outcome distribution awareness — the single highest-EV
+  fix for the UP-bias since the model now has a way to learn "this week
+  is Up-skewed, dampen NO predictions accordingly." UT disagreement
+  flags choppy regimes where predictions are less reliable.
+
+  Training window: 04-16..04-26 (11 days)
+  Validation: 04-26..04-27 (1 day)
+  Test: 04-27..04-28 (1 day held out)
+
+  Promotion gate: Brier ≤ signed_v1_trim baseline AND per-side
+  calibration gap < 0.10 on test.
