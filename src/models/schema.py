@@ -103,7 +103,19 @@ FEATURE_COLUMNS: List[str] = [
     # Single-TF RSI-14 on ticks (warm in ~15 ticks; the multi-TF RSI bank
     # needs bar-level history and takes longer).
     "rsi_14",
+    # Calendar regime — cyclical hour + weekend flag.
+    "hour_sin",
+    "hour_cos",
+    "is_weekend",
+    # Recent slot outcome history (Up rate over last N resolved slots).
+    # Default to 0.5 (uninformative) until enough history is supplied.
+    "recent_up_rate_5",
+    "recent_up_rate_10",
+    "recent_up_rate_20",
     *multi_tf_feature_names(),
+    # Multi-TF cross-TF disagreement — must come after multi_tf_feature_names()
+    # because it derives from those columns.
+    "ut_trend_disagreement",
 ]
 
 DEFAULT_FEATURE_VALUES: Dict[str, float] = {name: 0.0 for name in FEATURE_COLUMNS}
