@@ -56,8 +56,18 @@ class FVGIndicator(Indicator):
         auto: bool
     ):
         n = len(ohlc)
+        empty_int = np.zeros(n, dtype=int)
+        empty_float = np.full(n, np.nan, dtype=float)
+        sentinel_int = np.full(n, 999, dtype=int)
         if n < 3:
-            return [], np.zeros(n, dtype=int), np.zeros(n, dtype=int), np.zeros(n, dtype=int), np.zeros(n, dtype=int)
+            return (
+                [],
+                empty_int.copy(), empty_int.copy(),
+                empty_int.copy(), empty_int.copy(),
+                empty_int.copy(), empty_int.copy(),
+                empty_float.copy(), empty_float.copy(),
+                sentinel_int.copy(),
+            )
 
         high = ohlc["high"].astype(float).to_numpy()
         low  = ohlc["low"].astype(float).to_numpy()
@@ -76,6 +86,13 @@ class FVGIndicator(Indicator):
         bear_count       = np.zeros(n, dtype=int)
         bull_mitigated   = np.zeros(n, dtype=int)
         bear_mitigated   = np.zeros(n, dtype=int)
+
+        # new per-bar continuous arrays
+        bull_count_active  = np.zeros(n, dtype=int)
+        bear_count_active  = np.zeros(n, dtype=int)
+        dist_to_nearest_bull_fvg = np.full(n, np.nan, dtype=float)
+        dist_to_nearest_bear_fvg = np.full(n, np.nan, dtype=float)
+        nearest_fvg_age_bars     = np.full(n, 999, dtype=int)
 
         last_new_time = None  # Pine prevents duplicate adds on same bar/time
 
@@ -155,7 +172,36 @@ class FVGIndicator(Indicator):
             if bear_mitigated[i] == 0 and i > 0:
                 bear_mitigated[i] = bear_mitigated[i-1]
 
-        return records, bull_count, bear_count, bull_mitigated, bear_mitigated
+            # --- Per-bar continuous features (computed from still_active after mitigation)
+            active_bull = [r for r in active if r.is_bullish]
+            active_bear = [r for r in active if not r.is_bullish]
+
+            bull_count_active[i] = len(active_bull)
+            bear_count_active[i] = len(active_bear)
+
+            if active_bull:
+                mids = [(r.min_level + r.max_level) / 2.0 for r in active_bull]
+                nearest_mid = min(mids, key=lambda m: abs(m - close[i]))
+                dist_to_nearest_bull_fvg[i] = (nearest_mid - close[i]) / close[i]
+
+            if active_bear:
+                mids = [(r.min_level + r.max_level) / 2.0 for r in active_bear]
+                nearest_mid = min(mids, key=lambda m: abs(m - close[i]))
+                dist_to_nearest_bear_fvg[i] = (nearest_mid - close[i]) / close[i]
+
+            # Age of the most-recently-formed FVG (bull or bear)
+            recent_records = [r for r in records if not r.mitigated]
+            if recent_records:
+                newest = max(recent_records, key=lambda r: r.start_index)
+                nearest_fvg_age_bars[i] = i - newest.start_index
+
+        return (
+            records,
+            bull_count, bear_count, bull_mitigated, bear_mitigated,
+            bull_count_active, bear_count_active,
+            dist_to_nearest_bull_fvg, dist_to_nearest_bear_fvg,
+            nearest_fvg_age_bars,
+        )
 
     def compute(self, ohlc: pd.DataFrame, timeframe: str = "unknown") -> IndicatorResult:
         self.validate_ohlc(ohlc)
@@ -163,9 +209,12 @@ class FVGIndicator(Indicator):
         threshold_percent = self.params.get("threshold_percent", 0.0)
         auto = self.params.get("auto", False)
 
-        recs, bull_cnt, bear_cnt, bull_mit, bear_mit = self._detect_fvgs_with_counts(
-            ohlc, threshold_percent, auto
-        )
+        (
+            recs, bull_cnt, bear_cnt, bull_mit, bear_mit,
+            bull_cnt_active, bear_cnt_active,
+            dist_bull_fvg, dist_bear_fvg,
+            fvg_age_bars,
+        ) = self._detect_fvgs_with_counts(ohlc, threshold_percent, auto)
 
         n = len(ohlc)
         signals: List[Signal] = []
@@ -220,7 +269,13 @@ class FVGIndicator(Indicator):
                 "bear_count": int(bear_cnt[-1]) if n else 0,
                 "bull_mitigated": int(bull_mit[-1]) if n else 0,
                 "bear_mitigated": int(bear_mit[-1]) if n else 0,
-                "latest_gap": latest_unmitigated
+                "latest_gap": latest_unmitigated,
+                # per-bar continuous arrays
+                "bull_count_active": bull_cnt_active,
+                "bear_count_active": bear_cnt_active,
+                "dist_to_nearest_bull_fvg": dist_bull_fvg,
+                "dist_to_nearest_bear_fvg": dist_bear_fvg,
+                "nearest_fvg_age_bars": fvg_age_bars,
             },
             signals=signals,
             metadata={

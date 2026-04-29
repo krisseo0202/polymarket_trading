@@ -384,7 +384,28 @@ class TDSequentialIndicator(Indicator):
         
         td_result['td_up'] = td_up
         td_result['td_dn'] = td_dn
-        
+
+        # Continuous distance features
+        close_arr = ohlc['close'].astype(float).to_numpy()
+        tdst_support    = td_st_result['tdst_support']
+        tdst_resistance = td_st_result['tdst_resistance']
+
+        # (close - support) / close; positive when price is above support
+        dist_support = np.where(
+            np.isnan(tdst_support),
+            np.nan,
+            np.clip((close_arr - tdst_support) / close_arr, -0.20, 0.20),
+        )
+        # (resistance - close) / close; positive when price is below resistance
+        dist_resistance = np.where(
+            np.isnan(tdst_resistance),
+            np.nan,
+            np.clip((tdst_resistance - close_arr) / close_arr, -0.20, 0.20),
+        )
+
+        td_result['dist_to_tdst_support']    = dist_support
+        td_result['dist_to_tdst_resistance'] = dist_resistance
+
         return IndicatorResult(
             indicator_name="TDSequential",
             timeframe=timeframe,
