@@ -209,12 +209,30 @@ class TestEntry:
         assert sigs == []
 
     def test_no_trade_when_already_in_position(self):
-        """Should not enter again when already holding a position."""
+        """Should not enter again when already holding a position.
+
+        The phantom-clear in _auto_recover_position resets active_token_id
+        whenever by_token has no matching position. Supply an actual Position
+        on the second call so the guard sees a real hold, not a phantom.
+        """
         strat = _make_strategy(prob_yes=0.70, yes_ask=0.55, no_ask=0.48)
         data = _market_data(yes_bid=0.54, yes_ask=0.55, no_bid=0.47, no_ask=0.48)
         sigs1 = strat.analyze(data)
         assert len(sigs1) == 1  # first entry
-        sigs2 = strat.analyze(data)
+        assert sigs1[0].outcome == "YES"
+        # Supply the YES position so auto-recover doesn't treat it as a phantom.
+        yes_pos = Position(
+            market_id=MKT_ID,
+            token_id=YES_TID,
+            outcome="YES",
+            size=sigs1[0].size,
+            average_price=sigs1[0].price,
+        )
+        data2 = _market_data(
+            yes_bid=0.54, yes_ask=0.55, no_bid=0.47, no_ask=0.48,
+            positions=[yes_pos],
+        )
+        sigs2 = strat.analyze(data2)
         assert sigs2 == []  # already in position
 
     def test_no_trade_past_expiry_window(self):
@@ -429,3 +447,54 @@ class TestHelpers:
 
     def test_spread_pct_zero_mid(self):
         assert _spread_pct(0.0, 0.0) == float("inf")
+
+
+# ── Edge stability gate ───────────────────────────────────────────────────────
+
+
+class TestEdgeStability:
+    def test_default_fires_on_first_tick(self):
+        """min_stable_ticks unset (defaults to 1) matches legacy behavior."""
+        strat = _make_strategy(prob_yes=0.62, yes_ask=0.55, no_ask=0.48)
+        data = _market_data(yes_bid=0.54, yes_ask=0.55, no_bid=0.47, no_ask=0.48)
+        assert len(strat.analyze(data)) == 1
+
+    def test_blocks_until_n_consecutive_ticks(self):
+        """min_stable_ticks=3 must block first 2 ticks, fire on 3rd."""
+        strat = _make_strategy(
+            prob_yes=0.62, yes_ask=0.55, no_ask=0.48, min_stable_ticks=3,
+        )
+        data = _market_data(yes_bid=0.54, yes_ask=0.55, no_bid=0.47, no_ask=0.48)
+        assert len(strat.analyze(data)) == 0
+        assert "edge_not_stable" in strat.last_skip_reason
+        assert "1/3" in strat.last_skip_reason
+        assert len(strat.analyze(data)) == 0
+        assert "2/3" in strat.last_skip_reason
+        assert len(strat.analyze(data)) == 1
+
+    def test_slot_rollover_resets_counter(self):
+        """The tracker keys on slot_expiry_ts — new slot must clear the warm-up."""
+        strat = _make_strategy(
+            prob_yes=0.62, yes_ask=0.55, no_ask=0.48, min_stable_ticks=3,
+        )
+        data = _market_data(yes_bid=0.54, yes_ask=0.55, no_bid=0.47, no_ask=0.48)
+        strat.analyze(data)
+        strat.analyze(data)  # counter = 2
+        # Fresh market_data → new slot_expiry_ts (time.time() moves forward).
+        # A pause guarantees strict inequality even on fast machines.
+        time.sleep(0.001)
+        data_new = _market_data(yes_bid=0.54, yes_ask=0.55, no_bid=0.47, no_ask=0.48)
+        assert data_new["slot_expiry_ts"] != data["slot_expiry_ts"]
+        assert len(strat.analyze(data_new)) == 0
+        assert "1/3" in strat.last_skip_reason
+
+    def test_reset_slot_state_also_resets_tracker(self):
+        """Explicit reset_slot_state() must also zero the stability counters."""
+        strat = _make_strategy(
+            prob_yes=0.62, yes_ask=0.55, no_ask=0.48, min_stable_ticks=3,
+        )
+        data = _market_data(yes_bid=0.54, yes_ask=0.55, no_bid=0.47, no_ask=0.48)
+        strat.analyze(data)
+        strat.analyze(data)
+        strat.reset_slot_state()
+        assert strat._stability.yes_count == 0
