@@ -1,7 +1,8 @@
 """Risk management for trading operations"""
 
-from typing import Dict, List, Optional, Any, Tuple
-from datetime import datetime, timedelta
+from collections import deque
+from typing import Deque, Dict, List, Optional, Any, Tuple
+from datetime import datetime
 from dataclasses import dataclass
 
 from ..strategies.base import Signal
@@ -11,7 +12,6 @@ from ..api.types import Position, Order
 @dataclass
 class RiskLimits:
     """Risk limit configuration"""
-    max_position_size: float = 1000.0
     max_position_pct: float = 0.1  # 10% of balance per position
     max_total_exposure: float = 0.5  # 50% of balance total
     max_daily_loss: float = 0.1  # 10% daily loss limit
@@ -25,6 +25,13 @@ class RiskLimits:
     # both validate_signal and calculate_position_size reject all new
     # entries. This is the "stop trading" hard floor.
     max_session_loss_usdc: float = float("inf")
+    # Rolling kill switches — strict short-window versions of the session
+    # loss cap. They catch a bad streak before it eats the day's allowance.
+    # Disabled when rolling_window_n <= 0 or thresholds are at their
+    # permissive defaults.
+    rolling_window_n: int = 0
+    rolling_pnl_floor_usdc: float = float("-inf")
+    rolling_winrate_floor: float = 0.0  # 0.0 = effectively disabled
 
 
 class RiskManager:
@@ -42,7 +49,7 @@ class RiskManager:
     def __init__(self, limits: Optional[RiskLimits] = None):
         """
         Initialize risk manager
-        
+
         Args:
             limits: Risk limit configuration
         """
@@ -53,6 +60,13 @@ class RiskManager:
         self.circuit_breaker_active: bool = False
         self.max_drawdown: float = 0.0
         self.peak_balance: float = 0.0
+        # Rolling-window of recent realized PnLs for the kill-switch checks.
+        # Running counters (_rolling_sum, _rolling_wins) are kept in lockstep
+        # with the deque so rolling_kill_switch is O(1) per call instead of
+        # rebuilding sums on every entry decision.
+        self._recent_pnls: Deque[float] = deque(maxlen=max(1, self.limits.rolling_window_n))
+        self._rolling_sum: float = 0.0
+        self._rolling_wins: int = 0
     
     def reset_daily(self):
         """Reset daily tracking (call at start of each day)"""
@@ -126,16 +140,10 @@ class RiskManager:
         if self.daily_pnl < -abs(self.limits.max_daily_loss * balance):
             return False, f"Daily loss limit reached: {self.daily_pnl:.2f}"
 
-        # Check position size limit.
-        # max_position_size is a hard share cap; max_position_pct produces
-        # a USDC notional that must be converted to shares via signal.price
-        # so both terms in min() share the same unit.
+        # Check position size limit. max_position_pct produces a USDC
+        # notional cap, converted to shares via signal.price.
         notional_cap = balance * self.limits.max_position_pct
-        shares_from_notional = notional_cap / signal.price if signal.price > 0 else 0
-        max_size = min(
-            self.limits.max_position_size,
-            shares_from_notional
-        )
+        max_size = notional_cap / signal.price if signal.price > 0 else 0
         if signal.size > max_size:
             return False, f"Position size {signal.size} exceeds limit {max_size:.1f} shares (notional cap ${notional_cap:.2f})"
         
@@ -172,8 +180,7 @@ class RiskManager:
 
         All comparisons are in shares. The USDC-denominated limits
         (max_position_pct, max_total_exposure, max_exposure_per_market)
-        are converted to share-equivalent via current_price before
-        clipping.
+        are converted to share-equivalent via current_price before clipping.
 
         Args:
             signal: Trading signal
@@ -193,17 +200,17 @@ class RiskManager:
         if balance > 0 and self.daily_pnl < -abs(self.limits.max_daily_loss * balance):
             return 0.0
 
+        # Rolling kill switches (short-window guards on a bad streak).
+        halted, _ = self.rolling_kill_switch()
+        if halted:
+            return 0.0
+
         # Start with signal size
         size = signal.size
 
-        # Apply position size limit. Convert the notional cap to shares
-        # so both terms have the same unit.
+        # Apply position size limit. Convert the notional cap to shares.
         notional_cap = balance * self.limits.max_position_pct
-        shares_from_notional = notional_cap / current_price if current_price > 0 else 0
-        max_size = min(
-            self.limits.max_position_size,
-            shares_from_notional
-        )
+        max_size = notional_cap / current_price if current_price > 0 else 0
         size = min(size, max_size)
         
         # Check total exposure
@@ -256,12 +263,58 @@ class RiskManager:
     def record_trade(self, pnl: float):
         """
         Record a completed trade for daily tracking
-        
+
         Args:
             pnl: Profit/loss from the trade
         """
         self.daily_pnl += pnl
         self.trade_count += 1
+
+        # Maintain rolling counters in lockstep with the bounded deque.
+        # When the deque is full, append() silently pops the oldest entry —
+        # we have to mirror that subtraction here BEFORE the append so the
+        # counters reflect the post-append window.
+        if len(self._recent_pnls) == self._recent_pnls.maxlen:
+            popped = self._recent_pnls[0]
+            self._rolling_sum -= popped
+            if popped > 0:
+                self._rolling_wins -= 1
+        self._recent_pnls.append(pnl)
+        self._rolling_sum += pnl
+        if pnl > 0:
+            self._rolling_wins += 1
+
+    def rolling_kill_switch(self) -> Tuple[bool, str]:
+        """Check rolling-window kill switches.
+
+        Returns ``(halted, reason)``. Returns ``(False, "OK")`` until the
+        window is full so a freshly-started bot isn't halted on insufficient
+        data. Once full, halts when EITHER:
+
+          * sum of last N PnLs < ``rolling_pnl_floor_usdc``, OR
+          * win rate of last N trades < ``rolling_winrate_floor``.
+
+        These are strict, short-window versions of ``max_session_loss_usdc``.
+        Disabled when ``rolling_window_n <= 0``.
+        """
+        n = self.limits.rolling_window_n
+        if n <= 0 or len(self._recent_pnls) < n:
+            return False, "OK"
+
+        if self._rolling_sum < self.limits.rolling_pnl_floor_usdc:
+            return True, (
+                f"Rolling PnL floor breached: last {n} trades sum to "
+                f"${self._rolling_sum:+.2f} < ${self.limits.rolling_pnl_floor_usdc:+.2f}"
+            )
+
+        win_rate = self._rolling_wins / n
+        if win_rate < self.limits.rolling_winrate_floor:
+            return True, (
+                f"Rolling win-rate floor breached: last {n} trades "
+                f"{self._rolling_wins}/{n}={win_rate:.1%} < {self.limits.rolling_winrate_floor:.1%}"
+            )
+
+        return False, "OK"
     
     def get_risk_metrics(self) -> Dict[str, Any]:
         """Get current risk metrics"""

@@ -1,8 +1,6 @@
 """Unit tests for BTCSigmoidModel."""
 
-import math
 import time
-import pytest
 
 from src.models.sigmoid_model import BTCSigmoidModel
 

@@ -1,7 +1,7 @@
 """Backtesting framework for trading strategies"""
 
 from typing import List, Dict, Any, Optional
-from datetime import datetime, timedelta
+from datetime import datetime
 import pandas as pd
 import numpy as np
 

@@ -255,12 +255,35 @@ class Strategy(ABC):
         self.entry_size      = None
 
     def _auto_recover_position(self, by_token: Dict[str, Any], now_ts: float) -> None:
-        """Recover position state from live positions after a bot restart.
+        """Reconcile internal position state with authoritative ``by_token``.
 
-        No-op when already tracking a position. Checks YES then NO token.
+        Two responsibilities, both important:
+
+        1. **Sync from inventory** — if the strategy isn't tracking a
+           position but the inventory shows one (e.g. after a bot restart
+           or an externally-placed fill), pick it up.
+        2. **Clear phantom state** — if the strategy IS tracking a position
+           but the inventory shows none, the prior cycle's optimistic
+           update (set in ``_check_entry`` before ``place_order`` runs) was
+           never backed by an actual fill. Reset so the strategy doesn't
+           hold a phantom that blocks new entries forever.
+
+        The phantom-clear path matters because ``_check_entry`` updates
+        ``active_token_id`` / ``entry_*`` *before* the order is placed, as
+        a within-cycle guard against double-firing. If the order is
+        rejected downstream (risk manager, disabled strategy, exception),
+        that guard becomes a permanent block until a slot rollover. This
+        reconciliation makes it self-heal on the next cycle.
         """
+        # Phantom-clear: tracked token doesn't actually hold a position.
         if self.active_token_id is not None:
-            return
+            tracked_pos = by_token.get(self.active_token_id)
+            if tracked_pos is None or tracked_pos.size <= 0:
+                self._reset_position_state()
+            else:
+                return
+
+        # Sync-from-inventory: state is None, but inventory has a position.
         for tid in (self._yes_token_id, self._no_token_id):
             if not tid:
                 continue

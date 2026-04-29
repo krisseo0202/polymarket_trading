@@ -18,7 +18,9 @@ from ..engine.slot_state import SlotStateManager
 from ..engine.state_store import BotState, StateStore
 from ..models import BTCSigmoidModel
 from ..models.logreg_model import LogRegModel
+from ..models.logreg_fb_model import LogRegFBModel
 from ..models.logreg_v4_model import LogRegV4Model
+from ..models.xgb_fb_model import XGBFBModel
 from ..strategies.coin_toss import CoinTossStrategy
 from ..strategies.logreg_edge import LogRegEdgeStrategy
 from ..strategies.prob_edge import ProbEdgeStrategy
@@ -28,7 +30,9 @@ from ..utils.config import load_config
 from ..utils.logger import setup_logger
 from ..utils.market_utils import get_server_time
 
-STRATEGIES = ["coin_toss", "logreg_edge", "logreg", "prob_edge"]
+STRATEGIES = ["coin_toss", "logreg_edge", "logreg", "logreg_fb", "xgb_fb", "prob_edge"]
+
+XGB_FB_MODEL_DIR = "models/signed_v1_trim"
 
 # The `logreg` strategy loads the v4 model (18 features + isotonic calibration)
 # from models/logreg_v4 via LogRegV4Model. This is the single supported live
@@ -200,9 +204,9 @@ def init_services(args) -> Services:
         paper_balance=paper_balance,
     )
 
-    session_loss_cap: float = raw_yaml.get("risk", {}).get("max_session_loss_usdc", float("inf"))
+    risk_yaml = raw_yaml.get("risk", {})
+    session_loss_cap: float = risk_yaml.get("max_session_loss_usdc", float("inf"))
     risk_limits = RiskLimits(
-        max_position_size=cfg.risk_limits.get("max_position_size", 200.0),
         max_position_pct=cfg.risk_limits.get("max_position_pct", 0.05),
         max_total_exposure=cfg.risk_limits.get("max_total_exposure", 0.15),
         max_daily_loss=cfg.risk_limits.get("max_daily_loss", 0.05),
@@ -210,6 +214,9 @@ def init_services(args) -> Services:
         circuit_breaker_enabled=cfg.risk_limits.get("circuit_breaker_enabled", True),
         circuit_breaker_threshold=cfg.risk_limits.get("circuit_breaker_threshold", 0.20),
         max_session_loss_usdc=session_loss_cap,
+        rolling_window_n=int(risk_yaml.get("rolling_window_n", 0)),
+        rolling_pnl_floor_usdc=float(risk_yaml.get("rolling_pnl_floor_usdc", float("-inf"))),
+        rolling_winrate_floor=float(risk_yaml.get("rolling_winrate_floor", 0.0)),
     )
     risk_manager = RiskManager(limits=risk_limits)
 
@@ -281,6 +288,56 @@ def init_services(args) -> Services:
         ) if retrain_cfg.enabled else None
         if _retrainer is not None:
             _retrainer.start()
+    elif strategy_name == "logreg_fb":
+        btc_feed = BtcPriceFeed(
+            symbol=str(strategy_cfg.get("btc_symbol", "BTC-USD")),
+            exchange=str(strategy_cfg.get("btc_exchange", "coinbase")),
+            logger=logger,
+        ).start()
+        _maybe_warmup(btc_feed)
+        model_dir = str(strategy_cfg.get("model_dir", "models/week1_v2_realfills"))
+        fb_model = LogRegFBModel.load(model_dir, logger=logger)
+        if not fb_model.ready:
+            logger.warning(
+                "LogReg FB model not loaded from %s — strategy will skip all trades until model is available",
+                model_dir,
+            )
+        else:
+            logger.info(
+                "LogReg FB loaded from %s (%d features)",
+                model_dir, len(fb_model.feature_names),
+            )
+        strategy = LogRegEdgeStrategy(
+            config=strategy_cfg,
+            btc_feed=btc_feed,
+            model_service=fb_model,
+            logger=logger,
+        )
+    elif strategy_name == "xgb_fb":
+        btc_feed = BtcPriceFeed(
+            symbol=str(strategy_cfg.get("btc_symbol", "BTC-USD")),
+            exchange=str(strategy_cfg.get("btc_exchange", "coinbase")),
+            logger=logger,
+        ).start()
+        _maybe_warmup(btc_feed)
+        model_dir = str(strategy_cfg.get("model_dir", XGB_FB_MODEL_DIR))
+        xgb_model = XGBFBModel.load(model_dir, logger=logger)
+        if not xgb_model.ready:
+            logger.warning(
+                "XGB FB model not loaded from %s — strategy will skip all trades until model is available",
+                model_dir,
+            )
+        else:
+            logger.info(
+                "XGB FB loaded from %s (%d features)",
+                model_dir, len(xgb_model.feature_names),
+            )
+        strategy = LogRegEdgeStrategy(
+            config=strategy_cfg,
+            btc_feed=btc_feed,
+            model_service=xgb_model,
+            logger=logger,
+        )
     elif strategy_name == "prob_edge":
         btc_feed = BtcPriceFeed(
             symbol=str(strategy_cfg.get("btc_symbol", "BTC-USD")),

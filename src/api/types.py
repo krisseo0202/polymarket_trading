@@ -1,7 +1,7 @@
 """Data models and types for Polymarket API"""
 
 from dataclasses import dataclass
-from typing import List, Optional, Dict, Any, Literal
+from typing import List, Optional, Dict, Literal
 from datetime import datetime
 
 Side = Literal["BUY", "SELL"]

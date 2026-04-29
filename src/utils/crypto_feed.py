@@ -14,7 +14,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Deque, List, Literal, Optional, Tuple
 
 Exchange = Literal["coinbase", "binance", "binance_us"]

@@ -10,10 +10,13 @@ import numpy as np
 import pandas as pd
 
 from src.api.types import OrderBook, OrderBookEntry
-from src.models import DEFAULT_FEATURE_VALUES, FEATURE_COLUMNS, build_live_features, parse_strike_price
+from src.models import DEFAULT_FEATURE_VALUES, build_live_features, parse_strike_price
 
 
-DEFAULT_BTC_WINDOW_SECONDS = 300
+# 4 hours — see src/backtest/s3_snapshot_loader.py for rationale. Must match
+# the live strategy's BTC window so training and inference see the same
+# long-horizon features.
+DEFAULT_BTC_WINDOW_SECONDS = 14400
 _BOOK_SIZE = 100.0
 
 

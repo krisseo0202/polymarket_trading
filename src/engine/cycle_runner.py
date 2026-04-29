@@ -226,6 +226,7 @@ class CycleRunner:
             paper_trading=svc.paper_trading,
         )
         market_data = cycle_snap.to_market_data(yes_book, no_book, positions, balance)
+        _inject_recent_outcomes(market_data, svc.state, cycle_snap.slot_ts)
 
         # Online-retrain hot-swap: if the retrainer thread has a new model
         # ready AND the strategy is currently flat, swap it in before the
@@ -355,6 +356,7 @@ class CycleRunner:
                 paper_trading=svc.paper_trading,
             )
             market_data = intra_snap.to_market_data(yes_book, no_book, positions, balance)
+            _inject_recent_outcomes(market_data, svc.state, intra_snap.slot_ts)
             signals = svc.strategy.analyze(market_data)
             _log_decision(svc.strategy, signals, market_data, cycle_type="intra")
 
@@ -734,6 +736,29 @@ class CycleRunner:
         )
 
 
+def _inject_recent_outcomes(
+    market_data: dict, state, current_slot_ts: int, n: int = 20,
+) -> None:
+    """Inject the last N resolved slot outcomes into ``market_data``.
+
+    The signed-v2 feature builder reads ``market_data["recent_slot_outcomes"]``
+    to compute ``recent_up_rate_5/10/20``. Without this injection, those
+    features stay at the 0.5 prior in production and the model loses the
+    regime context it was trained to use.
+
+    No peeking ahead: only slots strictly before ``current_slot_ts`` are
+    included. Returns oldest → newest.
+    """
+    outcomes = state.slot_outcomes if state and getattr(state, "slot_outcomes", None) else {}
+    if not outcomes:
+        return
+    prior = sorted(
+        ((s_ts, outcome) for s_ts, outcome in outcomes.items() if s_ts < current_slot_ts),
+        key=lambda kv: kv[0],
+    )
+    market_data["recent_slot_outcomes"] = [outcome for _, outcome in prior[-n:]]
+
+
 def execute_signals(
     signals: list,
     client,
@@ -757,7 +782,16 @@ def execute_signals(
     for sig in signals:
         if sig.action == "BUY":
             if not strategy.should_enter(sig):
-                logger.debug(f"BUY rejected by strategy: {sig.reason}")
+                # Visible INFO — a silent DEBUG here once masked an
+                # `enabled: false` config (validate_signal short-circuits
+                # on enabled), producing "TRADED" decision-log records
+                # but zero actual fills.
+                logger.info(
+                    f"BUY rejected by strategy.should_enter "
+                    f"(enabled={strategy.enabled}, "
+                    f"min_conf={strategy.min_confidence}, "
+                    f"sig.conf={sig.confidence:.3f}): {sig.reason}"
+                )
                 continue
             # Clip to risk limits instead of rejecting outright. The
             # strategy's Kelly sizing is a suggestion; the risk manager

@@ -1,14 +1,11 @@
 """Tests for position sync (strategy <-> inventory) and paper trading fixes."""
 
 import time
-from typing import Any, Dict, List, Optional
 
-import pytest
 
 from src.api.client import PolymarketClient
-from src.api.types import Position
 from src.engine.execution import ExecutionTracker
-from src.strategies.base import Strategy, Signal
+from src.strategies.base import Strategy
 
 
 class MinimalStrategy(Strategy):

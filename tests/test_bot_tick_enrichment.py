@@ -1,10 +1,8 @@
 """Tests for enriched _log_price_tick fields in bot.py ticker loop."""
 
-import json
 import os
 import sys
-import tempfile
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -27,7 +25,6 @@ def _collect_tick_record(btc_feed=None, slot_mgr=None):
     return the record that would be passed to _log_price_tick.
     """
     import time
-    from src.engine.slot_state import SlotContext
     from src.models.feature_builder import _realized_vol
 
     yb, ya = 0.505, 0.510

@@ -1,12 +1,7 @@
 """Tests for the clean-session prompt and file-clearing logic in startup.py."""
 
-import os
-import json
-import tempfile
-from io import StringIO
 from unittest.mock import patch
 
-import pytest
 
 from src.utils.startup import _clear_session_files, _prompt_new_session
 from src.engine.state_store import BotState, StateStore
