@@ -421,13 +421,21 @@ class SnapshotCollector:
                 price_now = cl.price
                 price_src = "chainlink"
 
-        # Strike: Chainlink slot-open for this specific slot
+        # Strike: Chainlink slot-open for this specific slot. Prefer the
+        # carry-forward getter — Chainlink only pushes on ≥0.5% deviation, so
+        # calm slots receive zero ticks and the last-known price IS the
+        # slot-open price (by contract). Without this, 1%+ of snapshots would
+        # drop strike and be filtered from training.
         strike: Optional[float] = None
         strike_src = "unknown"
-        slot_open = self._chainlink_feed.get_slot_open_price()
+        slot_open = self._chainlink_feed.get_slot_open_or_carry_forward(slot_ts)
         if slot_open is not None and slot_open.slot_ts == slot_ts:
             strike = slot_open.price
-            strike_src = "chainlink"
+            fresh = self._chainlink_feed.get_slot_open_price()
+            if fresh is not None and fresh.slot_ts == slot_ts:
+                strike_src = "chainlink"
+            else:
+                strike_src = "chainlink_carryforward"
 
         vol_30s = _realized_vol(price_history, snapshot_ts, 30) if len(price_history) >= 3 else None
         vol_60s = _realized_vol(price_history, snapshot_ts, 60) if len(price_history) >= 3 else None

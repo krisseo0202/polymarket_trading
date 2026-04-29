@@ -127,7 +127,7 @@ def main():
             shutil.move(src, dst)
 
     if not args.apply:
-        print(f"\nRe-run with --apply to execute the moves.")
+        print("\nRe-run with --apply to execute the moves.")
     else:
         print(f"\nDone. {len(moves)} file(s) moved.")
 

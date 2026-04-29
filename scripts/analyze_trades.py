@@ -10,8 +10,6 @@ Usage:
 import argparse
 import json
 import math
-import os
-import sys
 from collections import defaultdict
 from datetime import datetime, timezone
 
@@ -165,7 +163,7 @@ def main():
     print(f"  Max loss:       ${min(t['_pnl'] for t in resolved):+.2f}")
 
     # By outcome side (YES vs NO)
-    print(f"\n--- By Side ---")
+    print("\n--- By Side ---")
     for side in ["YES", "NO"]:
         side_trades = [t for t in resolved if t.get("outcome") == side]
         if not side_trades:
@@ -175,7 +173,7 @@ def main():
         print(f"  {side:3s}: {len(side_trades):3d} trades | PnL: ${side_pnl:+8.2f} | Avg: ${side_pnl/len(side_trades):+.2f} | WR: {side_wr:.1%}")
 
     # By price bucket
-    print(f"\n--- By Entry Price ---")
+    print("\n--- By Entry Price ---")
     price_edges = [0.0, 0.30, 0.40, 0.50, 0.60, 1.01]
     price_buckets = defaultdict(list)
     for t in resolved:
@@ -188,7 +186,7 @@ def main():
         print(f"  ${b}: {len(bt):3d} trades | PnL: ${pnl:+8.2f} | Avg: ${pnl/len(bt):+.2f} | WR: {wr:.1%}")
 
     # By confidence
-    print(f"\n--- By Confidence ---")
+    print("\n--- By Confidence ---")
     conf_buckets = defaultdict(list)
     for t in resolved:
         c = t.get("confidence", 0.5)
@@ -201,7 +199,7 @@ def main():
         print(f"  {b}: {len(bt):3d} trades | PnL: ${pnl:+8.2f} | WR: {wr:.1%}")
 
     # By hour (UTC)
-    print(f"\n--- By Hour (UTC) ---")
+    print("\n--- By Hour (UTC) ---")
     hour_buckets = defaultdict(list)
     for t in resolved:
         h = datetime.fromtimestamp(t["ts"], tz=timezone.utc).hour
@@ -213,7 +211,7 @@ def main():
         print(f"  {h:02d}:00: {len(bt):3d} trades | PnL: ${pnl:+8.2f} | WR: {wr:.1%}")
 
     # Model calibration
-    print(f"\n--- Calibration (prob_yes vs actual Up rate) ---")
+    print("\n--- Calibration (prob_yes vs actual Up rate) ---")
     cal_buckets = defaultdict(lambda: {"count": 0, "up": 0, "pred_sum": 0.0})
     for t in resolved:
         p = t.get("prob_yes") or t.get("confidence", 0.5)
@@ -231,7 +229,7 @@ def main():
         print(f"  {pred:10.1%}  {actual:8.1%}  {d['count']:6d}  {err:+8.1%}")
 
     # Feature status impact
-    print(f"\n--- By Feature Status ---")
+    print("\n--- By Feature Status ---")
     fs_buckets = defaultdict(list)
     for t in resolved:
         fs = t.get("feature_status", "unknown")
