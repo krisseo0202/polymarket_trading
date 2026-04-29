@@ -37,6 +37,11 @@ ENV/
 logs/
 *.log
 
+# Feature-selection experiments: dataset + probe artifacts are large + reproducible.
+# selection.yaml stays tracked as the decision record.
+experiments/*/dataset.parquet
+experiments/*/probe/
+
 # Environment variables
 .env
 .env.local
@@ -52,6 +57,21 @@ data/
 
 # Bot runtime state
 bot_state.json
+bot_state_snapshot.json
+
+# Terraform state and sensitive infra files
+infra/aws/terraform.tfstate
+infra/aws/terraform.tfstate*.backup
+infra/aws/terraform.tfstate.[0-9]*.backup
+infra/aws/.terraform/
+infra/aws/.terraform.lock.hcl
+infra/aws/terraform.tfvars
+
+# Trained model artifacts (large, reproducible — top-level only)
+/models/
+
+# Temporary charts
+tmp_charts/
 
 # OS
 .DS_Store
