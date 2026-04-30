@@ -291,7 +291,7 @@ strategies:
     min_stable_ticks: 2          # require edge to persist 2 consecutive ticks
 
     # Kelly sizing
-    kelly_fraction: 0.1
+    kelly_fraction: 0.05
     min_position_size_usdc: 5.0
     max_position_size_usdc: 10.0
 
@@ -306,22 +306,22 @@ risk:
   max_position_pct: 0.05          # 5% of balance per position
   max_total_exposure: 1.0         # total open notional as fraction of balance
   max_daily_loss: 0.3             # pct-based daily loss (1.0 = disabled; use max_session_loss_usdc instead)
-  max_session_loss_usdc: 50       # absolute session loss cap in USDC — the real stop-loss
-
-  # Lifetime-peak drawdown breaker. Disabled in favor of max_session_loss_usdc
-  # + the rolling kill-switch below, which both auto-clear at session boundaries.
-  # The peak-drawdown breaker latches forever (no auto-reset) and tripped on
-  # 2026-04-28 at $328 balance, halting trading until manual restart.
-  circuit_breaker_enabled: false
-  circuit_breaker_threshold: 0.30  # only used if re-enabled; 30% drawdown
+  max_session_loss_usdc: 200       # absolute session loss cap in USDC — the real stop-loss
 
   # Rolling kill switches — halt new entries when recent performance is bad
   # enough that we should stop and look. These are strict short-window
   # versions of max_session_loss_usdc; they catch a bad streak before it
   # eats the day's allowance.
-  rolling_window_n: 10           # how many recent trades to evaluate
+  rolling_window_n: 20             # how many recent trades to evaluate
   rolling_pnl_floor_usdc: -100     # halt if last N trades sum to less than this
-  rolling_winrate_floor: 0.10      # halt if last N trades win rate < this
+  rolling_winrate_floor: 0.30      # halt if last N trades win rate < this
+
+  # Lifetime-peak drawdown breaker. Disabled in favor of max_session_loss_usdc
+  # + the rolling kill-switch above, which both auto-clear at session boundaries.
+  # The peak-drawdown breaker latches forever (no auto-reset) and tripped on
+  # 2026-04-28 at $328 balance, halting trading until manual restart.
+  circuit_breaker_enabled: false
+  circuit_breaker_threshold: 0.30  # only used if re-enabled; 30% drawdown
 
 chainlink_feed:
   enabled: true

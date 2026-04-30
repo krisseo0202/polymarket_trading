@@ -124,6 +124,23 @@ class LogRegEdgeStrategy(Strategy):
         self.last_f_ret_30s: Optional[float] = None
         self.last_f_delta: Optional[float] = None
 
+        # Late-slot snipe — opt-in microstructure path. Bypasses the normal
+        # min_seconds_to_expiry / min_entry_price / max_entry_price gates;
+        # has its own (different-shape) gates instead. Does NOT consult the
+        # model — thesis is microstructure mispricing harvest, not prediction.
+        snipe_cfg = dict(config.get("late_snipe") or {})
+        self.late_snipe_enabled: bool = bool(snipe_cfg.get("enabled", False))
+        self.late_snipe_max_tte_s: float = float(snipe_cfg.get("max_tte_s", 30.0))
+        self.late_snipe_min_entry_price: float = float(snipe_cfg.get("min_entry_price", 0.90))
+        self.late_snipe_max_entry_price: float = float(snipe_cfg.get("max_entry_price", 0.95))
+        self.late_snipe_min_moneyness_bps: float = float(snipe_cfg.get("min_moneyness_bps", 50.0))
+        self.late_snipe_max_spread_pct: float = float(snipe_cfg.get("max_spread_pct", 0.03))
+        self.late_snipe_size_usdc: float = float(snipe_cfg.get("size_usdc", 5.0))
+        # Once-per-slot guard, keyed by slot_ts (slot_expiry_ts − 300). Slot
+        # rollover changes slot_ts → comparison naturally lets the next slot
+        # snipe again without an explicit reset hook.
+        self._snipe_fired_for_slot: Optional[int] = None
+
     # ------------------------------------------------------------------
     # Core interface
     # ------------------------------------------------------------------
@@ -342,15 +359,12 @@ class LogRegEdgeStrategy(Strategy):
             )
             return []
 
-        # Model threshold respect: if the loaded model exposes explicit
-        # prob-side floors (min_prob_yes / max_prob_yes_for_no), enforce them
-        # as additional constraints. Config's min_confidence wins if it's
-        # tighter; the model's thresholds catch cases where the config gate
-        # is loose relative to what the model was trained/calibrated for.
+        # Model-side probability floors. If the loaded model_service exposes a
+        # `thresholds` dict with `min_prob_yes` / `max_prob_yes_for_no`,
+        # enforce them as additional gates on top of `delta`. Catches cases
+        # where one side of the calibrator is unreliable in a region the
+        # global delta gate doesn't cover. See tasks/postmortem_2026-04-25.md.
         model_thresholds = getattr(self.model_service, "thresholds", None)
-        # Only honor a real dict. MagicMock-based test fixtures will have a
-        # MagicMock here, and attribute-based access would silently return
-        # garbage floats. Treat non-dicts as "no thresholds declared".
         if not isinstance(model_thresholds, dict):
             model_thresholds = {}
         min_prob_yes = float(model_thresholds.get("min_prob_yes", 0.0))
@@ -525,9 +539,8 @@ class LogRegEdgeStrategy(Strategy):
         # intra-cycle pass. Reset is implicit: when slot_ts changes on
         # rollover, the equality check above lets the next slot fire again.
         # We do NOT optimistically set active_token_id/entry_*: that pattern
-        # caused phantom positions when orders were rejected downstream
-        # (see fix/strategy-silent-rejection-and-phantom-state). Let
-        # _auto_recover_position pick up the real position from inventory
+        # caused phantom positions when orders were rejected downstream.
+        # _auto_recover_position picks up the real position from inventory
         # after the fill lands.
         self._snipe_fired_for_slot = slot_ts
 

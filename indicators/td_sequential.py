@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import pandas as pd
 import numpy as np
-from typing import Dict
+from typing import Dict, Literal
 from .base import Indicator, IndicatorResult, IndicatorConfig
+
+TDMode = Literal["classic", "pine_simple"]
 
 class TDSequentialIndicator(Indicator):
     """
@@ -13,9 +15,16 @@ class TDSequentialIndicator(Indicator):
     def __init__(self, config: IndicatorConfig):
         super().__init__(config)
         self.setup_len: int = self.params.get("setup_len", 9)
-        self.setup_lookback: int = self.params.get("setup_lookback", 4) 
+        self.setup_lookback: int = self.params.get("setup_lookback", 4)
         self.countdown_len: int = self.params.get("countdown_len", 13)
-        self.countdown_lookback: int = self.params.get("countdown_lookback", 2) 
+        self.countdown_lookback: int = self.params.get("countdown_lookback", 2)
+        # classic: non-consecutive countdown after 9, up to 13 (Tom DeMark).
+        # pine_simple: extend the consecutive setup count past 9 up to
+        # setup_overshoot_max (matches joshua0702 Pine script).
+        self.mode: TDMode = self.params.get("mode", "classic")
+        if self.mode not in {"classic", "pine_simple"}:
+            raise ValueError(f"mode must be 'classic' or 'pine_simple', got {self.mode!r}")
+        self.setup_overshoot_max: int = self.params.get("setup_overshoot_max", 16)
     
     @staticmethod
     def _compute_tdst_levels(
@@ -316,7 +325,32 @@ class TDSequentialIndicator(Indicator):
         sell_cd_count = td_result['sell_cd_count']
         bullish_setup_complete = td_result['bullish_setup_complete']
         bearish_setup_complete = td_result['bearish_setup_complete']
-        
+
+        if self.mode == "pine_simple":
+            # In this mode buy_13/sell_13 mean "setup count hit 13 consecutively",
+            # not the classic non-consecutive countdown landing on 13.
+            cap = self.setup_overshoot_max
+            td_up = np.where(
+                (bearish_setup_count > 0) & (bearish_setup_count <= cap),
+                bearish_setup_count, 0,
+            ).astype(int)
+            td_dn = np.where(
+                (bullish_setup_count > 0) & (bullish_setup_count <= cap),
+                bullish_setup_count, 0,
+            ).astype(int)
+            td_result['buy_13'] = bullish_setup_count == self.countdown_len
+            td_result['sell_13'] = bearish_setup_count == self.countdown_len
+            td_result['td_up'] = td_up
+            td_result['td_dn'] = td_dn
+            return IndicatorResult(
+                indicator_name="TDSequential",
+                timeframe=timeframe,
+                values=td_result,
+                signals=[],
+                metadata={"ohlc": ohlc, "mode": self.mode},
+            )
+
+        # --- classic mode (default): non-consecutive countdown after 9 ---
         # TDUp: Sell Setup (bearish_setup_count) - Red triangles down above bars
         # VALIDATION: Only show valid sequences
         # Setup numbers: Show when setup_count > 0 (already consecutive from core computation)
@@ -411,5 +445,5 @@ class TDSequentialIndicator(Indicator):
             timeframe=timeframe,
             values=td_result,
             signals=[],
-            metadata={"ohlc": ohlc}
+            metadata={"ohlc": ohlc, "mode": self.mode},
         )
