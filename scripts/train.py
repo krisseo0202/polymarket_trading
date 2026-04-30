@@ -53,6 +53,10 @@ from src.backtest.period_split import (
     resolve_split_from_args,
     split_by_val_ratio,
 )
+from src.models.tte_weights import (
+    BUCKET_WEIGHTS,
+    tte_series_to_weights,
+)
 
 try:
     from xgboost import XGBClassifier
@@ -105,6 +109,7 @@ def train_logreg(
     y_train: np.ndarray,
     X_val: np.ndarray,
     y_val: np.ndarray,
+    sample_weight: Optional[np.ndarray] = None,
 ) -> Tuple[StandardScaler, LogisticRegression, IsotonicRegression, float]:
     scaler = StandardScaler().fit(X_train)
     model = LogisticRegression(
@@ -112,8 +117,14 @@ def train_logreg(
     )
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        model.fit(scaler.transform(X_train), y_train)
+        model.fit(
+            scaler.transform(X_train),
+            y_train,
+            sample_weight=sample_weight,
+        )
     raw_p = model.predict_proba(scaler.transform(X_val))[:, 1]
+    # Calibrator learns on unweighted val rows: the calibration map should
+    # reflect the true outcome distribution, not the training emphasis.
     calibrator = IsotonicRegression(out_of_bounds="clip").fit(raw_p, y_val)
     calibrated = calibrator.transform(raw_p)
     brier = float(brier_score_loss(y_val, calibrated))
@@ -125,6 +136,7 @@ def train_xgb(
     y_train: np.ndarray,
     X_val: np.ndarray,
     y_val: np.ndarray,
+    sample_weight: Optional[np.ndarray] = None,
 ) -> Tuple[XGBClassifier, IsotonicRegression, float]:
     model = XGBClassifier(
         max_depth=5,
@@ -136,12 +148,37 @@ def train_xgb(
         verbosity=0,
         n_jobs=-1,
     )
-    model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
+    model.fit(
+        X_train, y_train,
+        sample_weight=sample_weight,
+        eval_set=[(X_val, y_val)],
+        verbose=False,
+    )
     raw_p = model.predict_proba(X_val)[:, 1]
     calibrator = IsotonicRegression(out_of_bounds="clip").fit(raw_p, y_val)
     calibrated = calibrator.transform(raw_p)
     brier = float(brier_score_loss(y_val, calibrated))
     return model, calibrator, brier
+
+
+def compute_tte_sample_weights(
+    train_df: pd.DataFrame, enabled: bool,
+) -> Optional[np.ndarray]:
+    """Return sample weights from TTE buckets, or None if disabled.
+
+    Weights emphasize the core 60–180s trading window. See
+    src/models/tte_weights.py for the rationale and per-bucket values.
+    """
+    if not enabled:
+        return None
+    if "slot_expiry_ts" not in train_df.columns or "snapshot_ts" not in train_df.columns:
+        return None
+    tte = np.maximum(
+        0.0,
+        train_df["slot_expiry_ts"].to_numpy(dtype=float)
+        - train_df["snapshot_ts"].to_numpy(dtype=float),
+    )
+    return tte_series_to_weights(tte)
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +288,15 @@ def main() -> None:
         "--synthetic-half-spread", type=float, default=0.01,
         help="Fallback half-spread added to mid when real ask is missing.",
     )
+    parser.add_argument(
+        "--tte-weighted", action="store_true", default=True,
+        help="Weight training loss by TTE bucket (emphasize core 60-180s window). "
+             "Default on. See src/models/tte_weights.py.",
+    )
+    parser.add_argument(
+        "--no-tte-weighted", dest="tte_weighted", action="store_false",
+        help="Disable TTE-bucket weighting (use uniform sample weights).",
+    )
     parser.add_argument("--log-level", default="INFO")
     add_period_arguments(parser)
     args = parser.parse_args()
@@ -293,8 +339,19 @@ def main() -> None:
         fee_bps=args.fee_bps,
     )
 
+    sample_weight = compute_tte_sample_weights(train_df, enabled=args.tte_weighted)
+    if sample_weight is not None:
+        logging.info(
+            "TTE-weighted training ON — bucket weights: %s",
+            BUCKET_WEIGHTS,
+        )
+    else:
+        logging.info("TTE-weighted training OFF — uniform sample weights")
+
     # --- LogReg -----------------------------------------------------------------
-    lr_scaler, lr_model, lr_calibrator, lr_brier = train_logreg(X_train, y_train, X_val, y_val)
+    lr_scaler, lr_model, lr_calibrator, lr_brier = train_logreg(
+        X_train, y_train, X_val, y_val, sample_weight=sample_weight,
+    )
     lr_p = lr_calibrator.transform(lr_model.predict_proba(lr_scaler.transform(X_val))[:, 1])
     lr_metrics = {"brier": lr_brier, **slot_pnl(val_df, lr_p, config=fill_cfg)}
     logging.info("LogReg  brier=%.4f sharpe=%.2f pnl=%.2f trades=%d",
@@ -308,7 +365,9 @@ def main() -> None:
         pickle.dump(lr_calibrator, f)
 
     # --- XGB --------------------------------------------------------------------
-    xgb_model, xgb_calibrator, xgb_brier = train_xgb(X_train, y_train, X_val, y_val)
+    xgb_model, xgb_calibrator, xgb_brier = train_xgb(
+        X_train, y_train, X_val, y_val, sample_weight=sample_weight,
+    )
     xgb_p = xgb_calibrator.transform(xgb_model.predict_proba(X_val)[:, 1])
     xgb_metrics = {"brier": xgb_brier, **slot_pnl(val_df, xgb_p, config=fill_cfg)}
     logging.info("XGB     brier=%.4f sharpe=%.2f pnl=%.2f trades=%d",
@@ -384,6 +443,8 @@ def main() -> None:
             "fee_bps": fill_cfg.fee_bps,
             "entry_threshold": fill_cfg.entry_threshold,
         },
+        "tte_weighted": args.tte_weighted,
+        "tte_bucket_weights": BUCKET_WEIGHTS if args.tte_weighted else None,
         "logreg": lr_metrics,
         "xgb": xgb_metrics,
         "gate": gate_results,

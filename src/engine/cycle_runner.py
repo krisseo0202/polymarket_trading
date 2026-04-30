@@ -226,6 +226,7 @@ class CycleRunner:
             paper_trading=svc.paper_trading,
         )
         market_data = cycle_snap.to_market_data(yes_book, no_book, positions, balance)
+        _inject_recent_outcomes(market_data, svc.state, cycle_snap.slot_ts)
 
         # Online-retrain hot-swap: if the retrainer thread has a new model
         # ready AND the strategy is currently flat, swap it in before the
@@ -355,6 +356,7 @@ class CycleRunner:
                 paper_trading=svc.paper_trading,
             )
             market_data = intra_snap.to_market_data(yes_book, no_book, positions, balance)
+            _inject_recent_outcomes(market_data, svc.state, intra_snap.slot_ts)
             signals = svc.strategy.analyze(market_data)
             _log_decision(svc.strategy, signals, market_data, cycle_type="intra")
 
@@ -732,6 +734,29 @@ class CycleRunner:
             book_summary=book_summary,
             trade_log_path=svc.trade_log_path,
         )
+
+
+def _inject_recent_outcomes(
+    market_data: dict, state, current_slot_ts: int, n: int = 20,
+) -> None:
+    """Inject the last N resolved slot outcomes into ``market_data``.
+
+    The signed-v2 feature builder reads ``market_data["recent_slot_outcomes"]``
+    to compute ``recent_up_rate_5/10/20``. Without this injection, those
+    features stay at the 0.5 prior in production and the model loses the
+    regime context it was trained to use.
+
+    No peeking ahead: only slots strictly before ``current_slot_ts`` are
+    included. Returns oldest → newest.
+    """
+    outcomes = state.slot_outcomes if state and getattr(state, "slot_outcomes", None) else {}
+    if not outcomes:
+        return
+    prior = sorted(
+        ((s_ts, outcome) for s_ts, outcome in outcomes.items() if s_ts < current_slot_ts),
+        key=lambda kv: kv[0],
+    )
+    market_data["recent_slot_outcomes"] = [outcome for _, outcome in prior[-n:]]
 
 
 def execute_signals(

@@ -275,7 +275,7 @@ strategies:
     enabled: true
     btc_symbol: "btcusdt"
     btc_exchange: "binance"
-    model_dir: "models/signed_v1_trim"
+    model_dir: "models/signed_v2"
 
     # Entry filters — current values reflect the post-diagnose tuning.
     # See tasks/postmortem_2026-04-25.md for the bucket analysis that
@@ -315,6 +315,13 @@ risk:
   rolling_window_n: 20             # how many recent trades to evaluate
   rolling_pnl_floor_usdc: -100     # halt if last N trades sum to less than this
   rolling_winrate_floor: 0.30      # halt if last N trades win rate < this
+
+  # Lifetime-peak drawdown breaker. Disabled in favor of max_session_loss_usdc
+  # + the rolling kill-switch above, which both auto-clear at session boundaries.
+  # The peak-drawdown breaker latches forever (no auto-reset) and tripped on
+  # 2026-04-28 at $328 balance, halting trading until manual restart.
+  circuit_breaker_enabled: false
+  circuit_breaker_threshold: 0.30  # only used if re-enabled; 30% drawdown
 
 chainlink_feed:
   enabled: true

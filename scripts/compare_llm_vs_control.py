@@ -97,7 +97,7 @@ bb = min((t["brier"] for t in p), default=float("nan"))
 be = max((t["final_equity"] for t in p), default=float("nan"))
 print(f"{'Control (pure Optuna)':<22}{nt:>10}{len(p):>10}{bb:>14.4f}{be:>14.2f}")
 print("=" * 70)
-print(f"\nHypervolume (ref: brier=1.0, equity=$100):")
+print("\nHypervolume (ref: brier=1.0, equity=$100):")
 print(f"  LLM merged : {hv(llm_global):.2f}")
 print(f"  Control    : {hv(ctrl_global):.2f}")
 

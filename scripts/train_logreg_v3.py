@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import pickle
 import sys
@@ -433,7 +432,7 @@ def main():
     print(f"Slot-level acc: {slot_acc:.3f} ({len(slot_acc_rows)} slots)")
 
     # Calibration buckets
-    print(f"\nCalibration (valid):")
+    print("\nCalibration (valid):")
     for lo, hi in [(0, 0.3), (0.3, 0.45), (0.45, 0.55), (0.55, 0.7), (0.7, 1.0)]:
         mask = (p_valid >= lo) & (p_valid < hi)
         if mask.sum() > 0:
@@ -443,7 +442,7 @@ def main():
                   f"pred={pred:.3f}  actual={actual:.3f}")
 
     # Coefficients
-    print(f"\nCoefficients:")
+    print("\nCoefficients:")
     print(f"  {'intercept':25s} {model.intercept_[0]:+.4f}")
     for feat, coef in sorted(zip(FEATURES, model.coef_[0]),
                               key=lambda x: abs(x[1]), reverse=True):

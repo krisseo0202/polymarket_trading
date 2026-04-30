@@ -51,6 +51,12 @@ from sklearn.metrics import brier_score_loss
 from sklearn.preprocessing import StandardScaler
 
 from src.backtest.fill_sim import FillConfig, as_dict, slot_pnl
+from src.models.tte_weights import (
+    BUCKET_BOUNDS,
+    bucket_names,
+    bucket_range,
+    tte_series_to_buckets,
+)
 from src.backtest.period_split import (
     add_period_arguments,
     resolve_split_from_args,
@@ -359,6 +365,111 @@ def find_redundancy_clusters(
 # ---------------------------------------------------------------------------
 
 
+def _compute_tte(df: pd.DataFrame) -> np.ndarray:
+    """Seconds-to-expiry per row, derived from slot_expiry_ts - snapshot_ts.
+
+    Preferred over the ``seconds_to_expiry`` feature column because that
+    column may not be present if feature_columns selection excludes it.
+    """
+    expiry = df["slot_expiry_ts"].to_numpy(dtype=float)
+    snap = df["snapshot_ts"].to_numpy(dtype=float)
+    return np.maximum(0.0, expiry - snap)
+
+
+def tte_bucket_analysis(
+    val_df: pd.DataFrame,
+    logreg_p: np.ndarray,
+    xgb_p: np.ndarray,
+    fill_config: FillConfig,
+) -> pd.DataFrame:
+    """Per-TTE-bucket diagnostics: predictability vs tradable edge.
+
+    The distinction the user called out: **predictable is not the same as
+    profitable**. Near-resolution rows (very_late) are trivially predictable
+    but carry no edge. The core 60–180s window is where we need the model
+    to be both calibrated AND tradable.
+
+    Returns a DataFrame with one row per bucket containing:
+      - ``n`` row count
+      - ``brier_lr`` / ``brier_xgb`` calibrated Brier score on that bucket
+      - ``log_loss_lr`` / ``log_loss_xgb`` log loss per bucket
+      - ``ece_xgb`` expected calibration error (10-bin) on XGB probs
+      - ``mean_spread_pct`` avg yes_spread_pct (proxy for exec cost)
+      - ``solo_pnl_lr`` / ``solo_pnl_xgb`` realized edge after spread+fee
+      - ``pass_rate`` pct of rows where XGB fires a trade under the same rule
+    """
+    tte = _compute_tte(val_df)
+    buckets = tte_series_to_buckets(tte)
+    y = val_df["label"].to_numpy(dtype=float)
+
+    # Guard probabilities to avoid log(0) in log loss.
+    eps = 1e-12
+    p_lr = np.clip(logreg_p, eps, 1 - eps)
+    p_xg = np.clip(xgb_p, eps, 1 - eps)
+
+    mean_spread = val_df.get("yes_spread_pct")
+    mean_spread_arr = (
+        mean_spread.to_numpy(dtype=float) if mean_spread is not None else np.zeros(len(val_df))
+    )
+
+    rows: List[Dict[str, object]] = []
+    for name in bucket_names():
+        mask = buckets == name
+        n = int(mask.sum())
+        if n == 0:
+            rows.append({"bucket": name, "tte_range": bucket_range(name), "n": 0})
+            continue
+
+        yb = y[mask]
+        plr = p_lr[mask]
+        pxg = p_xg[mask]
+
+        brier_lr = float(np.mean((plr - yb) ** 2))
+        brier_xgb = float(np.mean((pxg - yb) ** 2))
+        log_loss_lr = float(-np.mean(yb * np.log(plr) + (1 - yb) * np.log(1 - plr)))
+        log_loss_xgb = float(-np.mean(yb * np.log(pxg) + (1 - yb) * np.log(1 - pxg)))
+
+        # Expected calibration error (10-bin) on XGB — catches "confident but wrong"
+        ece = 0.0
+        bins = np.linspace(0, 1, 11)
+        bin_idx = np.digitize(pxg, bins) - 1
+        bin_idx = np.clip(bin_idx, 0, 9)
+        for b in range(10):
+            bm = bin_idx == b
+            if bm.any():
+                ece += (bm.sum() / n) * abs(yb[bm].mean() - pxg[bm].mean())
+
+        # Realized edge via the existing fill simulator, restricted to bucket rows.
+        # slot_pnl returns a FillMetrics dataclass; wrap via as_dict for access.
+        bucket_df = val_df[mask].reset_index(drop=True)
+        solo_lr = as_dict(slot_pnl(bucket_df, plr, config=fill_config))
+        solo_xg = as_dict(slot_pnl(bucket_df, pxg, config=fill_config))
+
+        # Trade pass rate: fraction of bucket rows where XGB would have fired.
+        threshold = fill_config.entry_threshold
+        pass_rate = float(((pxg >= threshold) | (pxg <= 1 - threshold)).mean())
+
+        rows.append({
+            "bucket": name,
+            "tte_range": bucket_range(name),
+            "n": n,
+            "brier_lr": brier_lr,
+            "brier_xgb": brier_xgb,
+            "log_loss_lr": log_loss_lr,
+            "log_loss_xgb": log_loss_xgb,
+            "ece_xgb": float(ece),
+            "mean_spread_pct": float(np.mean(mean_spread_arr[mask])),
+            "solo_pnl_lr": solo_lr["pnl"],
+            "solo_sharpe_lr": solo_lr["sharpe"],
+            "solo_n_trades_lr": solo_lr["n_trades"],
+            "solo_pnl_xgb": solo_xg["pnl"],
+            "solo_sharpe_xgb": solo_xg["sharpe"],
+            "solo_n_trades_xgb": solo_xg["n_trades"],
+            "pass_rate_xgb": pass_rate,
+        })
+    return pd.DataFrame(rows)
+
+
 def sentinel_columns(features: List[str]) -> List[str]:
     return [f for f in features if f.startswith("random_value")]
 
@@ -433,6 +544,7 @@ def write_report(
     corr: pd.DataFrame,
     models: ProbeModels,
     dataset_stats: Dict[str, object],
+    bucket_df: Optional[pd.DataFrame] = None,
 ) -> None:
     sentinels = [f for f in table.index if f.startswith("random_value")]
     floor = float(table.loc[sentinels, "xgb_perm_importance"].max()) if sentinels else 0.0
@@ -457,6 +569,31 @@ def write_report(
         f.write(f"- Probe Brier — LogReg: `{models.logreg_val_brier:.4f}` · XGB: `{models.xgb_val_brier:.4f}`\n")
         f.write(f"- **Random sentinel floor (xgb_perm_importance):** `{floor:+.6f}` — ")
         f.write(f"{len(below)} feature(s) sit at or below this floor.\n\n")
+
+        if bucket_df is not None and not bucket_df.empty:
+            f.write("## TTE bucket analysis — predictability vs tradable edge\n\n")
+            f.write(
+                "Remember: **predictable is not the same as profitable**. "
+                "Near-resolution rows (`very_late`) are trivial to predict but "
+                "tight spreads and execution risk wipe out tradable edge. "
+                "The `core` bucket (60–180s) is the real target.\n\n"
+            )
+            display_cols = [
+                "bucket", "tte_range", "n",
+                "brier_lr", "brier_xgb", "log_loss_xgb", "ece_xgb",
+                "mean_spread_pct",
+                "solo_pnl_lr", "solo_sharpe_lr",
+                "solo_pnl_xgb", "solo_sharpe_xgb",
+                "pass_rate_xgb",
+            ]
+            show = bucket_df[[c for c in display_cols if c in bucket_df.columns]]
+            f.write(show.pipe(_to_markdown))
+            f.write("\n\n")
+            f.write(
+                "Training uses sample weights from `src/models/tte_weights.py` "
+                "to bias the loss toward the `core` bucket. Tune those weights "
+                "if the realized-edge pattern above disagrees with the prior.\n\n"
+            )
 
         f.write(f"## Top {_TOP_N_IN_REPORT} features by permutation importance\n\n")
         f.write(table.head(_TOP_N_IN_REPORT).reset_index().pipe(_to_markdown))
@@ -629,6 +766,14 @@ def main() -> None:
     corr.to_csv(out_dir / "correlation_matrix.csv")
     save_probe_models(out_dir, models)
 
+    # TTE bucket analysis: per-bucket predictability vs tradable edge so the
+    # user can validate the emphasize-core assumption with real numbers.
+    X_val = val_df[features].to_numpy(dtype=float)
+    lr_p = models.logreg.predict_proba(models.scaler.transform(X_val))[:, 1]
+    xgb_p = models.xgb.predict_proba(X_val)[:, 1]
+    bucket_df = tte_bucket_analysis(val_df, lr_p, xgb_p, fill_config=fill_cfg)
+    bucket_df.to_csv(out_dir / "tte_bucket_analysis.csv", index=False)
+
     write_report(
         out_dir,
         table,
@@ -639,6 +784,7 @@ def main() -> None:
             "n_train_slots": train_df["slot_ts"].nunique(),
             "n_val_slots": val_df["slot_ts"].nunique(),
         },
+        bucket_df=bucket_df,
     )
     print(f"Probe complete → {out_dir / 'report.md'}")
 

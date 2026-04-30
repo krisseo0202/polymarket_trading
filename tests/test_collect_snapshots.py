@@ -3,7 +3,6 @@
 import json
 import os
 import sys
-import tempfile
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -11,10 +10,8 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from scripts.collect_snapshots import (
     BookFetcher,
-    BookSummary,
     MarketDiscovery,
     SnapshotCollector,
-    SnapshotLogger,
     _determine_outcome,
     _parse_json_field,
 )
@@ -83,6 +80,47 @@ class TestBookFetcherImbalance:
         assert result is not None
         assert result.mid == pytest.approx(0.505)
         assert result.spread == pytest.approx(0.010)
+
+    def test_full_depth_fields_populated(self):
+        """Full-depth fields: bids/asks dicts, total depth, level counts."""
+        bids = _make_levels(7, base_price=0.50, base_size=10.0)
+        asks = _make_levels(3, base_price=0.51, base_size=20.0)
+        fetcher = BookFetcher(top_n=5)
+        with patch("requests.get", return_value=self._mock_response(bids, asks)):
+            result = fetcher.fetch("dummy_token")
+        assert result is not None
+        # Full book dicts contain all levels
+        assert len(result.bids) == 7
+        assert len(result.asks) == 3
+        # Total depth (7 bids × 10 = 70, 3 asks × 20 = 60)
+        assert result.bid_depth == pytest.approx(70.0)
+        assert result.ask_depth == pytest.approx(60.0)
+        # Level counts
+        assert result.n_bid_levels == 7
+        assert result.n_ask_levels == 3
+
+    def test_full_bids_asks_are_price_size_dicts(self):
+        """full_bids/full_asks are {price_str: size_str} dicts from the raw CLOB response."""
+        bids = [{"price": "0.500", "size": "25"}, {"price": "0.499", "size": "15"}]
+        asks = [{"price": "0.510", "size": "30"}]
+        fetcher = BookFetcher(top_n=5)
+        with patch("requests.get", return_value=self._mock_response(bids, asks)):
+            result = fetcher.fetch("dummy_token")
+        assert result.bids == {"0.500": "25", "0.499": "15"}
+        assert result.asks == {"0.510": "30"}
+
+    def test_depth_one_sided(self):
+        """All bids, no asks → bid_depth populated, ask_depth = 0."""
+        bids = _make_levels(4, base_size=10.0)
+        asks = []
+        fetcher = BookFetcher(top_n=5)
+        with patch("requests.get", return_value=self._mock_response(bids, asks)):
+            result = fetcher.fetch("dummy_token")
+        assert result is not None
+        assert result.bid_depth == pytest.approx(40.0)
+        assert result.ask_depth == pytest.approx(0.0)
+        assert result.n_bid_levels == 4
+        assert result.n_ask_levels == 0
 
 
 # ── MarketDiscovery caching ───────────────────────────────────────────────────
@@ -191,10 +229,13 @@ class TestOutcomeSentinel:
 class TestSnapshotSchema:
     REQUIRED_KEYS = {
         "slot_ts", "snapshot_ts",
+        "up_token", "down_token",
         "strike", "strike_source",
         "btc_now", "btc_source",
         "yes_bid", "yes_ask", "yes_mid", "yes_spread", "yes_imbalance",
+        "yes_bids", "yes_asks", "yes_bid_depth", "yes_ask_depth", "yes_n_levels",
         "no_bid", "no_ask", "no_mid", "no_spread", "no_imbalance",
+        "no_bids", "no_asks", "no_bid_depth", "no_ask_depth", "no_n_levels",
         "realized_vol_30s", "realized_vol_60s",
     }
 

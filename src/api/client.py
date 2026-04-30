@@ -7,9 +7,12 @@ from datetime import datetime
 import logging
 import requests
 
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType, BalanceAllowanceParams, AssetType, OpenOrderParams
-from py_clob_client.order_builder.constants import BUY, SELL
+# CLOB V2 cutover: 2026-04-28 ~11:00 UTC. Server-side AssetType.COLLATERAL
+# now resolves to pUSD instead of USDC.e; client surface is unchanged.
+# See tasks/todo.md "CLOB V2 migration" for the full migration ticket.
+from py_clob_client_v2.client import ClobClient
+from py_clob_client_v2.clob_types import OrderArgs, BalanceAllowanceParams, AssetType, OpenOrderParams
+from py_clob_client_v2.order_builder.constants import BUY, SELL
 from .types import MarketData, OrderBook, OrderBookEntry, Position, Order
 
 
@@ -56,7 +59,7 @@ class PolymarketClient:
                 signature_type=signature_type,
                 funder=funder_address or os.getenv("PROXY_FUNDER"),
             )
-            creds = self.client.create_or_derive_api_creds()
+            creds = self.client.create_or_derive_api_key()
             self.client.set_api_creds(creds)
             logging.getLogger(__name__).info(f"Polymarket Client Address: {self.client.get_address()}")
         else:

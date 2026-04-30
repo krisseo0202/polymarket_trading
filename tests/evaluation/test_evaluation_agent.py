@@ -4,7 +4,6 @@ import random
 from typing import Any, Dict, List
 
 import pandas as pd
-import pytest
 
 from src.evaluation.agent import EvaluationAgent, EvaluationConfig, EvaluationResult
 from src.strategies.base import Signal, Strategy

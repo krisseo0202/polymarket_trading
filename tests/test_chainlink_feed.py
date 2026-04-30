@@ -216,3 +216,58 @@ class TestGetRecentPrices:
         prices = feed.get_recent_prices(window_s=60)
         assert len(prices) == 1  # only the recent one within 60s
         assert prices[0][1] == 84500.0
+
+
+class TestSlotOpenOrCarryForward:
+    """get_slot_open_or_carry_forward: the carry-forward getter used by the bot
+    and the snapshot collector to stay Chainlink-sourced even when no fresh
+    tick arrived in the current slot (BTC didn't move 0.5%)."""
+
+    def test_returns_fresh_slot_open_when_available(self, feed):
+        slot_ts = 1700000100
+        slot_floor = (slot_ts // 300) * 300
+
+        with patch("src.utils.chainlink_feed.time") as mock_time:
+            mock_time.time.return_value = float(slot_ts)
+            feed._handle_message(_make_msg("btc/usd", 84500.0, float(slot_ts)))
+
+        got = feed.get_slot_open_or_carry_forward(slot_floor)
+        assert got is not None
+        assert got.slot_ts == slot_floor
+        assert got.price == 84500.0
+
+    def test_carries_forward_latest_when_no_tick_in_current_slot(self, feed):
+        """Slot 1 got a tick; slot 2 got none → carry forward the slot-1 price."""
+        slot1_ts = 1700000100
+        slot1_floor = (slot1_ts // 300) * 300
+        slot2_floor = slot1_floor + 300
+
+        with patch("src.utils.chainlink_feed.time") as mock_time:
+            mock_time.time.return_value = float(slot1_ts)
+            feed._handle_message(_make_msg("btc/usd", 84500.0, float(slot1_ts)))
+
+        got = feed.get_slot_open_or_carry_forward(slot2_floor)
+        assert got is not None
+        assert got.slot_ts == slot2_floor         # request honored
+        assert got.price == 84500.0                # last-known price carried
+
+    def test_returns_none_when_no_chainlink_data_at_all(self, feed):
+        """No ticks ever → None (caller must fall back to regex / btc_feed)."""
+        got = feed.get_slot_open_or_carry_forward(1700000400)
+        assert got is None
+
+    def test_does_not_carry_forward_future_ticks(self, feed):
+        """If the only tick we have is AFTER the requested slot, return None.
+
+        Guard against timestamp clock skew: we should never claim a slot-open
+        using a price that was observed later than the slot start.
+        """
+        slot_ts = 1700000400  # future slot
+        earlier_slot = slot_ts - 300
+
+        with patch("src.utils.chainlink_feed.time") as mock_time:
+            mock_time.time.return_value = float(slot_ts)
+            feed._handle_message(_make_msg("btc/usd", 84500.0, float(slot_ts)))
+
+        got = feed.get_slot_open_or_carry_forward(earlier_slot)
+        assert got is None

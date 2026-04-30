@@ -26,10 +26,11 @@ class RSIIndicator(Indicator):
         self.validate_ohlc(ohlc)
         close = ohlc["close"].astype(float).to_numpy()
         rsi = _wilder_rsi(close, self.period)
+        rsi_centered = rsi - 50.0
         return IndicatorResult(
             indicator_name="RSI",
             timeframe=timeframe,
-            values={"rsi": rsi},
+            values={"rsi": rsi, "rsi_centered": rsi_centered},
             signals=[],
         )
 

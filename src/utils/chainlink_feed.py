@@ -39,7 +39,14 @@ class SlotOpenPrice:
 
 
 _STALE_WARN_S = 90.0    # Chainlink updates on 0.5% deviation; quiet periods can last minutes
-_RECONNECT_S = 30.0    # reconnect if no messages (including PONGs) for 30s
+# Reconnect threshold for app-level silence. The WS library ALSO maintains
+# protocol-level ping/pong (ping_interval=20, ping_timeout=10) — if the TCP
+# connection dies, that mechanism will raise and trigger reconnect via the
+# outer exception handler. A 30s app-level threshold was tripping on every
+# quiet period where the server doesn't echo our text "PING" — causing
+# unnecessary reconnect storms. 120s gives real silent-failure detection
+# without fighting the underlying WS keepalive.
+_RECONNECT_S = 120.0
 _BUFFER_S = 600.0
 _BACKOFF_INIT = 1.0
 _BACKOFF_MAX = 15.0
@@ -106,6 +113,46 @@ class ChainlinkFeed:
         with self._lock:
             return self._slot_open
 
+    def get_slot_open_or_carry_forward(
+        self, slot_ts: int
+    ) -> Optional[SlotOpenPrice]:
+        """Return the Chainlink slot-open price for ``slot_ts``, carrying forward
+        the last-known price when no tick has arrived in the current slot.
+
+        Chainlink RTDS only pushes ticks on >= 0.5% price deviation, so
+        calm-market slots receive zero messages. By Chainlink's contract, the
+        slot-open price in that case IS the last-known price — if it had
+        changed materially, a tick would have been emitted. This method is
+        the semantically correct way for consumers (bot + snapshot collector)
+        to read strike when Chainlink is quiet.
+
+        Priority:
+          1. If ``_slot_open.slot_ts == slot_ts`` → return it unmodified.
+          2. Else if we have ANY latest tick (``_latest != None``) AND that tick
+             predates ``slot_ts`` → carry forward: synthesize a SlotOpenPrice
+             for ``slot_ts`` using ``_latest.price``.
+          3. Else → return None.
+
+        The ``captured_at`` field on the synthesized SlotOpenPrice is the
+        original tick's ``local_ts`` so callers can detect staleness if they
+        care. ``slot_ts`` always reflects the requested slot.
+        """
+        with self._lock:
+            if self._slot_open is not None and self._slot_open.slot_ts == slot_ts:
+                return self._slot_open
+            if self._latest is None:
+                return None
+            # Carry-forward only makes sense if the latest tick is from BEFORE
+            # the requested slot. A tick from AFTER would mean we missed
+            # _record_tick's slot-advance branch (shouldn't happen, but guard).
+            if self._latest.exchange_ts > slot_ts:
+                return None
+            return SlotOpenPrice(
+                slot_ts=slot_ts,
+                price=self._latest.price,
+                captured_at=self._latest.local_ts,
+            )
+
     def get_reference_price(self) -> Optional[float]:
         """Return the slot-open price (price to beat) if available."""
         with self._lock:
@@ -164,7 +211,7 @@ class ChainlinkFeed:
         try:
             data = json.loads(raw)
         except (json.JSONDecodeError, TypeError):
-            self._logger.debug(f"Chainlink: bad JSON")
+            self._logger.debug("Chainlink: bad JSON")
             return
 
         # RTDS messages may arrive in the legacy [topic, payload] format or

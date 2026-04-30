@@ -22,7 +22,6 @@ class Config:
     
     # Risk management
     risk_limits: Dict[str, Any] = field(default_factory=lambda: {
-        "max_position_size": 1000.0,
         "max_position_pct": 0.1,
         "max_total_exposure": 0.5,
         "max_daily_loss": 0.1,

@@ -288,3 +288,179 @@ def test_kelly_size_invalid_price_returns_zero():
     assert s._kelly_size(prob=0.60, price=0.0, balance=1000.0) == 0.0
     assert s._kelly_size(prob=0.60, price=1.0, balance=1000.0) == 0.0
     assert s._kelly_size(prob=0.60, price=-0.1, balance=1000.0) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Entry gate tests — verify min_confidence and model thresholds are honored
+# ---------------------------------------------------------------------------
+
+
+def _make_strategy_with_min_confidence(model, min_conf: float, delta=0.01):
+    """Strategy configured with explicit min_confidence."""
+    config = {
+        "delta": delta,
+        "position_size_usdc": 30.0,
+        "kelly_fraction": 0.15,
+        "max_spread_pct": 0.10,
+        "min_seconds_to_expiry": 10.0,
+        "max_seconds_to_expiry": 290.0,
+        "min_confidence": min_conf,
+    }
+    strategy = LogRegEdgeStrategy(config=config, model_service=model)
+    strategy.set_tokens("market_1", "yes_token", "no_token")
+    return strategy
+
+
+def test_min_confidence_blocks_low_prob_yes_entry():
+    """prob_yes on the chosen side must clear min_confidence (bug-repro)."""
+    # Model says p_yes=0.48. Market mid = 0.40 → edge_yes = 0.48 - 0.40 - 0.01 = 0.07
+    # Edge is well above delta=0.01, so pre-fix the bot would trade — but the
+    # model is essentially undecided. min_confidence=0.55 must block this.
+    model = _mock_model(prob_yes=0.48)
+    strategy = _make_strategy_with_min_confidence(model, min_conf=0.55, delta=0.01)
+
+    data = _market_data(yes_bid=0.39, yes_ask=0.41, no_bid=0.59, no_ask=0.61)
+    signals = strategy.analyze(data)
+
+    assert signals == []
+    assert "confidence_low" in strategy.last_skip_reason
+
+
+def test_min_confidence_blocks_low_prob_no_entry():
+    """Same gate for the NO side — the chosen side's prob is 1-p_hat."""
+    # p_yes=0.52 → prob on NO side = 0.48. min_confidence=0.55 must block.
+    model = _mock_model(prob_yes=0.52)
+    strategy = _make_strategy_with_min_confidence(model, min_conf=0.55, delta=0.01)
+
+    # Market prices NO at 0.40 → edge_no = (1-p_hat) - (1-q_t) - c_t structure.
+    # Just need a market where NO has the bigger edge.
+    data = _market_data(yes_bid=0.59, yes_ask=0.61, no_bid=0.39, no_ask=0.41)
+    signals = strategy.analyze(data)
+
+    assert signals == []
+    assert "confidence_low" in strategy.last_skip_reason
+
+
+def test_min_confidence_passes_when_prob_clears_threshold():
+    """Sanity: prob on chosen side >= min_confidence → not blocked by this gate."""
+    model = _mock_model(prob_yes=0.70)
+    strategy = _make_strategy_with_min_confidence(model, min_conf=0.55, delta=0.05)
+
+    data = _market_data(yes_bid=0.49, yes_ask=0.51, no_bid=0.49, no_ask=0.51)
+    signals = strategy.analyze(data)
+
+    assert len(signals) == 1
+    assert signals[0].outcome == "YES"
+
+
+def test_model_threshold_min_prob_yes_gates_yes_trade():
+    """Even if config min_confidence passes, model.thresholds['min_prob_yes'] must block."""
+    model = _mock_model(prob_yes=0.52)
+    model.thresholds = {"min_prob_yes": 0.60, "max_prob_yes_for_no": 0.40}
+    # min_confidence set low so the model gate is the binding constraint.
+    strategy = _make_strategy_with_min_confidence(model, min_conf=0.50, delta=0.005)
+
+    data = _market_data(yes_bid=0.39, yes_ask=0.41, no_bid=0.59, no_ask=0.61)
+    signals = strategy.analyze(data)
+
+    assert signals == []
+    assert "model_prob_yes_low" in strategy.last_skip_reason
+
+
+def test_model_threshold_max_prob_yes_for_no_gates_no_trade():
+    """Symmetric gate on the NO side."""
+    model = _mock_model(prob_yes=0.48)  # chosen side NO, prob_no=0.52
+    model.thresholds = {"min_prob_yes": 0.60, "max_prob_yes_for_no": 0.40}
+    strategy = _make_strategy_with_min_confidence(model, min_conf=0.50, delta=0.005)
+
+    data = _market_data(yes_bid=0.59, yes_ask=0.61, no_bid=0.39, no_ask=0.41)
+    signals = strategy.analyze(data)
+
+    assert signals == []
+    assert "model_prob_yes_high_for_no" in strategy.last_skip_reason
+
+
+def test_should_enter_does_not_second_guess_checked_signals():
+    """should_enter shouldn't re-gate on confidence — the _check_entry gate already ran."""
+    model = _mock_model(prob_yes=0.70)
+    strategy = _make_strategy_with_min_confidence(model, min_conf=0.55, delta=0.05)
+
+    data = _market_data(yes_bid=0.49, yes_ask=0.51, no_bid=0.49, no_ask=0.51)
+    signals = strategy.analyze(data)
+    assert len(signals) == 1
+
+    # Signal.confidence was clamped up to min_confidence — verify
+    # should_enter still returns True (does not re-block).
+    assert strategy.should_enter(signals[0]) is True
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Edge stability gate — min_stable_ticks
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _stability_strategy(min_stable_ticks: int, delta: float = 0.05) -> LogRegEdgeStrategy:
+    """Build a strategy wired for the stability-gate tests."""
+    model = _mock_model(prob_yes=0.70)
+    config = {
+        "delta": delta,
+        "position_size_usdc": 30.0,
+        "kelly_fraction": 0.15,
+        "max_spread_pct": 0.10,
+        "min_seconds_to_expiry": 10.0,
+        "max_seconds_to_expiry": 290.0,
+        "min_stable_ticks": min_stable_ticks,
+    }
+    s = LogRegEdgeStrategy(config=config, model_service=model)
+    s.set_tokens("market_1", "yes_token", "no_token")
+    return s
+
+
+def test_stability_default_still_fires_on_first_tick():
+    """Unset / default min_stable_ticks=1 must match legacy behavior exactly."""
+    s = _stability_strategy(min_stable_ticks=1)
+    data = _market_data(yes_bid=0.49, yes_ask=0.51, no_bid=0.49, no_ask=0.51)
+    assert len(s.analyze(data)) == 1
+
+
+def test_stability_blocks_first_two_ticks_fires_on_third():
+    """min_stable_ticks=3 should require 3 consecutive above-threshold ticks."""
+    s = _stability_strategy(min_stable_ticks=3)
+    data = _market_data(yes_bid=0.49, yes_ask=0.51, no_bid=0.49, no_ask=0.51)
+    assert len(s.analyze(data)) == 0
+    assert "edge_not_stable" in s.last_skip_reason
+    assert "1/3" in s.last_skip_reason
+    assert len(s.analyze(data)) == 0
+    assert "2/3" in s.last_skip_reason
+    assert len(s.analyze(data)) == 1
+
+
+def test_stability_resets_on_slot_rollover():
+    """A new slot must zero the counter — the prior slot's warm-up can't carry."""
+    s = _stability_strategy(min_stable_ticks=3)
+    data = _market_data(yes_bid=0.49, yes_ask=0.51, no_bid=0.49, no_ask=0.51, tte=150.0)
+    s.analyze(data)
+    s.analyze(data)  # counter = 2
+    # Simulate a new slot by giving slot_expiry_ts a different value while
+    # keeping the effective tte within the strategy's entry window.
+    data2 = _market_data(yes_bid=0.49, yes_ask=0.51, no_bid=0.49, no_ask=0.51, tte=160.0)
+    assert data2["slot_expiry_ts"] != data["slot_expiry_ts"]
+    assert len(s.analyze(data2)) == 0  # counter reset to 1 — still 1 of 3
+    assert "1/3" in s.last_skip_reason
+
+
+def test_stability_resets_when_edge_falls_below_threshold_mid_run():
+    """A single below-threshold tick must re-zero the counter."""
+    s = _stability_strategy(min_stable_ticks=3, delta=0.05)
+    # Two ticks where model agrees, edge is wide.
+    data_yes = _market_data(yes_bid=0.49, yes_ask=0.51, no_bid=0.49, no_ask=0.51)
+    s.analyze(data_yes)
+    s.analyze(data_yes)
+    # One tick where the edge is too small: yes_ask goes to 0.69 so
+    # edge_yes = 0.70 - 0.70 - 0.01 = -0.01  (below delta=0.05)
+    # edge_no  = 0.70 - 0.30 - 0.01 = 0.39   (above delta)
+    data_fail = _market_data(yes_bid=0.69, yes_ask=0.71, no_bid=0.29, no_ask=0.31)
+    s.analyze(data_fail)
+    # Back to wide YES edge — counter must restart.
+    assert len(s.analyze(data_yes)) == 0  # counter = 1 of 3
+    assert "1/3" in s.last_skip_reason

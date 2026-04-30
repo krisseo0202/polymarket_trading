@@ -162,13 +162,13 @@ def main() -> None:
     if not args.no_bot:
         components.append("bot")
     print(f"  Starting: {', '.join(components)}")
-    print(f"\n  Session outputs:")
+    print("\n  Session outputs:")
     print(f"    BTC data:   {args.btc_output}")
     print(f"    OB data:    {args.ob_output}")
     if not args.no_bot:
-        print(f"    Bot log:    logs/btc_updown_bot.log")
-        print(f"    Decisions:  data/decision_log_*.jsonl (timestamped at bot start)")
-    print(f"\n  Press Ctrl+C to stop all.\n")
+        print("    Bot log:    logs/btc_updown_bot.log")
+        print("    Decisions:  data/decision_log_*.jsonl (timestamped at bot start)")
+    print("\n  Press Ctrl+C to stop all.\n")
 
     procs = launch(
         bot=not args.no_bot,

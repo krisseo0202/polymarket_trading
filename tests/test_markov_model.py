@@ -1,7 +1,8 @@
 """Tests for the Markov transition matrix + Monte Carlo model.
 
 Covers: discretize, build_transition_matrix, validate_transition_matrix,
-simulate_paths, estimate_p_yes, MarkovModel.predict, compare_model_vs_market.
+simulate_paths, estimate_p_yes, composite state functions,
+MarkovModel.predict, compare_model_vs_market.
 """
 
 import numpy as np
@@ -211,7 +212,7 @@ class TestMarkovModelPredict:
         }
 
     def test_happy_path_returns_ready(self):
-        model = MarkovModel(n_states=20, n_paths=1000, seed=42)
+        model = MarkovModel(n_price_bins=10, n_paths=1000, seed=42)
         result = model.predict(self._make_snapshot())
         assert result.feature_status == "ready"
         assert 0.01 <= result.prob_yes <= 0.99
@@ -240,17 +241,19 @@ class TestMarkovModelPredict:
         assert result.feature_status == "missing_expiry"
 
     def test_last_features_populated(self):
-        model = MarkovModel(n_states=20, n_paths=500, seed=7)
+        model = MarkovModel(n_price_bins=10, n_paths=500, seed=7)
         model.predict(self._make_snapshot())
         f = model.last_features
         assert "p_yes" in f
         assert "n_observations" in f
         assert f["n_paths"] == 500
         assert f["strike"] == 100.0
+        assert "dims" in f
+        assert "n_total_states" in f
 
     def test_price_well_above_strike_favors_yes(self):
         """When current price is well above strike, most paths stay above."""
-        model = MarkovModel(n_states=30, n_paths=3000, seed=123)
+        model = MarkovModel(n_price_bins=15, n_paths=3000, seed=123)
         now = 1700000000.0
         # Random walk centered around 100, strike at 99 (current is above).
         rng = np.random.default_rng(42)
@@ -267,8 +270,8 @@ class TestMarkovModelPredict:
 
     def test_reproducible_with_seed(self):
         snap = self._make_snapshot()
-        r1 = MarkovModel(n_states=20, n_paths=500, seed=99).predict(snap)
-        r2 = MarkovModel(n_states=20, n_paths=500, seed=99).predict(snap)
+        r1 = MarkovModel(n_price_bins=10, n_paths=500, seed=99).predict(snap)
+        r2 = MarkovModel(n_price_bins=10, n_paths=500, seed=99).predict(snap)
         assert r1.prob_yes == r2.prob_yes
 
 

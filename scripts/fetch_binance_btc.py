@@ -13,7 +13,7 @@ import argparse
 import io
 import os
 import zipfile
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, timedelta
 
 import pandas as pd
 import requests

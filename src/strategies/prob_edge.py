@@ -21,6 +21,7 @@ import logging
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from ._edge_stability import EdgeStabilityTracker
 from .base import Signal, Strategy
 from ..api.types import OrderBook, Position
 from ..models.baseline_model import BTCUpDownBaselineModel
@@ -77,6 +78,12 @@ class ProbEdgeStrategy(Strategy):
         self._slot_trade_count: int = 0
         self._slot_realized_pnl: float = 0.0
         self._slot_blocked_direction: Optional[str] = None  # "YES" or "NO"
+
+        # Edge-stability gate: require net_edge to clear the required
+        # threshold on this many consecutive ticks before firing. Defaults
+        # to 1 (no debouncing) to preserve legacy behavior.
+        self.min_stable_ticks: int = int(config.get("min_stable_ticks", 1))
+        self._stability = EdgeStabilityTracker(n_ticks=self.min_stable_ticks)
 
         # ── Observable state (written every cycle — read by dashboard) ─────────
         self.last_prob_yes: Optional[float] = None
@@ -317,9 +324,19 @@ class ProbEdgeStrategy(Strategy):
         self.last_net_edge_yes = net_edge_yes
         self.last_net_edge_no = net_edge_no
 
+        # Edge-stability gate keyed on slot_expiry_ts. Counters auto-reset at
+        # slot rollover. With min_stable_ticks=1 both flags are ready on the
+        # first above-threshold tick (legacy behavior).
+        stab = self._stability.update(
+            yes_above=net_edge_yes >= required,
+            no_above=net_edge_no >= required,
+            slot_ts=slot_expiry_ts,
+        )
+
         candidates: List[Tuple[str, OrderBook, float, float]] = []
         if (
             net_edge_yes >= required
+            and stab.yes_ready
             and spread_pct(yes_bid, yes_ask) <= self.max_spread_pct
             and self.min_entry_price <= yes_ask <= self.max_entry_price
         ):
@@ -327,6 +344,7 @@ class ProbEdgeStrategy(Strategy):
 
         if (
             net_edge_no >= required
+            and stab.no_ready
             and spread_pct(no_bid, no_ask) <= self.max_spread_pct
             and self.min_entry_price <= no_ask <= self.max_entry_price
         ):
@@ -347,8 +365,20 @@ class ProbEdgeStrategy(Strategy):
             yes_sprd = spread_pct(yes_bid, yes_ask) if yes_bid > 0 else float("inf")
             no_sprd = spread_pct(no_bid, no_ask) if no_bid > 0 else float("inf")
             best_sprd = min(yes_sprd, no_sprd)
+            # Stability-specific skip reason takes precedence: it's the newest
+            # gate and operators need to distinguish "edge exists but not
+            # debounced yet" from "edge was never there".
+            stability_pending = (
+                (net_edge_yes >= required and not stab.yes_ready)
+                or (net_edge_no >= required and not stab.no_ready)
+            )
             if not self.last_skip_reason:
-                if best_sprd > self.max_spread_pct:
+                if stability_pending:
+                    best_count = max(stab.yes_count, stab.no_count)
+                    self.last_skip_reason = (
+                        f"edge_not_stable: {best_count}/{self.min_stable_ticks} consecutive ticks"
+                    )
+                elif best_sprd > self.max_spread_pct:
                     self.last_skip_reason = f"spread_wide: {best_sprd*100:.1f}% > {self.max_spread_pct*100:.0f}%"
                 elif best_net < required:
                     self.last_skip_reason = f"edge_low: net={best_net:+.3f} < req={required:.3f}"
@@ -491,6 +521,10 @@ class ProbEdgeStrategy(Strategy):
         self._slot_trade_count = 0
         self._slot_realized_pnl = 0.0
         self._slot_blocked_direction = None
+        # Stability counters also auto-reset via slot_ts in update(), but
+        # rolling them here keeps dashboards from showing stale counts
+        # between the rollover and the first analyze() of the new slot.
+        self._stability.reset()
 
     # ──────────────────────────────────────────────────────────────────────────
     # Dynamic edge threshold

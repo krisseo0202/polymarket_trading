@@ -23,6 +23,7 @@ import logging
 import time
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
+from ._edge_stability import EdgeStabilityTracker
 from .base import Signal, Strategy
 from ..api.types import OrderBook, Position
 from ..models.logreg_model import LogRegModel
@@ -82,6 +83,29 @@ class LogRegEdgeStrategy(Strategy):
         # 10s imbalance window + 5s ratio-change lag with slack.
         self._ob_history: Deque[Tuple[float, float, float]] = collections.deque()
         self._ob_history_max_age: float = 30.0
+
+        # Edge-stability gate — require the edge to clear the threshold on
+        # this many consecutive ticks (within the same slot) before firing.
+        # 1 = no debouncing (legacy behavior). See _edge_stability.py.
+        self.min_stable_ticks: int = int(config.get("min_stable_ticks", 1))
+        self._stability = EdgeStabilityTracker(n_ticks=self.min_stable_ticks)
+
+        # Late-slot snipe — opt-in microstructure path. Bypasses the normal
+        # min_seconds_to_expiry / min_entry_price / max_entry_price gates;
+        # has its own (different-shape) gates instead. Does NOT consult the
+        # model — thesis is microstructure mispricing harvest, not prediction.
+        snipe_cfg = dict(config.get("late_snipe") or {})
+        self.late_snipe_enabled: bool = bool(snipe_cfg.get("enabled", False))
+        self.late_snipe_max_tte_s: float = float(snipe_cfg.get("max_tte_s", 30.0))
+        self.late_snipe_min_entry_price: float = float(snipe_cfg.get("min_entry_price", 0.90))
+        self.late_snipe_max_entry_price: float = float(snipe_cfg.get("max_entry_price", 0.95))
+        self.late_snipe_min_moneyness_bps: float = float(snipe_cfg.get("min_moneyness_bps", 50.0))
+        self.late_snipe_max_spread_pct: float = float(snipe_cfg.get("max_spread_pct", 0.03))
+        self.late_snipe_size_usdc: float = float(snipe_cfg.get("size_usdc", 5.0))
+        # Once-per-slot guard, keyed by slot_ts (slot_expiry_ts − 300). Slot
+        # rollover changes slot_ts → comparison naturally lets the next slot
+        # snipe again without an explicit reset hook.
+        self._snipe_fired_for_slot: Optional[int] = None
 
         # Observable state
         self.last_prob_yes: Optional[float] = None
@@ -174,7 +198,12 @@ class LogRegEdgeStrategy(Strategy):
         return self._check_late_snipe(order_books, by_token, market_data, now_wall, now_mono)
 
     def should_enter(self, signal: Signal) -> bool:
-        return self.validate_signal(signal) and signal.confidence >= self.min_confidence
+        # The min_confidence gate is enforced earlier in _check_entry against
+        # the model's raw probability (see "Confidence gate" there). By the
+        # time we're here, the Signal's confidence is clamped up to at least
+        # self.min_confidence, so a post-hoc check would be a no-op. Relying
+        # on the _check_entry gate + validate_signal's structural checks.
+        return self.validate_signal(signal)
 
     # ------------------------------------------------------------------
     # Entry logic: p_hat vs q_t +/- c_t +/- delta
@@ -280,22 +309,54 @@ class LogRegEdgeStrategy(Strategy):
         # execution risk is higher near close, so demand more edge.
         effective_delta = self.delta * (1.0 + 0.5 * max(0.0, 1.0 - tte / 120.0))
 
-        # Entry decision: pick the side with higher edge, but must exceed delta
-        if edge_yes >= edge_no and edge_yes >= effective_delta:
+        # Edge-stability gate: track whether each side has cleared the
+        # threshold on enough consecutive ticks. Keyed by slot_expiry_ts so
+        # the counters reset automatically at rollover. With min_stable_ticks=1
+        # both flags are ready on the first above-threshold tick (legacy behavior).
+        slot_expiry_ts = market_data.get("slot_expiry_ts")
+        stab = self._stability.update(
+            yes_above=edge_yes >= effective_delta,
+            no_above=edge_no >= effective_delta,
+            slot_ts=float(slot_expiry_ts) if slot_expiry_ts is not None else None,
+        )
+
+        # Entry decision: pick the side with higher edge, must exceed delta
+        # AND have been above threshold for min_stable_ticks in this slot.
+        if edge_yes >= edge_no and edge_yes >= effective_delta and stab.yes_ready:
             side = "YES"
             edge = edge_yes
             entry_ask = yes_ask
             book = yes_book
             prob = p_hat
-        elif edge_no > edge_yes and edge_no >= effective_delta:
+        elif edge_no > edge_yes and edge_no >= effective_delta and stab.no_ready:
             side = "NO"
             edge = edge_no
             entry_ask = no_ask
             book = no_book
             prob = 1.0 - p_hat
+        elif (edge_yes >= effective_delta and not stab.yes_ready) or (
+            edge_no >= effective_delta and not stab.no_ready
+        ):
+            # Edge cleared threshold but hasn't held long enough yet — wait.
+            best_count = max(stab.yes_count, stab.no_count)
+            self.last_skip_reason = (
+                f"edge_not_stable: {best_count}/{self.min_stable_ticks} consecutive ticks"
+            )
+            return []
         else:
             best = max(edge_yes, edge_no)
             self.last_skip_reason = f"edge_low: best={best:+.3f} < delta={effective_delta:.3f} (tte={tte:.0f}s)"
+            return []
+
+        # Confidence gate: reject if model's probability on the chosen side
+        # is below the configured floor. This must run BEFORE building the
+        # Signal because Signal.confidence gets clamped up to min_confidence
+        # for display/logging — that clamp would otherwise let low-conviction
+        # predictions slip past validate_signal's check.
+        if prob < self.min_confidence:
+            self.last_skip_reason = (
+                f"confidence_low: side={side} prob={prob:.3f} < min_confidence={self.min_confidence:.3f}"
+            )
             return []
 
         # Model-side probability floors. If the loaded model_service exposes a
@@ -382,8 +443,9 @@ class LogRegEdgeStrategy(Strategy):
         now_wall: float,
         now_mono: float,
     ) -> List[Signal]:
-        """Late-slot, near-resolution sniping. Fires at most once per slot;
-        gated by tte, market price, |moneyness|, and spread."""
+        """Late-slot, near-resolution sniping. See class docstring + the
+        ``late_snipe`` config block for the thesis. Fires at most once per
+        slot; gated by tte, market price, |moneyness|, and spread."""
         slot_expiry_ts = float(market_data.get("slot_expiry_ts") or 0.0)
         tte = max(0.0, slot_expiry_ts - now_wall)
         if tte > self.late_snipe_max_tte_s:
@@ -401,6 +463,7 @@ class LogRegEdgeStrategy(Strategy):
             self.last_skip_reason = "snipe_in_position"
             return []
 
+        # Need strike + BTC mid to evaluate moneyness.
         strike = float(market_data.get("strike_price") or 0.0)
         if strike <= 0:
             self.last_skip_reason = "snipe_missing_strike"
@@ -427,8 +490,8 @@ class LogRegEdgeStrategy(Strategy):
         no_bid = float(no_book.bids[0].price) if no_book.bids else 0.0
         no_ask = float(no_book.asks[0].price) if no_book.asks else 0.0
 
-        # YES snipe needs BTC above strike (positive moneyness) AND the YES
-        # ask in the snipe band. NO snipe is the mirror.
+        # Pick the side. YES snipe needs BTC above strike (positive moneyness)
+        # AND the YES ask in the snipe band. NO snipe is the mirror.
         side: Optional[str] = None
         entry_ask = 0.0
         book: Optional[OrderBook] = None
@@ -453,6 +516,8 @@ class LogRegEdgeStrategy(Strategy):
             )
             return []
 
+        # Spread gate: tighter than normal entry, since there's no time to
+        # wait for spreads to come in.
         side_bid = yes_bid if side == "YES" else no_bid
         sp_pct = spread_pct(side_bid, entry_ask)
         if sp_pct > self.late_snipe_max_spread_pct:
@@ -517,7 +582,12 @@ class LogRegEdgeStrategy(Strategy):
 
         btc_prices = []
         if self.btc_feed is not None:
-            btc_prices = getattr(self.btc_feed, "get_recent_prices", lambda w=300: [])(300)
+            # 4 hours — long enough for btc_ret_3600s and multi-TF RSI warmup
+            # on 1m/3m/5m/15m. Must match training's BTC window
+            # (_BTC_WINDOW_SECONDS in src/backtest/s3_snapshot_loader.py).
+            btc_prices = getattr(
+                self.btc_feed, "get_recent_prices", lambda w=14400: []
+            )(14400)
             # Guard against trading on stale BTC data (feed dead >60s)
             if btc_prices and (now_wall - btc_prices[-1][0]) > 60:
                 self.logger.warning("btc_feed stale (>60s), skipping prediction")
@@ -540,6 +610,10 @@ class LogRegEdgeStrategy(Strategy):
             "strike_price": market_data.get("strike_price"),
             "slot_expiry_ts": market_data.get("slot_expiry_ts"),
             "now_ts": now_wall,
+            # Forward the recent-outcomes list cycle_runner injects into
+            # market_data so the signed-v2 recent_up_rate_* features see
+            # real outcome history instead of the 0.5 prior.
+            "recent_slot_outcomes": market_data.get("recent_slot_outcomes"),
         }
 
         try:

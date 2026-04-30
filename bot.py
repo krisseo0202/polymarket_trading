@@ -11,7 +11,6 @@ Configuration: config/config.yaml
 
 import argparse
 import json
-import logging
 import math
 import os
 import requests
@@ -21,7 +20,6 @@ import threading
 import time
 from typing import List, Optional
 
-import yaml
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -31,13 +29,14 @@ load_dotenv()
 sys.path.insert(0, os.path.dirname(__file__))
 
 from src.api.client import PolymarketClient
+from src.api.types import OrderBook, OrderBookEntry
 from src.engine.cycle_runner import CycleResult, CycleRunner
 from src.engine.slot_state import SlotContext
-from src.models.feature_builder import _realized_vol
+from src.models.feature_builder import _realized_vol, build_live_features
+from src.models.slot_path_state import SlotPathState
 from src.utils.btc_feed import BtcPriceFeed
-from src.utils.chainlink_feed import ChainlinkFeed
 from src.utils.market_utils import get_server_time
-from src.utils.startup import Services, init_services
+from src.utils.startup import STRATEGIES, init_services
 
 # ---------------------------------------------------------------------------
 # Globals (written by signal handlers, read by main loop / ticker)
@@ -60,6 +59,128 @@ def _log_price_tick(record: dict) -> None:
     with open(_price_tick_path, "a") as f:
         f.write(line + "\n")
         f.flush()
+
+
+def _l1_book(bid: Optional[float], ask: Optional[float]) -> Optional[OrderBook]:
+    """Build a 1-level OrderBook from ticker top-of-book. Returns None if missing."""
+    if bid is None and ask is None:
+        return None
+    bids = [OrderBookEntry(price=float(bid), size=100.0)] if bid is not None else []
+    asks = [OrderBookEntry(price=float(ask), size=100.0)] if ask is not None else []
+    return OrderBook(market_id="", token_id="", bids=bids, asks=asks, tick_size=0.001)
+
+
+def _log_intra_cycle_features(
+    logger,
+    model,
+    slot_state: SlotPathState,
+    btc_feed,
+    slot_mgr,
+    yes_bid: Optional[float],
+    yes_ask: Optional[float],
+    no_bid: Optional[float],
+    no_ask: Optional[float],
+) -> None:
+    """Recompute features from the ticker's in-memory data and log them.
+
+    Does NOT call model.predict — this is read-only display. Family A depth
+    features will sit at 0.0 because the ticker only has L1 (top-of-book)
+    prices; full depth only refreshes on cycle/intra-cycle fetches. BTC
+    momentum, vol, moneyness, and Family C path features update at ticker
+    cadence (~5s).
+    """
+    if logger is None or model is None or btc_feed is None or slot_mgr is None:
+        return
+
+    ctx = slot_mgr.get()
+    if ctx is None or ctx.strike_price is None or ctx.slot_end_ts is None:
+        return
+
+    yes_book = _l1_book(yes_bid, yes_ask)
+    no_book = _l1_book(no_bid, no_ask)
+    if yes_book is None or no_book is None:
+        return
+
+    btc_prices = btc_feed.get_recent_prices(300)
+    if len(btc_prices) < 2:
+        return
+
+    now_ts = time.time()
+    strike = float(ctx.strike_price)
+    btc_now = float(btc_prices[-1][1])
+    slot_ts = int(float(ctx.slot_end_ts)) - 300
+
+    # Reset on slot rollover; fold each new BTC tick since the last update.
+    if slot_state.slot_ts != slot_ts:
+        slot_state.reset(slot_ts)
+    last_ts = slot_state.last_ts or float(slot_ts)
+    for ts, price, *_ in btc_prices:
+        ts_f = float(ts)
+        if ts_f <= last_ts or ts_f < slot_ts:
+            continue
+        slot_state.update(ts_f, float(price), strike)
+
+    slot_path_features = slot_state.to_features(now_ts, btc_now, strike)
+
+    snapshot = {
+        "btc_prices": btc_prices,
+        "yes_book": yes_book,
+        "no_book": no_book,
+        "yes_history": [],
+        "no_history": [],
+        "question": "",
+        "strike_price": strike,
+        "slot_expiry_ts": ctx.slot_end_ts,
+        "now_ts": now_ts,
+        "slot_path_features": slot_path_features,
+    }
+
+    built = build_live_features(snapshot)
+    feats = built.features
+    names = getattr(model, "feature_names", None) or []
+    if not feats or not names:
+        return
+
+    version = getattr(model, "model_version", "model")
+    logger.info(
+        "=== INTRA-CYCLE FEATURES [%s] — %d cols (status=%s) ===",
+        version, len(names), built.status,
+    )
+    for name in names:
+        val = feats.get(name, 0.0)
+        try:
+            fval = float(val)
+        except (TypeError, ValueError):
+            fval = 0.0
+        logger.info("  %-32s = %+.6f", name, fval)
+    logger.info("=== END INTRA-CYCLE FEATURES ===")
+
+
+def _log_feature_snapshot(svc) -> None:
+    """Log the feature values the model used in its last prediction.
+
+    Only walks the model's own schema so the output is exactly what drove
+    the decision — not the 150+ columns build_live_features emits.
+    """
+    model = getattr(svc.strategy, "model_service", None) if svc.strategy else None
+    if model is None:
+        return
+    feats = getattr(model, "last_features", None) or {}
+    names = getattr(model, "feature_names", None) or []
+    if not feats or not names:
+        svc.logger.info("FEATURES: model has no last_features yet (warmup)")
+        return
+
+    version = getattr(model, "model_version", "model")
+    svc.logger.info("=== FEATURES [%s] — %d cols ===", version, len(names))
+    for name in names:
+        val = feats.get(name, 0.0)
+        try:
+            fval = float(val)
+        except (TypeError, ValueError):
+            fval = 0.0
+        svc.logger.info("  %-32s = %+.6f", name, fval)
+    svc.logger.info("=== END FEATURES ===")
 
 
 def _stime() -> float:
@@ -136,6 +257,7 @@ def ticker_until_next_cycle(
     logger=None,
     btc_feed: Optional[BtcPriceFeed] = None,
     slot_mgr=None,
+    display_features: bool = False,
 ) -> None:
     """
     Record prices in the background while waiting for the next cycle.
@@ -148,6 +270,14 @@ def ticker_until_next_cycle(
     no_ask:  List[Optional[float]] = [None]
     stop_evt = threading.Event()
     first_fetch_evt = threading.Event()
+
+    # Display-only slot-path state. Kept separate from the model's own
+    # SlotPathState so reading features for display never mutates what the
+    # trading model sees on cycle boundaries.
+    display_slot_state = SlotPathState() if display_features else None
+    display_model = (
+        getattr(strategy, "model_service", None) if display_features and strategy else None
+    )
 
     def _fetch_loop():
         last_analyzed = time.monotonic()
@@ -197,6 +327,27 @@ def ticker_until_next_cycle(
             if intra_cycle_analyze_fn and (now_m - last_analyzed) >= 30:
                 intra_cycle_analyze_fn()
                 last_analyzed = now_m
+
+            if display_features and display_slot_state is not None:
+                try:
+                    _log_intra_cycle_features(
+                        logger=logger,
+                        model=display_model,
+                        slot_state=display_slot_state,
+                        btc_feed=btc_feed,
+                        slot_mgr=slot_mgr,
+                        yes_bid=yes_bid[0],
+                        yes_ask=yes_ask[0],
+                        no_bid=no_bid[0],
+                        no_ask=no_ask[0],
+                    )
+                except Exception as exc:
+                    # Promoted from debug to warning: silent failures here
+                    # were hiding real bugs (e.g. slot_mgr returning None on
+                    # Chainlink reconnect, or a missing attribute on the
+                    # model). We want to know if display stops working.
+                    if logger:
+                        logger.warning("intra-cycle feature logging failed: %s", exc)
 
             for _ in range(5):
                 if stop_evt.wait(1.0):
@@ -282,10 +433,15 @@ def main() -> None:
     global _price_tick_path
 
     parser = argparse.ArgumentParser(description="Polymarket trading bot")
-    parser.add_argument("--strategy", choices=[
+    parser.add_argument("--asset", default=None,
+                        help="Asset to trade: BTC, ETH, SOL, DOGE, XRP (default: from config)")
+    # Keep pre-existing legacy names + merge anything startup.STRATEGIES now advertises.
+    _legacy_strategies = [
         "btc_updown", "btc_updown_xgb", "btc_vol_reversion", "coin_toss",
         "logreg_edge", "logreg", "prob_edge", "td_rsi",
-    ], default=None)
+    ]
+    _strategy_choices = sorted(set(_legacy_strategies) | set(STRATEGIES))
+    parser.add_argument("--strategy", choices=_strategy_choices, default=None)
     parser.add_argument("--paper", action="store_true", default=False)
     parser.add_argument("--live", action="store_true", default=False)
     parser.add_argument("--no-confirm", action="store_true", default=False)
@@ -301,9 +457,21 @@ def main() -> None:
                         help="Kelly fraction for position sizing (default: 0.15)")
     parser.add_argument("--exit-rule", choices=["default", "hold_to_expiry"],
                         default=None, help="Exit strategy: default (strategy-defined) or hold_to_expiry")
+    parser.add_argument("--display-features", action="store_true", default=False,
+                        help="After every cycle, log the live feature values the model used to predict. "
+                             "Only the features in the loaded model's schema are shown.")
+    parser.add_argument("--interval", type=int, default=None,
+                        help="Cycle period in seconds. Overrides trading.interval in config.yaml. "
+                             "Default 300 (5-min slot boundary). Lower values cause more trade decisions "
+                             "per slot; useful for testing.")
     args = parser.parse_args()
 
     svc = init_services(args)
+    # CLI --interval overrides whatever init_services read from config.yaml.
+    if args.interval is not None:
+        if args.interval <= 0:
+            raise SystemExit(f"--interval must be positive, got {args.interval}")
+        svc.interval = int(args.interval)
     _price_tick_path = svc.price_tick_path
 
     runner = CycleRunner(svc)
@@ -333,6 +501,9 @@ def main() -> None:
                 pass
             result = CycleResult.NO_MARKET
 
+        if args.display_features:
+            _log_feature_snapshot(svc)
+
         if result == CycleResult.CIRCUIT_BREAKER:
             # Tick prices but suppress analysis until circuit resets
             if runner.has_market():
@@ -340,6 +511,7 @@ def main() -> None:
                     svc.client, runner.yes_token_id, runner.no_token_id, svc.interval,
                     strategy=svc.strategy, intra_cycle_analyze_fn=None,
                     logger=svc.logger, btc_feed=svc.btc_feed, slot_mgr=svc.slot_mgr,
+                    display_features=args.display_features,
                 )
             else:
                 sleep_until_next_cycle(svc.interval)
@@ -351,6 +523,7 @@ def main() -> None:
                 strategy=svc.strategy,
                 intra_cycle_analyze_fn=runner.run_intra_cycle,
                 logger=svc.logger, btc_feed=svc.btc_feed, slot_mgr=svc.slot_mgr,
+                display_features=args.display_features,
             )
         else:
             sleep_until_next_cycle(svc.interval)
