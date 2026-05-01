@@ -87,9 +87,13 @@ class PolymarketClient:
             return self._get_mock_markets()
         
         try:
-            markets = self.client.get_markets()
+            # V2: get_markets returns a paginated dict {"data": [...], "next_cursor": ...}.
+            # Bot.py routes around this via gamma-api in find_updown_market(); this
+            # path is kept for ad-hoc tooling. We only consume the first page.
+            resp = self.client.get_markets()
+            markets = resp.get("data", []) if isinstance(resp, dict) else resp
             market_data_list = []
-            
+
             for m in markets:
                 if active and m.get('active', True) is False:
                     continue
@@ -308,7 +312,7 @@ class PolymarketClient:
             return False
         
         try:
-            response = self.client.cancel(order_id)
+            response = self.client.cancel_orders([order_id])
             # cancel() may return a dict with status or just True/None
             if isinstance(response, dict):
                 return response.get('status') == 'CANCELLED'
@@ -388,10 +392,13 @@ class PolymarketClient:
             ]
         
         try:
+            # V2: OpenOrderParams renamed token_id -> asset_id. Same semantic
+            # (filter by outcome token), the field name on the server side
+            # changed during the V2 cutover.
             params = OpenOrderParams()
             if token_id:
-                params.token_id = token_id
-            orders = self.client.get_orders(params)
+                params.asset_id = token_id
+            orders = self.client.get_open_orders(params)
             return orders if orders else []
         except Exception as e:
             raise Exception(f"Error fetching open orders: {e}")

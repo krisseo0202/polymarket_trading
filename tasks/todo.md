@@ -559,3 +559,181 @@ Smoke test on the testing URL with paper-trading on means we exercise
 the full V2 code path with zero capital risk. Wrap before flip means we
 never see a phantom `balance=0` again. Verify cycle logs after flip
 means we catch any V2 surprise within minutes, not days.
+
+---
+
+# Feature Engineering Agent — ablation-driven selection with LLM proposals
+
+## Context
+The model has ~80 features across 12 families (BTC momentum, orderbook depth,
+slot path, indicator signals, coherence, calendar, recent outcomes, multi-TF, etc.).
+XGB feature importance tells us which features the model *leans on*, but NOT whether
+those features improve P&L. A feature can dominate importance while capturing
+spurious signal that costs money on the wrong side.
+
+This agent closes that loop:
+1. Drop each feature family, retrain, backtest → measure ΔPNL + ΔBrier per family.
+2. Feed the ablation table to Claude (role: quant feature engineer) → propose new features.
+3. Gate each proposal through `feature_probe.py` sentinel test → retrain → backtest.
+4. Accept features where ΔPNL ≥ 0 AND ΔBrier ≤ +0.005 AND ΔSharpe ≥ -0.10.
+
+**Fixed test window**: last 7×24h of S3 data. All ablation and addition runs
+use the SAME window — no cherry-picking.
+
+## Objective function
+- **Primary**: maximize ΔPNL on the fixed test set.
+- **Gates** (must not regress to accept a change):
+  - ΔBrier ≤ +0.005 (existing `promote_gate` tolerance)
+  - ΔSharpe ≥ -0.10
+  - per-side calibration gap ≤ 0.10 (04-25 disaster gate)
+- Ranking among accepted candidates: P&L delta descending.
+
+## Feature family map (ablation groups)
+
+| Group | Features |
+|---|---|
+| `btc_momentum` | `btc_ret_5s..btc_ret_3600s`, `btc_vol_*`, `vol_ratio_15_60` |
+| `btc_structure` | `btc_mid`, `strike_price`, `moneyness`, `distance_to_strike_bps`, `seconds_to_expiry` |
+| `btc_microstructure` | `volume_surge_ratio`, `btc_vwap_deviation`, `cumulative_volume_delta_60s` |
+| `ob_basic` | `yes_*/no_*` bid/ask/mid/spread/imbalance/ret_30s |
+| `ob_depth` | Family A — microprice, depth_slope, top3_*, bid/ask_slope |
+| `ob_coherence` | Family B — `mid_sum_residual*`, `spread_asymmetry`, `depth_asymmetry` |
+| `slot_path` | Family C — excursion_bps, drift_bps, time_above_strike, strike_crosses |
+| `derived` | Family D+E — interaction terms, `fair_value_p_up`, residuals |
+| `indicators` | FVG (`active_bull_gap`, `active_bear_gap`, `latest_gap_distance_pct`), TD Sequential (`td_setup`, `td_cd`, `td_signal_*`, `td_tdst_*`), UT Bot (`ut_bot_*`), RSI-14 (`rsi_14`) |
+| `calendar` | `hour_sin`, `hour_cos`, `is_weekend` |
+| `recent_outcomes` | `recent_up_rate_5`, `recent_up_rate_10`, `recent_up_rate_20` |
+| `multi_tf` | `multi_tf_feature_names()` outputs + `ut_trend_disagreement` |
+
+## Architecture
+
+```
+Phase 1 — ABLATION (~5 min, 12 retrain+backtest runs)
+  ┌──────────────────────────────────────────────────────────┐
+  │  for each group in FEATURE_GROUPS:                        │
+  │    selection_minus_group = selection.yaml - group         │
+  │    model = train(selection_minus_group, test_window)      │
+  │    metrics = backtest(model, test_window)                 │
+  │    record: group | ΔPNL | ΔBrier | ΔSharpe | Δwin_rate  │
+  └──────────────────────────────────────────────────────────┘
+                             │
+                             ▼
+Phase 2 — LLM INTERPRETATION (Claude claude-sonnet-4-6)
+  ┌──────────────────────────────────────────────────────────┐
+  │  Input (cached system): feature schema + group docs       │
+  │  Input (user turn):    ablation CSV + XGB importances     │
+  │                        + per-side calibration table       │
+  │                        + baseline Brier/Sharpe/PnL        │
+  │                                                           │
+  │  Output (strict JSON):                                    │
+  │    drop_groups: ["ob_coherence", ...]                     │
+  │    proposals: [                                           │
+  │      { name, description,                                 │
+  │        python_code: "def compute(df): ..." }              │
+  │    ]                                                      │
+  │    hypothesis: "..."                                      │
+  └──────────────────────────────────────────────────────────┘
+                             │
+                             ▼
+Phase 3 — ADDITION LOOP (per proposal)
+  ┌──────────────────────────────────────────────────────────┐
+  │  eval python_code in restricted namespace (np, pd only)   │
+  │    → validate shape/dtype, reject on error                │
+  │  feature_probe.py sentinel gate                           │
+  │    → XGB permutation-importance > random_value sentinel?  │
+  │    → exit 1 = rejected, log reason "below_sentinel"       │
+  │  retrain with new feature → backtest (same test window)   │
+  │  accept if ΔPNL ≥ 0 AND promote_gate passes              │
+  │    → write dated selection.yaml + symlink CURRENT         │
+  └──────────────────────────────────────────────────────────┘
+```
+
+## Files
+
+- [ ] NEW `src/models/feature_group_map.py` (~50 LOC)
+      Single dict `FEATURE_GROUPS: Dict[str, List[str]]` mapping 12 group names
+      to feature lists. Validates at import time that every name in `FEATURE_COLUMNS`
+      appears in exactly one group (assertion on module load).
+
+- [ ] NEW `scripts/feature_ablation.py` (~200 LOC)
+      CLI: `--selection <yaml> --test-start <date> --test-end <date> --out <dir>`
+      Imports `train.py` logic directly (no subprocess). For each group: loads
+      selection, removes group features, calls `train_logreg` + `train_xgb` +
+      `slot_pnl` on the test split, records delta vs baseline. Prints table and
+      writes `<out>/ablation_results.csv`.
+
+- [ ] NEW `scripts/feature_engineering_agent.py` (~300 LOC)
+      Orchestrator. Args: `--selection <yaml> --test-start <date> --test-end <date>`
+      `--model claude-sonnet-4-6 --max-proposals 5 --dry-run`
+      Phases 1→2→3. Uses `anthropic` SDK with prompt caching (system = schema + docs,
+      cached; user turn = ablation table + diagnostics, not cached).
+      Appends one record per run to `data/feature_engineering_history.jsonl`:
+      `{ts, phase_reached, groups_dropped, proposals_tried, accepted, baseline_metrics, final_metrics}`.
+
+- [ ] MODIFY `scripts/feature_probe.py` (+~30 LOC)
+      Add `--target-feature <name>` flag: inject only the named column into the
+      existing dataset (must already be present in the parquet), run XGB
+      permutation-importance, compare to `random_value` sentinel. Exit 0 = pass.
+
+- [ ] MODIFY `scripts/train.py:promote_gate` (+~10 LOC)
+      Add per-side calibration gap check: reject if either side's calibration gap
+      (mean_predicted − observed_rate) exceeds 0.10. Consistent with auto-retrain
+      agent design and 04-25 postmortem requirement.
+
+## LLM prompt design (Phase 2)
+
+System prompt (cache-able, stable):
+- Role: senior quant feature engineer for a BTC 5-min binary-outcome market.
+- Explains what each feature group represents, what ΔPNL means here.
+- Output schema: strict JSON with field types documented.
+- Constraint: `python_code` must be a single function `compute(df: pd.DataFrame) → pd.Series`
+  using only `df` columns, `np`, `pd`. No disk/network access. Returns float64 Series
+  of length `len(df)`.
+
+User turn (not cached, per-run):
+- Ablation CSV (12 rows, 5 columns).
+- Top-20 XGB importances from the current model.
+- Per-side calibration table (from `diagnose_run.py`).
+- Baseline Brier, Sharpe, PnL on the test window.
+
+## Safety properties
+
+- Fixed test window enforced: ablation script raises `ValueError` if `--test-start`
+  or `--test-end` are missing. No default window.
+- LLM code execution: `exec(code, {"np": np, "pd": pd, "df": df})`. Any `import`
+  statement in the code string raises `SyntaxError` pre-exec (simple string scan).
+  Output validated: must be `pd.Series`, dtype float64, length == len(df), no NaN > 20%.
+- Sentinel gate runs BEFORE retrain. No retrain on noise.
+- selection.yaml never overwritten in-place. Agent writes
+  `experiments/fe_agent_<ts>/selection.yaml` and updates a `CURRENT` symlink.
+- `--dry-run` flag stops after Phase 2, prints LLM JSON, makes zero file changes.
+
+## Acceptance tests
+
+- [ ] `feature_ablation.py` on current selection.yaml + last-7d window produces
+      12-row CSV in under 6 minutes.
+- [ ] Each row: ΔPNL, ΔBrier, ΔSharpe, Δwin_rate vs baseline (not vs zero).
+- [ ] `feature_engineering_agent.py --dry-run` completes Phase 1+2, prints valid JSON.
+- [ ] A `python_code` proposal containing `import os` is rejected pre-exec with
+      reason `"unsafe_import"` logged to history JSONL.
+- [ ] A proposal whose output is a constant column fails sentinel gate with
+      reason `"below_sentinel"`.
+- [ ] A run on a known-good historical feature (confirmed from prior experiments)
+      passes sentinel + promote_gate and is written into the dated selection.yaml.
+- [ ] `tests/scripts/test_feature_ablation.py` — unit tests with a synthetic 100-row
+      dataset and mocked `train_logreg`/`train_xgb` verify the delta calculation logic.
+
+## Open questions
+- Multi-objective ablation: should we also report per-side ΔPNL (YES-side vs NO-side)
+  in the ablation table, or just total? (Per-side would give LLM richer signal.)
+- LLM temperature: 0.2 for reproducibility, or higher for creative feature proposals?
+  Recommend 0.3 — low enough to be stable, high enough to explore.
+- Iteration limit: cap at 3 LLM rounds per invocation (one ablation, up to 5 proposals
+  each round). Beyond that, human reviews the history JSONL and re-runs.
+
+## Why P&L-primary, not Brier-primary
+Brier measures calibration quality. A perfectly calibrated model that always predicts
+0.50 has Brier = 0.25 and makes zero money. P&L measures what actually matters. Brier
+is the gate — it prevents the agent from accepting a model that wins money by being
+confidently wrong in a way that happens to pay off on the test set. Both are necessary;
+neither is sufficient alone.
