@@ -150,6 +150,8 @@ def build_features_frame(
     add_random_sentinel: bool = False,
     random_seed: int = 0,
     n_random_sentinels: int = 1,
+    last_snap_only: bool = False,
+    min_tte_seconds: float = 0.0,
 ) -> pd.DataFrame:
     """Assemble a feature DataFrame from parsed snapshot records.
 
@@ -161,6 +163,14 @@ def build_features_frame(
         provided, the rolling BTC history inside the feature builder is
         sourced from it rather than the short in-snapshot return window.
     btc_window_seconds : rolling window passed to the feature builder.
+    last_snap_only : when True, emit only the final snapshot row per slot.
+        State (slot_path, yes/no history) is still accumulated across all
+        snapshots; only the build_live_features() call is deferred to the
+        last valid snapshot. ~60x faster for backtest-only use cases.
+    min_tte_seconds : when > 0 and last_snap_only is True, only consider
+        snapshots with at least this many seconds remaining as the candidate
+        decision point. Eliminates last-snapshot bias where market prices
+        have converged to near-certain outcomes near expiry.
     """
     log = logger or logging.getLogger(__name__)
 
@@ -208,6 +218,11 @@ def build_features_frame(
         slot_state = SlotPathState()
         slot_state.reset(slot_ts)
         tick_idx = 0
+
+        # When last_snap_only, we accumulate state across all snapshots but
+        # defer build_live_features() to the last valid one. Use a dict that
+        # gets overwritten each iteration; we call the builder once after.
+        pending: Optional[Dict] = None
 
         for snap in ordered:
             snapshot_ts = float(snap.get("snapshot_ts") or 0.0)
@@ -266,19 +281,13 @@ def build_features_frame(
                 btc_ts, btc_price, snapshot_ts, btc_window_seconds
             )
             if len(btc_prices) < 2:
-                btc_now_raw = snap.get("btc_now")
-                if btc_now_raw is not None:
+                if btc_now_value > 0:
                     # Synthesize a two-point history so the feature builder can
                     # at least compute moneyness/TTE; returns will be zero.
-                    try:
-                        btc_now = float(btc_now_raw)
-                    except (TypeError, ValueError):
-                        btc_now = 0.0
-                    if btc_now > 0:
-                        btc_prices = [
-                            (snapshot_ts - 1.0, btc_now),
-                            (snapshot_ts, btc_now),
-                        ]
+                    btc_prices = [
+                        (snapshot_ts - 1.0, btc_now_value),
+                        (snapshot_ts, btc_now_value),
+                    ]
 
             # Recent slot outcomes BEFORE this slot — feeds the
             # recent_up_rate_{5,10,20} features. No peeking ahead: the
@@ -302,11 +311,30 @@ def build_features_frame(
                 "slot_path_features": slot_path_features,
                 "recent_slot_outcomes": recent_slot_outcomes,
             }
-            built = build_live_features(snapshot_for_features)
 
-            row: Dict[str, object] = {
+            if last_snap_only:
+                tte = (slot_ts + _SLOT_SECONDS) - snapshot_ts
+                if min_tte_seconds <= 0 or tte >= min_tte_seconds:
+                    # Overwrite pending each iteration; build only after the loop.
+                    pending = {"args": snapshot_for_features, "ts": snapshot_ts}
+            else:
+                built = build_live_features(snapshot_for_features)
+                row: Dict[str, object] = {
+                    "slot_ts": slot_ts,
+                    "snapshot_ts": snapshot_ts,
+                    "slot_expiry_ts": slot_ts + _SLOT_SECONDS,
+                    "label": label,
+                    "outcome": outcome,
+                    "feature_status": built.status,
+                }
+                row.update(built.features)
+                rows.append(row)
+
+        if last_snap_only and pending is not None:
+            built = build_live_features(pending["args"])
+            row = {
                 "slot_ts": slot_ts,
-                "snapshot_ts": snapshot_ts,
+                "snapshot_ts": pending["ts"],
                 "slot_expiry_ts": slot_ts + _SLOT_SECONDS,
                 "label": label,
                 "outcome": outcome,
@@ -467,6 +495,8 @@ def load_dates(
     add_random_sentinel: bool = False,
     random_seed: int = 0,
     n_random_sentinels: int = 1,
+    last_snap_only: bool = False,
+    min_tte_seconds: float = 0.0,
 ) -> pd.DataFrame:
     """Load one or more date partitions and build the training frame.
 
@@ -517,6 +547,8 @@ def load_dates(
         add_random_sentinel=add_random_sentinel,
         random_seed=random_seed,
         n_random_sentinels=n_random_sentinels,
+        last_snap_only=last_snap_only,
+        min_tte_seconds=min_tte_seconds,
     )
 
 

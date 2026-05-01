@@ -208,15 +208,52 @@ def promote_gate(
     brier_slack: float = 0.002,
     sharpe_slack: float = 0.1,
     pnl_ratio: float = 0.95,
+    per_side_gap_max: float = 0.10,
 ) -> Tuple[bool, str]:
-    """Main must not regress much vs the probe (trained on ALL features)."""
+    """Main must not regress much vs the probe (trained on ALL features).
+
+    Per-side calibration gap (``yes_calibration_gap`` / ``no_calibration_gap``,
+    when present in ``main``) is the 04-25 disaster gate: if the model is
+    anti-calibrated on either side by more than ``per_side_gap_max``, reject
+    regardless of how the global Brier looks.
+    """
     if main["brier"] > probe["brier"] + brier_slack:
         return False, f"Brier regression: {main['brier']:.4f} > {probe['brier']:.4f} + {brier_slack}"
     if main["sharpe"] < probe["sharpe"] - sharpe_slack:
         return False, f"Sharpe regression: {main['sharpe']:.2f} < {probe['sharpe']:.2f} - {sharpe_slack}"
     if probe["pnl"] > 0 and main["pnl"] < probe["pnl"] * pnl_ratio:
         return False, f"PnL regression: {main['pnl']:.2f} < {probe['pnl']:.2f} × {pnl_ratio}"
-    return True, "Main model within tolerance of probe on Brier, Sharpe, PnL"
+    for side in ("yes", "no"):
+        key = f"{side}_calibration_gap"
+        gap = main.get(key)
+        if gap is not None and abs(gap) > per_side_gap_max:
+            return False, f"Per-side calibration: |{key}|={abs(gap):.3f} > {per_side_gap_max}"
+    return True, "Main model within tolerance of probe on Brier, Sharpe, PnL, per-side calibration"
+
+
+def per_side_calibration_gap(
+    val_df: pd.DataFrame,
+    p_val: np.ndarray,
+    side_col: str = "side",
+    label_col: str = "label",
+) -> Dict[str, float]:
+    """Mean(predicted_p) − observed_up_rate, computed separately for YES and NO trades.
+
+    Returns ``{"yes_calibration_gap": float, "no_calibration_gap": float}`` —
+    NaN replaced with 0.0 when a side has no trades. Suitable for shoving into
+    a metrics dict that ``promote_gate`` consumes.
+    """
+    out: Dict[str, float] = {"yes_calibration_gap": 0.0, "no_calibration_gap": 0.0}
+    if side_col not in val_df.columns or label_col not in val_df.columns:
+        return out
+    sides = val_df[side_col].astype(str).str.lower().to_numpy()
+    y = val_df[label_col].to_numpy(dtype=float)
+    for side in ("yes", "no"):
+        mask = sides == side
+        if not mask.any():
+            continue
+        out[f"{side}_calibration_gap"] = float(p_val[mask].mean() - y[mask].mean())
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +326,17 @@ def main() -> None:
         help="Fallback half-spread added to mid when real ask is missing.",
     )
     parser.add_argument(
+        "--min-tte-train",
+        type=float,
+        default=0.0,
+        help=(
+            "Drop training and validation rows with seconds_to_expiry below "
+            "this value. Mitigates target leakage from market-price features "
+            "in the late-slot equilibrium band (Polymarket YES price → outcome "
+            "as TTE → 0). Test set is never filtered. Default 0 (no filter)."
+        ),
+    )
+    parser.add_argument(
         "--tte-weighted", action="store_true", default=True,
         help="Weight training loss by TTE bucket (emphasize core 60-180s window). "
              "Default on. See src/models/tte_weights.py.",
@@ -327,6 +375,26 @@ def main() -> None:
         raise SystemExit(
             "Training requires a validation set. Either provide --valid-period "
             "or rely on the default --val-ratio (non-zero)."
+        )
+
+    if args.min_tte_train > 0:
+        if "slot_expiry_ts" not in train_df.columns or "snapshot_ts" not in train_df.columns:
+            raise SystemExit(
+                "--min-tte-train requires slot_expiry_ts and snapshot_ts columns "
+                "in the dataset; one or both are missing."
+            )
+        def _tte_filter(frame: pd.DataFrame) -> pd.DataFrame:
+            tte = frame["slot_expiry_ts"].astype(float) - frame["snapshot_ts"].astype(float)
+            return frame.loc[tte >= args.min_tte_train].reset_index(drop=True)
+        n_train_before, n_val_before = len(train_df), len(val_df)
+        train_df = _tte_filter(train_df)
+        val_df = _tte_filter(val_df)
+        logging.info(
+            "TTE leakage filter: dropped %d/%d train rows and %d/%d val rows "
+            "with seconds_to_expiry < %.0f (test set unfiltered)",
+            n_train_before - len(train_df), n_train_before,
+            n_val_before - len(val_df), n_val_before,
+            args.min_tte_train,
         )
 
     X_train = train_df[sel.active_features].to_numpy(dtype=float)
@@ -445,6 +513,7 @@ def main() -> None:
         },
         "tte_weighted": args.tte_weighted,
         "tte_bucket_weights": BUCKET_WEIGHTS if args.tte_weighted else None,
+        "min_tte_train": args.min_tte_train,
         "logreg": lr_metrics,
         "xgb": xgb_metrics,
         "gate": gate_results,

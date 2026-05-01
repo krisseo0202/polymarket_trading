@@ -662,6 +662,75 @@ def save_probe_models(out_dir: Path, models: ProbeModels) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Target-feature fast path (single-feature sentinel gate)
+# ---------------------------------------------------------------------------
+
+
+def _run_target_feature_mode(args: argparse.Namespace) -> None:
+    """Single-feature sentinel gate.
+
+    Loads dataset (must already contain the target column + a random sentinel),
+    fits XGB on train, computes permutation-importance on val, exits 0 if
+    target's importance > the sentinel's, else exits 1.
+    """
+    target = args.target_feature
+    if not args.dataset and not (args.start_date and args.end_date):
+        raise SystemExit("--target-feature requires either --dataset or --start-date/--end-date")
+
+    dates: Optional[List[str]] = None
+    if args.start_date and args.end_date:
+        dates = expand_date_range(args.start_date, args.end_date)
+    df = load_dataset(
+        parquet_path=args.dataset,
+        dates=dates,
+        bucket=args.bucket,
+        random_seed=args.random_seed,
+        n_sentinels=max(1, args.n_sentinels),
+    )
+    if df.empty:
+        raise SystemExit("Dataset empty.")
+    if target not in df.columns:
+        raise SystemExit(
+            f"Target feature {target!r} not present in dataset columns. "
+            f"Inject the column before invoking the probe."
+        )
+
+    split = resolve_split_from_args(args, df, val_ratio=args.val_ratio)
+    train_df = split.frames["training"]
+    val_df = split.frames.get("validation")
+    if val_df is None or val_df.empty:
+        raise SystemExit("Val split empty.")
+
+    feats = feature_columns(df)
+    if target not in feats:
+        raise SystemExit(
+            f"Target {target!r} present in dataset but excluded from feature set "
+            f"(check _NON_FEATURE_COLUMNS)."
+        )
+    sentinels = sentinel_columns(feats)
+    if not sentinels:
+        raise SystemExit("No sentinel column in dataset; cannot gate.")
+
+    logging.info(
+        "Target-feature mode: probing %r against sentinels %s on %d val rows",
+        target, sentinels, len(val_df),
+    )
+    models = fit_probes(train_df, val_df, feats)
+    perm = permutation_importance_xgb(models, val_df, n_repeats=args.perm_repeats)
+    importances = dict(zip(feats, perm))
+    target_imp = float(importances[target])
+    sentinel_max = max(float(importances[s]) for s in sentinels)
+
+    verdict = target_imp > sentinel_max
+    print(
+        f"target={target!r} importance={target_imp:.6f} "
+        f"sentinel_max={sentinel_max:.6f} "
+        f"verdict={'PASS' if verdict else 'FAIL'}"
+    )
+    raise SystemExit(0 if verdict else 1)
+
+
+# ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
 
@@ -694,8 +763,22 @@ def main() -> None:
         help="Fallback half-spread added to mid when real ask is missing.",
     )
     parser.add_argument("--log-level", default="INFO")
+    parser.add_argument(
+        "--target-feature",
+        default=None,
+        help=(
+            "Fast path: probe only this single named column against the random "
+            "sentinel. Column must already exist in the dataset. Exits 0 if the "
+            "target's permutation-importance > sentinel's, exits 1 otherwise. "
+            "Skips report generation."
+        ),
+    )
     add_period_arguments(parser)
     args = parser.parse_args()
+
+    if args.target_feature:
+        _run_target_feature_mode(args)
+        return
 
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper()),
