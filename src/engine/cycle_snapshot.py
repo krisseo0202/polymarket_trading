@@ -264,9 +264,6 @@ def build_cycle_snapshot(
         if inv.position != 0
     }
 
-    # ── Resolved slot outcome (written at rollover) ───────────────────────────
-    slot_outcome: Optional[str] = None   # "Up" | "Down" | None (current slot unresolved)
-
     # ── Active orders ──────────────────────────────────────────────────────────
     orders = [
         {

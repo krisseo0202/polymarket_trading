@@ -16,9 +16,7 @@ inventory doesn't back it up. This test locks in the clear path.
 from __future__ import annotations
 
 import time
-from typing import Optional
 
-import pytest
 
 from src.api.types import OrderBook, OrderBookEntry, Position
 from src.models.logreg_model import LogRegModel

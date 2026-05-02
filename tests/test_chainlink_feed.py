@@ -109,7 +109,6 @@ class TestSlotOpenCapture:
         # Use a deterministic time aligned to a slot boundary
         slot_ts = 1700000100  # arbitrary, within some slot
         slot_floor = (slot_ts // 300) * 300
-
         with patch("src.utils.chainlink_feed.time") as mock_time:
             mock_time.time.return_value = float(slot_ts)
             raw = _make_msg("btc/usd", 84500.0, float(slot_ts))
@@ -122,8 +121,6 @@ class TestSlotOpenCapture:
 
     def test_subsequent_price_same_slot_no_overwrite(self, feed):
         slot_ts = 1700000100
-        slot_floor = (slot_ts // 300) * 300
-
         with patch("src.utils.chainlink_feed.time") as mock_time:
             # First price
             mock_time.time.return_value = float(slot_ts)
@@ -226,7 +223,6 @@ class TestSlotOpenOrCarryForward:
     def test_returns_fresh_slot_open_when_available(self, feed):
         slot_ts = 1700000100
         slot_floor = (slot_ts // 300) * 300
-
         with patch("src.utils.chainlink_feed.time") as mock_time:
             mock_time.time.return_value = float(slot_ts)
             feed._handle_message(_make_msg("btc/usd", 84500.0, float(slot_ts)))

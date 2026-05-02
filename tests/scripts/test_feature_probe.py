@@ -7,7 +7,6 @@ above features we inject as pure noise. Also verify redundancy detection.
 from __future__ import annotations
 
 import importlib.util
-import os
 import sys
 from pathlib import Path
 

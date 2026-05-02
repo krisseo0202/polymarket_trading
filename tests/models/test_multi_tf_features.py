@@ -1,10 +1,8 @@
 """Tests for the multi-timeframe feature computer."""
 
 import numpy as np
-import pytest
 
 from src.models.multi_tf_features import (
-    MIN_BARS_PER_TF,
     TIMEFRAMES,
     compute_multi_tf_features,
     multi_tf_feature_names,

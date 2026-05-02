@@ -209,10 +209,6 @@ class ProbEdgeStrategy(Strategy):
             strike = float(strike_price) if strike_price is not None else None
         except (TypeError, ValueError):
             strike = None
-        try:
-            slot_expiry_ts = float(snapshot.get("slot_expiry_ts") or 0.0)
-        except (TypeError, ValueError):
-            slot_expiry_ts = 0.0
         if btc_now is not None and strike is not None and strike > 0:
             distance_pct = (btc_now - strike) / strike
             self.last_distance_to_break_pct = distance_pct

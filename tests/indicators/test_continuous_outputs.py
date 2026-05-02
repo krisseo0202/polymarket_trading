@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-import pytest
 
 from indicators.base import IndicatorConfig
 from indicators.ut_bot import UTBotIndicator

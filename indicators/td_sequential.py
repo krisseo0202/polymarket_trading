@@ -323,8 +323,6 @@ class TDSequentialIndicator(Indicator):
         bearish_setup_count = td_result['bearish_setup_count']
         buy_cd_count = td_result['buy_cd_count']
         sell_cd_count = td_result['sell_cd_count']
-        bullish_setup_complete = td_result['bullish_setup_complete']
-        bearish_setup_complete = td_result['bearish_setup_complete']
 
         if self.mode == "pine_simple":
             # In this mode buy_13/sell_13 mean "setup count hit 13 consecutively",
