@@ -1,10 +1,8 @@
 """Tests for the Binance historical REST client — no live HTTP."""
 
 import json
-from io import BytesIO
 from unittest.mock import MagicMock
 
-import pandas as pd
 import pytest
 
 from src.utils.binance_historical import fetch_btc_klines

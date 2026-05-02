@@ -3,14 +3,12 @@
 import argparse
 from datetime import datetime, timezone
 
-import numpy as np
 import pandas as pd
 import pytest
 
 from src.backtest.period_split import (
     PERIOD_LABELS,
     PeriodBounds,
-    PeriodConfig,
     add_period_arguments,
     parse_period_config,
     parse_period_spec,

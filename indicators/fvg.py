@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from typing import List, Optional
 from .base import (
     Indicator,
-    IndicatorConfig,
     IndicatorResult,
     Signal,
     SignalType,

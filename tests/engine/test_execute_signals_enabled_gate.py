@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import logging
 
-import pytest
 
 from src.engine.cycle_runner import execute_signals
 from src.strategies.base import Signal, Strategy

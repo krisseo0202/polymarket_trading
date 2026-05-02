@@ -4,7 +4,6 @@ import numpy as np
 import pytest
 
 from src.models.tte_weights import (
-    BUCKET_BOUNDS,
     BUCKET_WEIGHTS,
     bucket_names,
     bucket_range,

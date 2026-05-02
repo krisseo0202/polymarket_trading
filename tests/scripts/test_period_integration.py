@@ -5,7 +5,6 @@ These exercise the argparse wiring and the split-resolution path without
 requiring xgboost / pyarrow / s3fs to be installed."""
 
 import argparse
-import importlib
 import json
 
 import pandas as pd

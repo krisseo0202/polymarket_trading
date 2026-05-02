@@ -20,9 +20,8 @@ from __future__ import annotations
 import time
 from unittest.mock import MagicMock
 
-import pytest
 
-from src.api.types import OrderBook, OrderBookEntry, Position
+from src.api.types import OrderBook, OrderBookEntry
 from src.models.prediction import PredictionResult
 from src.strategies.logreg_edge import LogRegEdgeStrategy
 
