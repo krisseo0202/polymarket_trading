@@ -11,8 +11,9 @@ Group=polymarket
 WorkingDirectory=/opt/polymarket/app
 Environment=PYTHONUNBUFFERED=1
 ExecStart=/opt/polymarket/venv/bin/python scripts/data_collector.py \
+    --assets BTC ETH SOL DOGE XRP \
     --snap-output /opt/polymarket/data/snapshots.jsonl \
-    --history-output /opt/polymarket/data/btc_updown_5m.csv \
+    --history-output /opt/polymarket/data/updown_5m.csv \
     --history-hours 2 \
     --history-interval 3600 \
     --map-interval 600
